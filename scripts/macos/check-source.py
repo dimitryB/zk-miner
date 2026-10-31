@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check cargo metadata proves the intended engine and CPU-only feature closure."""
+"""Check cargo metadata proves the intended engine and explicitly selected feature closure."""
 import argparse
 import json
 from pathlib import Path
@@ -12,7 +12,11 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--engine", type=Path)
     group.add_argument("--unchanged-verifier", action="store_true")
+    parser.add_argument("--metal-runtime", action="store_true", help="allow the explicit experimental runtime Metal HAL only with --engine")
     args = parser.parse_args()
+    if args.metal_runtime and not args.engine:
+        parser.error("--metal-runtime requires a local --engine")
+    observed_runtime = False
     metadata = json.loads(args.metadata.read_text())
     nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
     count = 0
@@ -26,11 +30,19 @@ def main():
                 parser.error(f"verifier source is not the unchanged pinned Git revision: {package}")
             features = set(nodes[package["id"]]["features"])
             prohibited = {"cuda", "rocm", "intel", "metal", "bonsai"}
+            if args.metal_runtime:
+                prohibited.remove("metal")
+                if package["name"] == "risc0-zkp" and "metal-runtime" in features:
+                    observed_runtime = True
+            else:
+                prohibited.add("metal-runtime")
             if args.unchanged_verifier:
                 prohibited |= {"prove", "client"}
             if features & prohibited:
                 parser.error(f"unexpected features in {package['name']}: {features & prohibited}")
             print(package["name"], package["version"], sorted(features))
+    if args.metal_runtime and not observed_runtime:
+        parser.error("runtime Metal HAL was requested but not resolved")
     if not count:
         parser.error("no engine packages found")
     print(f"verified source and feature closure of {count} engine packages")

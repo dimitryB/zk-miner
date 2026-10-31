@@ -159,4 +159,12 @@ it is uncommitted and is not embedded recursively in the evidence bundle.
 Raw receipts, seals and full logs remain under `target/macos` (about 10 GiB
 including all toolchains/builds). Initial provenance remains in baseline.json.
 Final binary hashes describe the final rebuild, not a claim that the earlier
-full acceptance suite used later platform-test fixes. No source was committed.
+full acceptance suite used later platform-test fixes. At the initial CPU milestone, source changes were still uncommitted.
+
+## Metal continuation
+
+CPU checkpoints and follow-up work are now committed on new local branches at
+the user's request; no push. See METAL.md for the first actual GPU differential
+milestone: 222 cases / 404 completed commands, retained failures, exact source/
+binary binding, and a new complete CPU-only Groth16 regression proof. This does
+not enable a hybrid worker or satisfy complete-proof Gate 3.

@@ -106,12 +106,12 @@ A different supported segmentation must be verified explicitly; this worker
 cannot claim support for all marketplace jobs. Keccak-specific coverage and
 other guest precompiles are not established by SHA-256-chain coverage.
 
-No Metal kernels execute yet. Runtime capabilities were queried, but the
-compiler is absent (`xcrun --find metal` exits 72; no full Xcode). Install a
-compatible compiler only with any required privileged-change authorization,
-then test retained generic HAL finite-field transforms/hash/Merkle operations
-against CPU before selecting one segment stage. Newer upstream circuit/recursion
+No complete proof uses Metal yet. The explicit experimental runtime compiler
+route now passes retained HAL arithmetic/NTT/hash differential tests; see
+METAL.md. The offline compiler is still absent (`xcrun --find metal` exits 72;
+no full Xcode). Provision it only with any required privileged-change approval.
+The next proving step is selecting one compatible segment stage. Newer upstream circuit/recursion
 code must be adapted selectively to the pinned engine, not imported wholesale.
-Explicit feature gating is preparatory build isolation, not hybrid support.
+Feature gating and standalone HAL validation do not establish a hybrid prover.
 The Metal budget/synchronization and offset/boundary/error tests remain future
 work; no speedup, unattended stability or profitability claim is made.

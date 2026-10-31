@@ -38,10 +38,13 @@ cd /Users/dbur/dev/zk-miner
 export HEMI_MINER_DIR=/Users/dbur/dev/zk-miner
 source scripts/macos/env.sh
 rustup toolchain list
-python3 scripts/macos/local-engine.py /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 target/macos/local-engine.toml
+ENGINE_REV=$(git -C /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 rev-parse HEAD)
+python3 scripts/macos/local-engine.py /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 target/macos/local-engine.toml --revision "$ENGINE_REV"
 ```
 
-The generator rejects the wrong HEAD/origin. Do not export x86 RUSTFLAGS,
+Review the engine commit/diff before supplying ENGINE_REV. The generator requires
+that exact HEAD, the Hemi origin, and ancestry from the pinned baseline; it rejects
+an unreviewed descendant unless --revision is explicit. Do not export x86 RUSTFLAGS,
 RISC0_DEV_MODE, skip-build variables, Bonsai credentials, or proof-selection
 variables. Acceptance rejects them instead of silently masking them.
 
