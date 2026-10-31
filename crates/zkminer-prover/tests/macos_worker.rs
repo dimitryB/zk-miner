@@ -118,6 +118,12 @@ impl Workload {
     }
 }
 
+fn elapsed_ms(started: Instant) -> f64 {
+    let value = started.elapsed().as_secs_f64() * 1000.0;
+    assert!(value.is_finite() && value >= 0.0);
+    value
+}
+
 fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -350,7 +356,7 @@ fn measured_prove(
         "before_prove_call",
     );
     let done = Arc::new(AtomicBool::new(false));
-    let (result, mut observations) = std::thread::scope(|scope| {
+    let (result, mut observations, prove_call_ms) = std::thread::scope(|scope| {
         let stop = done.clone();
         let observer = scope.spawn(move || {
             let mut samples = Vec::new();
@@ -371,6 +377,7 @@ fn measured_prove(
             }
             samples
         });
+        let prove_started = Instant::now();
         let result = pool.prove(
             "risc0",
             elf,
@@ -379,8 +386,9 @@ fn measured_prove(
             Some(Duration::from_secs(600)),
             None,
         );
+        let prove_call_ms = elapsed_ms(prove_started);
         done.store(true, Ordering::Release);
-        (result, observer.join().unwrap())
+        (result, observer.join().unwrap(), prove_call_ms)
     });
     observations.insert(0, baseline.clone());
     observations.push(rss_observation(
@@ -397,6 +405,8 @@ fn measured_prove(
         "observation_window":"immediately before WorkerPool::prove through its return; post-verification idle observation is separate",
         "host_memory_method":"production Darwin available-memory estimate (free pages plus conservative reclaim credit); includes all host pressure and is not added to worker RSS or treated as an allocation guarantee",
         "sampling_interval_ms":1000,"request_elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
+        "prove_call_ms":prove_call_ms,
+        "prove_call_scope":"immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
         "baseline_before_prove_call":baseline,"observations":observations}),
     )
 }
@@ -589,7 +599,7 @@ fn verify(
     proof: zkminer_prover::engine::ProofOutput,
     record: &Value,
     workload: &Workload,
-) {
+) -> f64 {
     fs::create_dir(dir).unwrap();
     assert_eq!(proof.journal, workload.expected);
     assert_eq!(proof.seal.len(), 256);
@@ -605,6 +615,7 @@ fn verify(
     .unwrap();
     fs::write(dir.join("journal.bin"), &proof.journal).unwrap();
     fs::write(dir.join("seal.bin"), &proof.seal).unwrap();
+    let verifier_started = Instant::now();
     let output = Command::new(verifier)
         .arg("verify-seal")
         .arg(program)
@@ -614,6 +625,7 @@ fn verify(
         .arg(workload.po2.to_string())
         .output()
         .unwrap();
+    let external_verifier_ms = elapsed_ms(verifier_started);
     fs::write(dir.join("verifier.stdout"), &output.stdout).unwrap();
     fs::write(dir.join("verifier.stderr"), &output.stderr).unwrap();
     assert!(
@@ -638,6 +650,35 @@ fn verify(
         proof.duration.as_secs_f64(),
         observed_mode()
     );
+    external_verifier_ms
+}
+
+fn save_proof_timing(
+    dir: &Path,
+    record: &Value,
+    resources: &Value,
+    external_verifier_ms: f64,
+) -> Value {
+    let prove_call_ms = resources["prove_call_ms"].as_f64().unwrap();
+    assert!(prove_call_ms.is_finite() && prove_call_ms >= 0.0);
+    assert!(external_verifier_ms.is_finite() && external_verifier_ms >= 0.0);
+    let timing = json!({
+        "schema_version":1,"method":"monotonic std::time::Instant elapsed wall time",
+        "prove_call_ms":prove_call_ms,"external_verifier_ms":external_verifier_ms,
+        "prove_call_scope":resources["prove_call_scope"],
+        "external_verifier_scope":"external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
+        "worker_pid":record["worker_pid"],"worker_start_time_us":resources["worker_start_time_us"],
+        "request_id":record["request_id"],
+        "worker_pid_before_prove":resources["baseline_before_prove_call"]["worker_pid"],
+        "worker_start_time_us_before_prove":resources["baseline_before_prove_call"]["worker_start_time_us"],
+        "same_worker_as_before_prove":resources["baseline_matches_request_worker"],
+    });
+    fs::write(
+        dir.join("timing.json"),
+        serde_json::to_vec_pretty(&timing).unwrap(),
+    )
+    .unwrap();
+    timing
 }
 
 #[test]
@@ -779,16 +820,31 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         WorkerResponse::Error { .. }
     ));
     drop(handle);
+    let setup_started = Instant::now();
+    let phase_started = Instant::now();
     let mut pool = WorkerPool::new(
         HashMap::from([("risc0".into(), binary)]),
         vec![],
         Some(Duration::from_secs(600)),
     );
+    let pool_new_ms = elapsed_ms(phase_started);
+    let phase_started = Instant::now();
     assert_eq!(pool.discover_and_spawn(), [KEY]);
+    let pool_discover_and_spawn_ms = elapsed_ms(phase_started);
+    let spawned_worker_pid = pool.worker_pid(KEY).unwrap();
+    let spawned_worker_start = zkminer_prover::memory::pid_starttime(spawned_worker_pid)
+        .expect("discovered worker has no live start identity");
+    assert!(zkminer_prover::memory::pid_is_our_worker(
+        spawned_worker_pid,
+        Some(spawned_worker_start)
+    ));
+    let phase_started = Instant::now();
     assert!(pool
         .warm_up("risc0", Duration::from_secs(15))
         .unwrap()
         .contains("helper"));
+    let worker_warmup_ms = elapsed_ms(phase_started);
+    let phase_started = Instant::now();
     assert!(
         pool.execute_cycles(
             "risc0",
@@ -799,6 +855,8 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         .unwrap()
             > 0
     );
+    let valid_execute_cycles_ms = elapsed_ms(phase_started);
+    let phase_started = Instant::now();
     assert!(pool
         .execute_cycles(
             "risc0",
@@ -807,6 +865,34 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             Some(Duration::from_secs(10))
         )
         .is_err());
+    let invalid_execute_cycles_ms = elapsed_ms(phase_started);
+    let setup_total_ms = elapsed_ms(setup_started);
+    let setup_worker_pid = pool.worker_pid(KEY).unwrap();
+    let setup_worker_start = zkminer_prover::memory::pid_starttime(setup_worker_pid);
+    if let Some(start) = setup_worker_start {
+        assert!(zkminer_prover::memory::pid_is_our_worker(
+            setup_worker_pid,
+            Some(start)
+        ));
+    }
+    let mut run_timing = json!({
+        "schema_version":1,"method":"monotonic std::time::Instant elapsed wall time",
+        "setup_scope":"fresh WorkerPool initialization, discovery/startup, warmup and valid/invalid execute-cycle validation; excludes preceding mode/protocol preflight; no proof has been requested; the validation worker may be retired before proving",
+        "setup":{
+            "pool_new_ms":pool_new_ms,"pool_discover_and_spawn_ms":pool_discover_and_spawn_ms,
+            "worker_warmup_ms":worker_warmup_ms,"valid_execute_cycles_ms":valid_execute_cycles_ms,
+            "invalid_execute_cycles_ms":invalid_execute_cycles_ms,"total_ms":setup_total_ms,
+            "spawned_worker_pid":spawned_worker_pid,"spawned_worker_start_time_us":spawned_worker_start,
+            "worker_pid":setup_worker_pid,"worker_start_time_us":setup_worker_start,
+            "identity_scope":"spawned identity immediately after discovery; worker identity after valid/invalid execution validation; null start identity denotes no live worker",
+        },
+        "cleanup":null,
+    });
+    fs::write(
+        evidence.join("timing.json"),
+        serde_json::to_vec_pretty(&run_timing).unwrap(),
+    )
+    .unwrap();
     let pressure = match std::env::var("ZKMINER_MACOS_ADMISSION_PRESSURE")
         .as_deref()
         .unwrap_or("0")
@@ -850,7 +936,7 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             )),
             "duplicate completed request identity"
         );
-        verify(
+        let external_verifier_ms = verify(
             &verifier,
             &program,
             &input,
@@ -864,9 +950,15 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             &record,
             &mut resources,
         );
+        let timings = save_proof_timing(
+            &evidence.join(format!("proof-{index}")),
+            &record,
+            &resources,
+            external_verifier_ms,
+        );
         ledger(
             &evidence,
-            &json!({"case":format!("proof-{index}"),"status":"complete_independently_verified","worker":record,"resources":resources}),
+            &json!({"case":format!("proof-{index}"),"status":"complete_independently_verified","worker":record,"resources":resources,"timings":timings}),
         );
         assert!(helpers().is_empty(), "helper survived a successful proof");
     }
@@ -1001,7 +1093,7 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             )),
             "duplicate completed request identity"
         );
-        verify(
+        let external_verifier_ms = verify(
             &verifier,
             &program,
             &input,
@@ -1015,18 +1107,43 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             &record,
             &mut resources,
         );
+        let timings = save_proof_timing(
+            &evidence.join("proof-after-restart"),
+            &record,
+            &resources,
+            external_verifier_ms,
+        );
         ledger(
             &evidence,
-            &json!({"case":"proof-after-restart","status":"complete_independently_verified","worker":record,"resources":resources}),
+            &json!({"case":"proof-after-restart","status":"complete_independently_verified","worker":record,"resources":resources,"timings":timings}),
         );
     }
+    let cleanup_started = Instant::now();
     let pid = pool.worker_pid(KEY).unwrap();
+    let cleanup_worker_start = zkminer_prover::memory::pid_starttime(pid);
+    let phase_started = Instant::now();
     pool.shutdown_all();
+    let shutdown_all_ms = elapsed_ms(phase_started);
+    let phase_started = Instant::now();
     drop(pool);
+    let drop_pool_ms = elapsed_ms(phase_started);
+    let phase_started = Instant::now();
     assert!(helpers().is_empty(), "helper survived shutdown");
     if pid != 0 {
         assert_group_gone(pid);
     }
+    let post_cleanup_checks_ms = elapsed_ms(phase_started);
+    run_timing["cleanup"] = json!({
+        "shutdown_all_ms":shutdown_all_ms,"drop_pool_ms":drop_pool_ms,
+        "post_cleanup_checks_ms":post_cleanup_checks_ms,"total_ms":elapsed_ms(cleanup_started),
+        "worker_pid":pid,"worker_start_time_us":cleanup_worker_start,
+        "scope":"WorkerPool shutdown and drop followed by helper absence and process-group checks",
+    });
+    fs::write(
+        evidence.join("timing.json"),
+        serde_json::to_vec_pretty(&run_timing).unwrap(),
+    )
+    .unwrap();
     fs::write(evidence.join("complete.json"), serde_json::to_vec_pretty(&json!({
         "status":"complete_independently_verified", "requested_mode":mode(),"observed_mode":observed_mode(),
         "verified_proofs":repeats + usize::from(lifecycle), "helper_cancel":lifecycle,"helper_timeout":lifecycle,
