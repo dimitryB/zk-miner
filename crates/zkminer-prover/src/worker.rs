@@ -162,6 +162,10 @@ fn may_signal_group(pid: u32) -> bool {
 /// `proc_root` is a parameter so the discriminator can be tested against a synthetic tree.
 #[cfg(unix)]
 fn live_group_members(proc_root: &Path, pgid: i32) -> Option<Vec<(i32, String)>> {
+    #[cfg(target_os = "macos")]
+    if proc_root == Path::new("/proc") {
+        return crate::macos::group_members(pgid);
+    }
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(proc_root) {
         Ok(e) => e,
@@ -335,6 +339,10 @@ pub struct WorkerHandle {
     /// process exits, so the question has to be asked of an ancestor, which means asking it as a
     /// DELTA. See `memory::oom_kill_count`.
     oom_kills_at_spawn: Option<u64>,
+    #[cfg(target_os = "macos")]
+    _memory_guard: crate::macos::MemoryGuard,
+    #[cfg(target_os = "macos")]
+    _helper_lease: Option<crate::macos::HelperLease>,
 }
 
 /// Request to the spawner thread: build a worker, hand back the handle.
@@ -448,6 +456,14 @@ impl WorkerHandle {
         for (k, v) in env_overrides {
             cmd.env(k, v);
         }
+
+        #[cfg(target_os = "macos")]
+        let helper_lease = {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+            crate::macos::HelperLease::configure(backend, &mut cmd, env_overrides)
+                .with_context(|| format!("{} macOS helper configuration", zkminer_prover_protocol::types::WORKER_DECLINED))?
+        };
 
         // Kill worker if parent process dies (prevents orphan GPU processes after host crash).
         // PR_SET_PDEATHSIG is Linux-specific.
@@ -584,6 +600,7 @@ impl WorkerHandle {
         // NOT a wrapper process — see `memory::cap_process_memory` for why that distinction is
         // load-bearing for every pid-keyed path in this file.
         let pid_for_cap = spawn_guard.get().id();
+        #[cfg(not(target_os = "macos"))]
         match crate::memory::worker_memory_ceiling_bytes(crate::memory::DEFAULT_HOST_RESERVE_BYTES)
         {
             Some(ceiling) => {
@@ -610,6 +627,9 @@ impl WorkerHandle {
         // Baseline for attributing a later SIGKILL. See `WorkerHandle::died_of_host_oom`.
         let oom_kills_at_spawn = crate::memory::oom_kill_count();
 
+        #[cfg(target_os = "macos")]
+        let memory_guard = crate::macos::MemoryGuard::new(pid_for_cap)?;
+
         // The handle takes ownership from here, so the guard stops being responsible for it.
         let child = spawn_guard.release();
 
@@ -624,6 +644,10 @@ impl WorkerHandle {
             stderr_task,
             reaped: false,
             oom_kills_at_spawn,
+            #[cfg(target_os = "macos")]
+            _memory_guard: memory_guard,
+            #[cfg(target_os = "macos")]
+            _helper_lease: helper_lease,
         };
 
         // Perform Hello handshake
@@ -1593,12 +1617,16 @@ mod tests {
         wait_for_zombie(pid);
 
         // The old guard: a zombie keeps its own group non-empty.
+        #[cfg(not(target_os = "macos"))]
         let old_guard_fires = unsafe { libc::kill(-(pid as i32), 0) } == 0;
+        #[cfg(not(target_os = "macos"))]
         assert!(
             old_guard_fires,
             "precondition: the old kill(-pgid, 0) guard must still succeed for a zombie \
              leader — if the kernel no longer behaves this way, the bug this test pins is gone"
         );
+        // Darwin removes the empty group and stops exposing proc_pidinfo after
+        // exit. waitid(WNOWAIT), exercised above and below, still owns the child.
 
         // The new predicate: nothing was left behind.
         assert!(
@@ -1683,6 +1711,7 @@ mod tests {
                 other => panic!("probe {i} lost the zombie: {other:?}"),
             }
             // Still signallable, i.e. the group number is still ours.
+            #[cfg(not(target_os = "macos"))]
             assert_eq!(unsafe { libc::kill(-(pid as i32), 0) }, 0);
         }
         let _ = child.wait();

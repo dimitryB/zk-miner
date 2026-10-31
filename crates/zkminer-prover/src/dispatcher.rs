@@ -3564,6 +3564,9 @@ impl WorkerPool {
             crate::memory::mem_total_bytes(),
         ) {
             (Some(a), Some(t)) => (a, t),
+            #[cfg(target_os = "macos")]
+            _ => { tracing::warn!("cannot observe macOS memory; refusing admission"); return None; }
+            #[cfg(not(target_os = "macos"))]
             _ => {
                 tracing::warn!(
                     "cannot read host memory; admission control is inactive for this proof. The \
@@ -3803,8 +3806,8 @@ impl WorkerPool {
             crate::memory::mem_available_bytes(),
             crate::memory::mem_total_bytes(),
         ) else {
-            // Fail OPEN, matching `reserve_host_memory`. See the note there.
-            return true;
+            // macOS has no cgroup/OOM-score backstop; unknown memory is not capacity.
+            return !cfg!(target_os = "macos");
         };
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
         // How many of this backend's proofs could be running at once if we take this one.

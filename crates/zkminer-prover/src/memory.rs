@@ -40,7 +40,10 @@ use std::time::Duration;
 ///
 /// The OS, the miner, the TUI, and the page cache the prover itself needs to read a 236 MB binary.
 /// Too small and the cap does not prevent a freeze; too large and a legitimate proof is refused.
+#[cfg(not(target_os = "macos"))]
 pub const DEFAULT_HOST_RESERVE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+pub const DEFAULT_HOST_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Host memory SP1's one-time warm-up (`WorkerPool::warm_up`) may use at peak: where the server
 /// runs Groth16 in a helper, building the stripped circuit reads the full one (13.9 GB measured on
@@ -72,6 +75,7 @@ const CAP_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The kernel's own estimate of what can be allocated without swapping — NOT `MemFree`, which
 /// excludes reclaimable page cache and on this box reads ~9 GB while 26 GB is actually available.
+#[cfg(not(target_os = "macos"))]
 pub fn mem_available_bytes() -> Option<u64> {
     parse_meminfo_kb(
         &std::fs::read_to_string("/proc/meminfo").ok()?,
@@ -80,9 +84,16 @@ pub fn mem_available_bytes() -> Option<u64> {
 }
 
 /// `MemTotal` from `/proc/meminfo`, in bytes.
+#[cfg(not(target_os = "macos"))]
 pub fn mem_total_bytes() -> Option<u64> {
     parse_meminfo_kb(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal")
 }
+
+#[cfg(target_os = "macos")]
+pub fn mem_available_bytes() -> Option<u64> { crate::macos::available_bytes() }
+
+#[cfg(target_os = "macos")]
+pub fn mem_total_bytes() -> Option<u64> { crate::macos::total_bytes() }
 
 /// Pull one `kB` field out of `/proc/meminfo` and return it in bytes.
 ///
@@ -434,7 +445,7 @@ pub(crate) fn starttime_of_stat(stat: &str) -> Option<u64> {
 /// `(pid, starttime)` for a live process, or `None` if it is gone.
 ///
 /// Captured at spawn and re-checked before any signal: see `pid_is_our_worker`.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn pid_starttime(pid: u32) -> Option<u64> {
     starttime_of_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
@@ -463,7 +474,7 @@ pub fn pid_starttime(pid: u32) -> Option<u64> {
 /// Cheaper than `pidfd_open` plumbing and needs no extra per-worker state, which matters because the
 /// pid atomic is written from sixteen places. Unreadable `/proc` answers `false`: not signalling a
 /// worker leaks a process, while signalling a stranger's group can take down the machine.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn pid_is_our_worker(pid: u32, expected_starttime: Option<u64>) -> bool {
     if pid == 0 {
         return false;
@@ -488,6 +499,14 @@ pub fn pid_is_our_worker(pid: u32, expected_starttime: Option<u64>) -> bool {
         Some(expected) => starttime_of_stat(&stat) == Some(expected),
         None => true,
     }
+}
+
+#[cfg(target_os = "macos")]
+pub fn pid_starttime(pid: u32) -> Option<u64> { crate::macos::start_time(pid) }
+
+#[cfg(target_os = "macos")]
+pub fn pid_is_our_worker(pid: u32, expected_starttime: Option<u64>) -> bool {
+    crate::macos::owned_group(pid, expected_starttime)
 }
 
 /// Non-unix: there is no `/proc` to prove identity with, and no process groups to signal, so the
@@ -1143,6 +1162,8 @@ mod tests {
     #[test]
     fn pressure_brakes_on_stall_before_memory_runs_out() {
         let gib = 1024 * 1024 * 1024;
+        // Between the platform reserve and its 1.5x brake floor.
+        let braking_available = DEFAULT_HOST_RESERVE_BYTES * 4 / 3;
         let total = 28 * gib;
         // Quiet and roomy.
         assert_eq!(
@@ -1165,7 +1186,7 @@ mod tests {
         // The floor now sits ABOVE the admission reserve, so the brake fires while the gate would
         // still admit — which is the point of a brake. 4 GiB free on a 28 GiB box: floor is 4.5 GiB.
         assert_eq!(
-            classify_pressure(None, 4 * gib, total),
+            classify_pressure(None, braking_available, total),
             PressureState::Brake
         );
         // And at or below the reserve itself the host is past braking: admission refuses everything
@@ -1184,6 +1205,7 @@ mod tests {
         // and this arm exists for the two cases the gate cannot cover: a kernel with no PSI at all,
         // and a host so short that even admission's own reserve is gone.
         let brake_floor = (total / 10).max(DEFAULT_HOST_RESERVE_BYTES * 3 / 2);
+        #[cfg(not(target_os = "macos"))]
         assert!(
             !can_admit(
                 unmeasured_peak_for("risc0"),
@@ -1196,6 +1218,8 @@ mod tests {
             "the gate is expected to have refused long before the free-memory arm trips; if this \
              ever passes, the arm has become the primary signal and its thresholds need rethinking"
         );
+        #[cfg(target_os = "macos")]
+        assert_eq!(classify_pressure(None, brake_floor - 1, total), PressureState::Brake);
         // PSI quiet but memory nearly gone: do not report Ok anyway. Nothing has stalled yet only
         // because nothing has tried to allocate; the next proof is what would. At 2 GiB — under
         // admission's own 3 GiB reserve — that is Critical, not merely Brake.
@@ -1204,7 +1228,7 @@ mod tests {
             PressureState::Critical
         );
         assert_eq!(
-            classify_pressure(Some(0.0), 4 * gib, total),
+            classify_pressure(Some(0.0), braking_available, total),
             PressureState::Brake
         );
     }
@@ -1230,7 +1254,7 @@ mod tests {
         // On a small host the absolute minimum applies rather than a derisory 10%.
         assert_eq!(
             classify_pressure(Some(0.0), 8 * gib, 8 * gib),
-            PressureState::Ok
+            if DEFAULT_HOST_RESERVE_BYTES >= 8 * gib { PressureState::Critical } else { PressureState::Ok }
         );
     }
 

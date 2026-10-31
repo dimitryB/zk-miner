@@ -11903,6 +11903,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "libc",
+ "risc0-binfmt",
  "risc0-build",
  "risc0-groth16",
  "risc0-zkvm",

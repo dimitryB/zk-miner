@@ -14,3 +14,5 @@ pub mod openvm;
 pub mod risc0;
 #[cfg(feature = "sp1")]
 pub mod sp1;
+#[cfg(target_os = "macos")]
+mod macos;

@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [[bin]]
+name = "zkminer-prove-risc0"
+path = "src/main.rs"
+required-features = ["macos"]
+
+[[bin]]
 name = "zkminer-prove-risc0-cuda"
 path = "src/main.rs"
 required-features = ["cuda"]
@@ -14,6 +19,7 @@ path = "src/main.rs"
 required-features = ["rocm"]
 
 [features]
+macos = ["risc0-zkvm/disable-dev-mode"]
 cuda = ["risc0-zkvm/cuda", "risc0-groth16/cuda"]
 rocm = ["risc0-zkvm/rocm", "risc0-groth16/rocm"]
 
@@ -48,3 +54,7 @@ methods = [
 
 [build-dependencies]
 risc0-build = "3.0"
+risc0-binfmt = "3.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
