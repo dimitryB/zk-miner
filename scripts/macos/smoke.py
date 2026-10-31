@@ -13,36 +13,83 @@ import subprocess
 import sys
 import time
 import uuid
+from proof_provenance import sha, verify_build
 
 IMAGE = "risczero/risc0-groth16-prover:v2025-04-03.1"
 DIGEST = "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee"
 
+
+def validate_proof_evidence(proof, mode):
+    if proof.get("proof_kind") != "groth16" or proof.get("requested_mode") != mode:
+        raise RuntimeError("proof report is not a complete Groth16 proof in the requested mode")
+    count = proof.get("stats", {}).get("segments")
+    if type(count) is not int or count < 1:
+        raise RuntimeError("proof report has no positive segment count")
+    stage = proof.get("observed_stages", {}).get("metal_stage")
+    if mode == "cpu":
+        if stage is not None:
+            raise RuntimeError("CPU baseline unexpectedly reports Metal work")
+        return
+    if not isinstance(stage, dict) or stage.get("name") != "segment_poseidon2_merkle_fold":
+        raise RuntimeError("forced Metal proof is missing the declared Merkle fold stage")
+    segments = stage.get("segments")
+    if not isinstance(segments, list) or len(segments) != count:
+        raise RuntimeError("Metal stage evidence does not cover every proved segment")
+    indices = []
+    dispatches = 0
+    positive = ("po2", "completed_dispatches", "fold_calls", "input_digests", "output_digests",
+                "peak_staging_bytes", "staging_limit_bytes")
+    for segment in segments:
+        if not isinstance(segment, dict) or any(type(segment.get(key)) is not int or segment[key] <= 0 for key in positive):
+            raise RuntimeError("segment has no positive Metal work or staging evidence")
+        index = segment.get("segment_index")
+        if type(index) is not int:
+            raise RuntimeError("invalid Metal segment index")
+        indices.append(index)
+        if (segment["input_digests"] != 2 * segment["output_digests"]
+                or segment["completed_dispatches"] < segment["fold_calls"]
+                or not 4096 <= segment["staging_limit_bytes"] <= 16 * 1024**2
+                or segment["peak_staging_bytes"] > segment["staging_limit_bytes"]):
+            raise RuntimeError("inconsistent Metal fold work or exceeded staging budget")
+        dispatches += segment["completed_dispatches"]
+    if sorted(indices) != list(range(count)) or stage.get("completed_dispatches") != dispatches:
+        raise RuntimeError("Metal segment indices or completed dispatch total are inconsistent")
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--context", required=True, help="dedicated local Docker context")
+    parser.add_argument("--mode", choices=["cpu", "metal"], default="cpu")
+    parser.add_argument("--engine", type=Path, help="exact local engine checkout; required in Metal mode")
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=1800, help="seconds per complete proof")
     parser.add_argument("--rss-gib", type=int, default=32, help="native prover RSS watchdog ceiling")
     parser.add_argument("--po2", type=int, default=18)
     parser.add_argument("--workload", choices=["fibonacci", "sha256-chain", "segment-boundary"], default="fibonacci")
     args = parser.parse_args()
+    if args.mode == "metal" and args.engine is None:
+        parser.error("--engine is required for a source-bound Metal proof")
     if not (1 <= args.repeat <= 100 and 1 <= args.timeout <= 7200 and 1 <= args.rss_gib <= 48 and 13 <= args.po2 <= 20):
         parser.error("repeat 1..100, timeout 1..7200, RSS GiB 1..48, po2 13..20 required")
     root = Path(__file__).resolve().parents[2]
     base = root / "target/macos"
-    for name in ("RISC0_DEV_MODE", "RISC0_SKIP_BUILD", "RISC0_SKIP_BUILD_KERNELS", "DOCS_RS", "RISC0_PROVER",
-                 "RISC0_EXECUTOR", "BONSAI_API_KEY", "BONSAI_API_URL", "RISC0_TEST_INJECT_INVALID"):
+    for name in ("RISC0_DEV_MODE", "RISC0_SKIP_BUILD", "RISC0_SKIP_BUILD_KERNELS", "RISC0_SKIP_VERIFY", "DOCS_RS", "RISC0_PROVER",
+                 "RISC0_EXECUTOR", "RISC0_SERVER_PATH", "RISC0_API_URL", "BONSAI_API_KEY", "BONSAI_API_URL", "RISC0_TEST_INJECT_INVALID"):
         if name in os.environ:
             parser.error(f"unset {name}; acceptance does not mask unsafe overrides")
     docker = shutil.which("docker")
     if not docker:
         parser.error("Docker is required for this explicitly emulated wrapping bootstrap")
+    endpoint = subprocess.check_output([docker, "context", "inspect", args.context, "--format",
+                                        "{{.Endpoints.docker.Host}}"], text=True).strip()
+    if not endpoint.startswith("unix://"):
+        parser.error("only a dedicated local Docker socket is supported")
     docker_cmd = [docker, "--context", args.context]
     info = json.loads(subprocess.check_output(docker_cmd + ["image", "inspect", IMAGE]))[0]
     if not any(d.endswith("@" + DIGEST) for d in info.get("RepoDigests", [])):
         parser.error("helper image digest differs from recorded pinned bootstrap image")
     elf = base / "guest-build/riscv32im-risc0-zkvm-elf/release" / (args.workload + ".bin")
-    prover = base / "cpu/release/hemi-macos-proof"
+    prover = base / ("cpu/release/hemi-macos-proof" if args.mode == "cpu"
+                     else "hybrid/release/hemi-macos-hybrid-proof")
     verifier = base / "verifier/release/hemi-macos-proof"
     for path in (elf, prover, verifier):
         if not path.is_file():
@@ -92,11 +139,22 @@ def main():
             started = time.monotonic()
             report = {"run_id": run_id, "workload": args.workload, "helper_image": DIGEST,
                       "helper_arch": "linux/amd64", "helper_context": args.context,
-                      "requested_mode": "cpu", "status": "failed", "native_peak_rss_bytes": 0,
+                      "requested_mode": args.mode, "status": "failed", "native_peak_rss_bytes": 0,
+                      "prover_binary_sha256": sha(prover), "verifier_binary_sha256": sha(verifier),
+                      "runner_sha256": sha(Path(__file__).resolve()), "elf_sha256": sha(elf),
+                      "input_sha256": hashlib.sha256(input_data).hexdigest(), "expected_journal_hex": expected,
+                      "helper_endpoint": endpoint,
                       "rss_method": "ps RSS of owned native prover, sampled every 5s; excludes VM/helper", "command": [str(prover), "prove", *common]}
             proc = None
             print(f"attempt {run_id}: {attempt}", flush=True)
             try:
+                verifier_build = verify_build("verifier", verifier)
+                (attempt / "verifier-build.json").write_text(json.dumps(verifier_build, indent=2) + "\n")
+                report["verifier_build"] = verifier_build
+                if args.mode == "metal":
+                    hybrid_build = verify_build("hybrid", prover, args.engine)
+                    (attempt / "hybrid-build.json").write_text(json.dumps(hybrid_build, indent=2) + "\n")
+                    report["hybrid_build"] = hybrid_build
                 with (attempt / "prover.log").open("w") as log:
                     proc = subprocess.Popen(report["command"], env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                     while proc.poll() is None:
@@ -116,11 +174,26 @@ def main():
                             pass
                     if proc.returncode:
                         raise RuntimeError(f"prover exited {proc.returncode}; see prover.log")
+                proof_info = json.loads((attempt / "proof/proof.json").read_text())
+                report["proof"] = proof_info
+                validate_proof_evidence(proof_info, args.mode)
+                if args.mode == "metal" and verify_build("hybrid", prover, args.engine) != hybrid_build:
+                    raise RuntimeError("sealed hybrid build changed during proving")
+                if verify_build("verifier", verifier) != verifier_build:
+                    raise RuntimeError("sealed verifier build changed before independent verification")
                 with (attempt / "verifier.log").open("w") as log:
                     subprocess.run([str(verifier), "verify", *common], env=env, stdout=log,
                                    stderr=subprocess.STDOUT, check=True, timeout=60)
+                if verify_build("verifier", verifier) != verifier_build:
+                    raise RuntimeError("sealed verifier build changed during independent verification")
+                verification = json.loads((attempt / "proof/verification.json").read_text())
+                if (verification.get("verification") != "passed"
+                        or verification.get("journal_hex") != expected
+                        or verification.get("image_id") != proof_info.get("image_id")
+                        or set(verification.get("negative_tests", [])) != {"wrong_image", "modified_journal", "corrupt_seal"}):
+                    raise RuntimeError("independent verifier report is missing expected identity, output, or negative tests")
+                report["verification"] = verification
                 if args.workload == "segment-boundary":
-                    proof_info = json.loads((attempt / "proof/proof.json").read_text())
                     if proof_info["stats"]["segments"] < 2:
                         raise RuntimeError("multi-segment workload produced fewer than two segments; lower po2")
                 report["status"] = "complete_independently_verified"

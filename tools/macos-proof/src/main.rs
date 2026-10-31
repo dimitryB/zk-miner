@@ -11,6 +11,8 @@ fn reject_overrides() -> Result<()> {
         "RISC0_DEV_MODE",
         "RISC0_SKIP_BUILD",
         "RISC0_SKIP_BUILD_KERNELS",
+        "RISC0_SKIP_VERIFY",
+        "DOCS_RS",
         "RISC0_PROVER",
         "RISC0_EXECUTOR",
         "RISC0_SERVER_PATH",
@@ -123,10 +125,36 @@ fn prove(dir: &Path, elf: &[u8], input: &[u8], expected: &[u8], po2: u32) -> Res
         .session_limit(Some(4 * 1024 * 1024))
         .build()?;
     // Deliberately bypass default_prover: no environment/remote/server selection.
+    #[cfg(not(feature = "hybrid"))]
     let prover = LocalProver::new("hemi-cpu-acceptance");
+    #[cfg(feature = "hybrid")]
+    let prover = LocalProver::new_metal("hemi-metal-fold-acceptance", 512 * 1024);
+    let requested_mode = if cfg!(feature = "hybrid") { "metal" } else { "cpu" };
     let t = Instant::now();
     let info = prover.prove_with_opts(env, elf, &ProverOpts::composite())?;
     let segment_ms = t.elapsed().as_secs_f64() * 1000.0;
+    #[cfg(not(feature = "hybrid"))]
+    let observed_stages = json!({"segment": "cpu", "recursion": "cpu", "identity": "cpu",
+        "groth16": "local_linux_amd64_helper"});
+    #[cfg(feature = "hybrid")]
+    let observed_stages = {
+        let stages = prover.metal_stage_reports();
+        ensure!(stages.len() == info.stats.segments, "missing Metal evidence for a segment");
+        for (index, stage) in stages.iter().enumerate() {
+            ensure!(stage.segment_index as usize == index && stage.completed_dispatches > 0
+                && stage.fold_calls > 0 && stage.output_digests > 0
+                && stage.input_digests == 2 * stage.output_digests
+                && stage.peak_staging_bytes <= stage.staging_limit_bytes,
+                "invalid or empty Metal stage evidence");
+        }
+        let dispatches: u64 = stages.iter().map(|s| s.completed_dispatches).sum();
+        json!({"metal_stage": {"name": "segment_poseidon2_merkle_fold",
+            "segments": stages, "completed_dispatches": dispatches,
+            "kernel_source_sha256": hash(risc0_zkp::hal::metal::runtime_kernel_source().as_bytes())},
+            "other_segment_operations": "cpu", "recursion": "cpu", "identity": "cpu",
+            "groth16": "local_linux_amd64_helper"})
+    };
+    fs::write(dir.join("segment-stages.json"), serde_json::to_vec_pretty(&observed_stages)?)?;
     info.receipt.verify(image)?;
     ensure!(
         info.receipt.journal.bytes == expected,
@@ -158,7 +186,7 @@ fn prove(dir: &Path, elf: &[u8], input: &[u8], expected: &[u8], po2: u32) -> Res
     fs::write(dir.join("receipt.bin"), bincode::serialize(&receipt)?)?;
     fs::write(dir.join("journal.bin"), &receipt.journal.bytes)?;
     fs::write(dir.join("seal.bin"), &receipt.inner.groth16()?.seal)?;
-    let report = json!({"proof_kind": "groth16", "requested_mode": "cpu", "image_id": image.to_string(),
+    let report = json!({"proof_kind": "groth16", "requested_mode": requested_mode, "observed_stages": observed_stages, "image_id": image.to_string(),
         "elf_sha256": hash(elf), "input_sha256": hash(input), "journal_hex": hex::encode(expected), "po2": po2,
         "stats": info.stats, "stage_ms": {"execution_and_segment": segment_ms, "recursion": recursion_ms,
         "identity_and_wrap": wrapping_ms, "verification": verify_ms}, "total_ms": total.elapsed().as_secs_f64() * 1000.0,

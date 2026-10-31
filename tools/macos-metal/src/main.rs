@@ -1,5 +1,5 @@
 //! Retained Metal HAL differentials, with real dispatch evidence and bounded inputs.
-//! These tests do not enable Metal in the worker or claim a complete hybrid proof.
+//! Differential evidence only; complete hybrid proofs have a separate acceptance harness.
 use anyhow::{ensure, Context, Result};
 use risc0_core::field::{
     baby_bear::{BabyBear, BabyBearElem as E, P},
@@ -10,6 +10,7 @@ use risc0_zkp::{
     hal::{
         cpu::CpuHal,
         metal::{runtime_kernel_source, MetalHal, MetalHalPoseidon2, MetalHalSha256, MetalHash},
+        metal_fold::MetalPoseidon2Fold,
         tracker, Buffer, Hal,
     },
 };
@@ -579,7 +580,77 @@ fn run_sha_cases(
     Ok(())
 }
 
+fn hybrid_fold_case(
+    hybrid: &CpuHal<BabyBear, MetalPoseidon2Fold>,
+    cpu: &CpuHal<BabyBear>,
+    outputs: usize,
+    offset: usize,
+    full_tree: bool,
+) -> Result<Value> {
+    let tracked_before = tracker().lock().unwrap().total;
+    let inputs = outputs * 2;
+    let sentinel = Digest::from([E::new(17).as_u32_montgomery(); 8]);
+    let mut initial = vec![sentinel; offset + 4 * outputs + GUARD];
+    for i in 0..inputs {
+        // Every word is a valid reduced Montgomery field value.
+        initial[offset + inputs + i] = Digest::from(std::array::from_fn(|j| {
+            E::new((i as u32).wrapping_mul(37).wrapping_add(j as u32 * 73)).as_u32_montgomery()
+        }));
+    }
+    let expected = cpu.copy_from_digest("hybrid_expected", &initial);
+    let actual = hybrid.copy_from_digest("hybrid_actual", &initial);
+    let before = hybrid.metal_stats().context("hybrid stats absent")?;
+    let mut count = outputs;
+    let mut expected_dispatches = 0;
+    let chunk_outputs = before.staging_limit_bytes / (4 * std::mem::size_of::<Digest>());
+    loop {
+        cpu.hash_fold(&expected.slice(offset, outputs * 4), count * 2, count);
+        hybrid.hash_fold(&actual.slice(offset, outputs * 4), count * 2, count);
+        ensure!(
+            read(&actual) == read(&expected),
+            "hybrid fold differs or changed sentinel: outputs={outputs}, layer={count}"
+        );
+        expected_dispatches += count.div_ceil(chunk_outputs) as u64;
+        if !full_tree || count == 1 {
+            break;
+        }
+        count /= 2;
+    }
+    let after = hybrid.metal_stats().context("hybrid stats absent")?;
+    let completed = after.completed_dispatches - before.completed_dispatches;
+    ensure!(
+        completed == expected_dispatches && completed > 0,
+        "hybrid dispatch accounting mismatch"
+    );
+    ensure!(
+        after.peak_staging_bytes <= after.staging_limit_bytes,
+        "hybrid exceeded staging budget"
+    );
+    ensure!(
+        after.input_digests - before.input_digests
+            == 2 * (after.output_digests - before.output_digests),
+        "hybrid work accounting mismatch"
+    );
+    drop(expected);
+    drop(actual);
+    ensure!(
+        tracker().lock().unwrap().total == tracked_before,
+        "hybrid staging allocation was retained"
+    );
+    Ok(
+        json!({"operation":"hybrid_poseidon2_fold", "outputs":outputs, "buffer_offset":offset,
+        "full_tree":full_tree, "completed_dispatches":completed,
+        "fold_calls":after.fold_calls-before.fold_calls,
+        "output_digests":after.output_digests-before.output_digests,
+        "input_digests":after.input_digests-before.input_digests,
+        "peak_staging_bytes":after.peak_staging_bytes,"staging_limit_bytes":after.staging_limit_bytes,
+        "result":"matched"}),
+    )
+}
+
 fn main() -> Result<()> {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<CpuHal<BabyBear>>();
     for key in [
         "RISC0_DEV_MODE",
         "RISC0_SKIP_BUILD",
@@ -596,15 +667,40 @@ fn main() -> Result<()> {
             "ntt",
             "sha256",
             "poseidon2",
+            "hybrid-fold",
             "all"
         ]
         .contains(&mode.as_str()),
-        "expected basic, boundaries, arithmetic, ntt, sha256, poseidon2, or all"
+        "expected basic, boundaries, arithmetic, ntt, sha256, poseidon2, hybrid-fold, or all"
     );
     let gpu = MetalHalSha256::new();
     let cpu = CpuHal::new(gpu.get_hash_suite().clone());
     let poseidon = if mode == "poseidon2" || mode == "all" {
         Some(MetalHalPoseidon2::new())
+    } else {
+        None
+    };
+    let hybrid = if mode == "hybrid-fold" || mode == "all" {
+        Some(CpuHal::<BabyBear, _>::with_hash_fold(
+            risc0_zkp::core::hash::poseidon2::Poseidon2HashSuite::new_suite(),
+            MetalPoseidon2Fold::new(512 * 1024)?,
+        ))
+    } else {
+        None
+    };
+    let hybrid_small = if hybrid.is_some() {
+        ensure!(
+            MetalPoseidon2Fold::new(4095).is_err(),
+            "too-small budget was accepted"
+        );
+        ensure!(
+            MetalPoseidon2Fold::new(16 * 1024 * 1024 + 1).is_err(),
+            "too-large budget was accepted"
+        );
+        Some(CpuHal::<BabyBear, _>::with_hash_fold(
+            risc0_zkp::core::hash::poseidon2::Poseidon2HashSuite::new_suite(),
+            MetalPoseidon2Fold::new(4096)?,
+        ))
     } else {
         None
     };
@@ -616,11 +712,30 @@ fn main() -> Result<()> {
             hash_cases(poseidon, &cpu, "poseidon2", &mut cases)
                 .context("Poseidon2 HAL differential")?;
         }
+        if let Some(ref hybrid) = hybrid {
+            let cpu = CpuHal::new(hybrid.get_hash_suite().clone());
+            for outputs in [1, 31, 32, 33, 4095, 4096, 4097, 65537] {
+                cases.push(hybrid_fold_case(hybrid, &cpu, outputs, 13, false)?);
+            }
+            cases.push(hybrid_fold_case(hybrid, &cpu, 8192, 13, true)?);
+        }
+        if let Some(ref hybrid) = hybrid_small {
+            let cpu = CpuHal::new(hybrid.get_hash_suite().clone());
+            for outputs in [31, 32, 33, 65] {
+                cases.push(hybrid_fold_case(hybrid, &cpu, outputs, 3, false)?);
+            }
+        }
         ensure!(!cases.is_empty(), "no differential cases executed");
         Ok(())
     })();
-    let completed =
-        gpu.completed_dispatches() + poseidon.as_ref().map_or(0, |p| p.completed_dispatches());
+    let completed = gpu.completed_dispatches()
+        + poseidon.as_ref().map_or(0, |p| p.completed_dispatches())
+        + hybrid
+            .as_ref()
+            .map_or(0, |h| h.metal_stats().unwrap().completed_dispatches)
+        + hybrid_small
+            .as_ref()
+            .map_or(0, |h| h.metal_stats().unwrap().completed_dispatches);
     let accounted: u64 = cases
         .iter()
         .map(|c| c["completed_dispatches"].as_u64().unwrap())
@@ -634,8 +749,8 @@ fn main() -> Result<()> {
             "kernel_source_sha256":hex::encode(Sha256::digest(runtime_kernel_source().as_bytes())),
             "completed_dispatches":completed, "successful_case_dispatches":accounted,
             "case_count":cases.len(), "cases":cases,
-            "proof_acceleration":"not enabled", "verification":"CPU/Metal primitive equality only",
-            "limits":"at most 4096 data elements per arithmetic case; no invalid GPU accesses"
+            "proof_acceleration":"differential-only; see separate hybrid proof evidence", "verification":"CPU/Metal primitive equality only",
+            "limits":"at most 4096 arithmetic elements; hybrid fold uses <=512KiB staging and <=65537 outputs; no invalid GPU accesses"
         }))?
     );
     outcome?;

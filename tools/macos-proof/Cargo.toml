@@ -24,3 +24,8 @@ risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbd
 [profile.release]
 opt-level = 3
 
+
+# The shared source also belongs to tools/macos-hybrid; this CPU/verifier
+# manifest deliberately does not expose its local-only feature.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("hybrid"))'] }

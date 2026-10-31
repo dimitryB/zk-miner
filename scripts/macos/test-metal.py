@@ -20,7 +20,7 @@ def sha(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine', type=Path, required=True)
-    parser.add_argument('--mode', choices=['basic', 'boundaries', 'arithmetic', 'ntt', 'sha256', 'poseidon2', 'all'], default='all')
+    parser.add_argument('--mode', choices=['basic', 'boundaries', 'arithmetic', 'ntt', 'sha256', 'poseidon2', 'hybrid-fold', 'all'], default='all')
     parser.add_argument('--timeout', type=int, default=180)
     args = parser.parse_args()
     if not 1 <= args.timeout <= 600:

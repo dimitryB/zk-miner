@@ -1,4 +1,4 @@
-# Reproduce the local CPU path
+# Reproduce the local CPU and experimental hybrid paths
 
 This experimental path is local only. It does not require a wallet or a
 marketplace job. Use one proof at a time. Do not treat these instructions as
@@ -14,7 +14,11 @@ Current paths are `/Users/dbur/dev/zk-miner` and
 
 Required: ARM64 macOS, CLT C/C++ compiler/SDK, Python 3.11+ (`tomllib`), Git,
 Docker/Colima, host Rust 1.93.0, and the pinned RISC Zero guest compiler.
-No Metal compiler is needed for this CPU build. The runtime probe is:
+No offline Metal compiler is needed for CPU builds or the runtime-compiled
+hybrid path. The existing MTLDevice compiler has already compiled and dispatched
+kernels on this Mac, so no manual installation is needed for the current work.
+Do not install Xcode components, Rosetta or other privileged software without
+owner approval. The runtime capability probe is:
 
 ```sh
 clang -fobjc-arc -framework Foundation -framework Metal scripts/macos/hardware.m -o target/macos/hardware
@@ -69,7 +73,7 @@ disk was 532 GiB. No image pull occurs during proving.
 ## Build and verify sources
 
 ```sh
-cargo +1.93.0 build --release --features prove --manifest-path tools/macos-proof/Cargo.toml --config target/macos/local-engine.toml --target-dir target/macos/cpu
+cargo +1.93.0 build --locked --release --features prove --manifest-path tools/macos-proof/Cargo.toml --config target/macos/local-engine.toml --target-dir target/macos/cpu
 python3 scripts/macos/build-guest.py fibonacci --config target/macos/local-engine.toml
 python3 scripts/macos/build-guest.py sha256-chain --config target/macos/local-engine.toml
 python3 scripts/macos/build-guest.py segment-boundary --config target/macos/local-engine.toml
@@ -88,6 +92,12 @@ restores the root Git lock. Run it without concurrent root Cargo mutations.
 An unexpected lock diff fails and retains both snapshots for review.
 
 The unchanged verifier build has no local Cargo override or `prove` feature.
+`build-verifier.sh` always copies the reviewed standalone
+`tools/macos-proof/Verifier.Cargo.lock` and builds with `--locked`; external
+package versions and the Hemi Git pin match the root lock. The script seals the
+copied source/lock, metadata and executable. Both CPU and Metal smoke tests
+require this seal: rerun `build-verifier.sh` if the verifier predates provenance
+sealing or its sealed inputs changed. No dependency update is needed.
 `check-source.py` validates all resolved engine packages (17 in the worker,
 10 in the verifier in this session). Metadata and feature records are under
 `target/macos`; use the helper to reject accidental mixed-source builds.
@@ -97,6 +107,35 @@ worker. No replacement of the root engine pin is required.
 For a native C++/Metal source change, use a fresh backend-specific target
 directory or clean the affected sys/circuit package in that directory and
 rebuild. Do not reuse a CPU result as evidence that new Metal kernels ran.
+
+## Build the experimental hybrid harness
+
+The new local API `LocalProver::new_metal(name, staging_bytes)` requires the
+`risc0-zkvm/metal-hybrid` feature. The isolated `tools/macos-hybrid` manifest
+selects it explicitly and shares the proof harness's source. CPU builds and the
+native worker keep their existing defaults. Review the selected commit before
+supplying its full SHA:
+
+```sh
+ENGINE_DIR=/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0
+ENGINE_REV=0d5b41e8e44876c1e8b5a8a671aabc154e33106c
+sh scripts/macos/build-hybrid.sh "$ENGINE_DIR" "$ENGINE_REV"
+sh scripts/macos/build-verifier.sh
+```
+
+The hybrid executable is `target/macos/hybrid/release/hemi-macos-hybrid-proof`;
+it does not replace `target/macos/cpu/release/hemi-macos-proof`. The build uses a
+separate target and lock, requires the zkvm/circuit hybrid feature chain plus
+the runtime Metal HAL, and seals the binary to engine HEAD/diff, source/lock,
+overrides and dependency metadata. Stage new engine files before building so
+the source diff records them; rebuild after changing sealed inputs.
+
+Only segment Poseidon2 Merkle pair folds use Metal. The harness sets a **512 KiB
+per-chunk staging cap** and reports actual completed work for every segment.
+Witness generation, NTTs, leaf hashing, other segment operations, recursion and
+identity remain CPU. Final Groth16 wrapping still uses the pinned local
+Linux/amd64 helper under emulation. The staging cap is not the whole process or
+VM memory budget. See [METAL.md](METAL.md) for API limits and synchronization.
 
 ## Local acceptance
 
@@ -110,6 +149,23 @@ Every attempt gets a new directory and a ledger entry. A multi-segment attempt
 must contain at least two segments and complete independent Groth16 verification.
 The ledger retains failures. The harness's RSS sampling excludes VM memory.
 Do not run the smoke harness concurrently with the worker test.
+
+To request the separate forced-Metal harness, after the hybrid build:
+
+```sh
+python3 scripts/macos/smoke.py --context colima-hemi-macos-cpu --mode metal --engine "$ENGINE_DIR" --repeat 2 --workload fibonacci
+python3 scripts/macos/smoke.py --context colima-hemi-macos-cpu --mode metal --engine "$ENGINE_DIR" --repeat 1 --workload segment-boundary --po2 16
+```
+
+`--mode cpu` is the default; `--mode metal` requires `--engine` and never silently
+falls back to an entirely CPU proof. Both modes share the one-proof lock. Metal
+attempts archive the checked hybrid and unchanged-verifier build seals. A passing
+result requires the full Groth16 proof, expected identity/public output,
+positive bounded Metal fold work for every segment, and independent verification
+including wrong-image, changed-journal and corrupted-seal rejection. Failed
+attempts and intermediate receipts remain recorded. These commands are
+reproduction instructions; consult [VALIDATION.md](VALIDATION.md) for actual
+executed outcomes.
 
 For real discovery/IPC/admission/lifecycle testing, run from the sourced shell:
 
@@ -134,8 +190,11 @@ suite; it has not yet been run. It may take approximately an hour with QEMU.
 
 Do not manually run the worker as a second server. The miner's WorkerPool
 launches it and supplies the helper lease. CPU and auto use one generic slot;
-forced metal fails. Calibration is unsupported. The two tiny benchmark inputs
-are not the GPU benchmark suite and must not produce comparative rankings.
+forced metal still fails. The separate hybrid acceptance harness does not
+enable worker Metal selection or an extra worker slot. Hybrid worker integration
+and repeated lifecycle validation remain separate work. Calibration is
+unsupported. The two tiny benchmark inputs are not the GPU benchmark suite and
+must not produce comparative rankings.
 
 ## Stop / remove
 

@@ -168,3 +168,115 @@ the user's request; no push. See METAL.md for the first actual GPU differential
 milestone: 222 cases / 404 completed commands, retained failures, exact source/
 binary binding, and a new complete CPU-only Groth16 regression proof. This does
 not enable a hybrid worker or satisfy complete-proof Gate 3.
+
+
+## Integrated Metal Merkle-fold milestone (2026-10-31)
+
+The hybrid acceptance binary explicitly selects
+`LocalProver::new_metal(..., 512 * 1024)` on engine
+`0d5b41e8e44876c1e8b5a8a671aabc154e33106c`. It consumes Metal-produced
+Poseidon2 Merkle-fold outputs in real segment proving. Witness generation,
+leaf hashing, transforms, constraint evaluation, FRI arithmetic, recursion and
+identity remain CPU; final Groth16 uses the same local emulated Linux/amd64
+helper. The worker's Metal mode remains disabled pending integration tests.
+
+The engine adds a default-preserving CPU HAL strategy, an opt-in bounded fold
+bridge, explicit local prover selection and per-segment completed-work reports.
+The Intel shadow verifier retains an explicit default CPU HAL type. No circuit,
+constant, key, verifier parameter, proof format, pinned engine or dependency
+version changed. The new hybrid lock uses only versions already in the root
+lock. Upstream and the supplied Hemi checkout remain clean and unchanged.
+
+Source-bound differential run `767200b6ed0c46058d177bee61fe6354` passed
+**235 cases / 451 completed GPU commands**, including 13 bridge cases / 47
+commands. New cases cover chunk boundaries/tails at 512 KiB and 4 KiB, sliced
+buffers with sentinels, full-tree in-place reuse and tracked allocations returning
+to baseline. Constructor budgets outside 4 KiB..16 MiB are rejected. These are
+correctness checks, not performance measurements. The retained kernel source
+hash remains `2fc1eb3c8a00e4fb40f5055dbaef08074e4c16cbc4e06b89de2bfe1e57d1bcd0`.
+
+Eight acceptance-control unit tests pass, covering incomplete/mislabeled GPU
+evidence, binary/source/lock/metadata changes and the exact hybrid feature chain.
+Their synthetic fixtures are **not** proof-generation evidence. The source guards
+also passed on actual CPU, primitive Metal, hybrid and unchanged-verifier build
+metadata. CPU metadata excludes Metal; hybrid metadata requires zkvm and RV32IM
+`metal-hybrid` plus ZKP `metal-runtime`.
+
+Commands actually executed (from the miner root, with the task-local env):
+
+```sh
+sh scripts/macos/build-hybrid.sh /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 0d5b41e8e44876c1e8b5a8a671aabc154e33106c
+sh scripts/macos/build-verifier.sh
+sh scripts/macos/build-metal.sh /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 0d5b41e8e44876c1e8b5a8a671aabc154e33106c
+python3 scripts/macos/test-metal.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --mode all
+python3 scripts/macos/test-proof-controls.py
+python3 scripts/macos/smoke.py --context colima-hemi-macos-cpu --mode metal --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --workload fibonacci --po2 18 --repeat 2
+```
+
+The independent verifier's cryptographic implementation is unchanged Git
+`f8dcbdf8124a3f1528146bb01d539c55545cbb3d`, without local engine overrides or
+proving features. Its reviewed standalone lock preserves external versions and
+permits a fresh `--locked` build. Every proof attempt archives the exact verifier
+binary/source/lock/metadata seal; hybrid attempts archive their engine/harness
+seal too. The runner rejects changed artifacts and requires all three negative
+checks in addition to positive final Groth16 verification.
+
+Build/audit failures retained: an initial unfiltered offline metadata request
+attempted to resolve uncached `android_system_properties`; adding the actual
+macOS platform filter resolved it without downloading/updating packages. An
+engine-workspace unit-test command could not resolve uncached `maybe-async` and
+is not counted as passed; the isolated harnesses built and exercised the code.
+Two in-progress hybrid builds compiled but were correctly refused a provenance
+seal because reviewed code/HEAD changed during their build. A stable committed
+rebuild was sealed before any accepted proof. One synthetic control test first
+failed on macOS `/var` versus `/private/var` canonicalization, then passed after
+its fixture was canonicalized. None of these attempts is treated as a proof.
+
+Review found and fixed command-buffer lifetime accumulation, a concurrent local
+request diagnostic race, Intel shadow-call type inference and fresh-verifier
+lock seeding. No invalid GPU memory access or hardware fault was injected. Linux/
+CUDA/Intel runtime tests are unavailable on this Mac; the Intel fix is source
+reviewed, not a claim of running Intel hardware.
+
+
+### Complete accepted outcomes
+
+| Run | Mode / workload | Segments | GPU completions | Wall seconds |
+|---|---|---:|---:|---:|
+| `d4e86941bd7b464f9954aa24ea1b2375` | metal / fibonacci | 1 | 194 | 168.439 |
+| `1ad9ae716a73463584b840fcf268bac4` | metal / fibonacci | 1 | 194 | 166.856 |
+| `0551842728b9449ab3d85de41a3668f8` | metal / segment-boundary | 5 | 1269 | 237.822 |
+| `08b5cca54b024b9ca9d3400f41b23b1b` | cpu / fibonacci | 1 | 0 | 165.581 |
+
+All four runs produced real final Groth16 receipts with 256-byte raw seals and
+passed the unchanged pinned verifier plus wrong-image, modified-journal and
+corrupted-seal rejection. Both hybrid Fibonacci runs exactly matched the CPU
+regression's program/input hashes, image, journal, po2 and cycle/segment stats;
+randomized receipt bytes were not compared. Every one of the five boundary
+segments recorded positive Metal work, totaling 1,269 completed commands.
+
+The final hybrid manifest whitespace cleanup rebuilt an executable identical
+to all three accepted hybrid runs. The final unchanged verifier also rechecked
+all three receipts after its manifest cleanup. Historical per-attempt build
+seals remain intact. The CPU all-features build exposes only `prove`, and its
+actual metadata excludes Metal. Fresh temporary verifier metadata resolves
+with `--locked --offline`, preserving the unchanged Git engine.
+
+Additional executed acceptance commands:
+
+```sh
+python3 scripts/macos/smoke.py --context colima-hemi-macos-cpu --mode metal --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --workload segment-boundary --po2 16 --repeat 1
+python3 scripts/macos/smoke.py --context colima-hemi-macos-cpu --mode cpu --workload fibonacci --po2 18 --repeat 1
+cargo +1.93.0 build --locked --release --manifest-path tools/macos-proof/Cargo.toml --all-features --config target/macos/local-engine.toml --target-dir target/macos/cpu
+```
+
+`evidence/hybrid-validation.json` binds exact commands, source/build manifests,
+receipt/seal/journal hashes and verifier evidence. `hybrid-measurements.csv`
+contains these smoke timings; `hybrid-bridge-cases.json` records bridge equality
+cases; `hemi-hybrid.patch` is the separately recorded engine diff since the
+primitive checkpoint. Raw attempts remain under `target/macos/runs`. No failed
+proof attempt occurred in this milestone; all earlier failures are retained.
+
+Next: expose the validated stage through the native worker, then test repeated
+requests, failure/restart and cancellation before enabling worker auto/Metal
+selection. Full Gate 3 stability/performance and network acceptance remain open.

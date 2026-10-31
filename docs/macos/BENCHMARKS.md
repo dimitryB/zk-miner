@@ -62,4 +62,27 @@ For the next formal benchmark, first run extended stability, then define an
 identical supported guest/input/po2 and resource envelope for CPU and an actually
 validated hybrid mode. Warm up and collect at least five complete alternating
 runs per mode; record cold start, failures, actual stages, thermal/background
-load and independently verified outputs. No hybrid mode is validated today.
+load and independently verified outputs. The isolated one-stage hybrid harness now passes complete proof acceptance; worker hybrid mode remains disabled.
+
+
+## First integrated hybrid correctness runs (2026-10-31)
+
+| Run | Mode / workload | Segments | GPU completions | Wall seconds |
+|---|---|---:|---:|---:|
+| `d4e86941bd7b464f9954aa24ea1b2375` | metal / fibonacci | 1 | 194 | 168.439 |
+| `1ad9ae716a73463584b840fcf268bac4` | metal / fibonacci | 1 | 194 | 166.856 |
+| `0551842728b9449ab3d85de41a3668f8` | metal / segment-boundary | 5 | 1269 | 237.822 |
+| `08b5cca54b024b9ca9d3400f41b23b1b` | cpu / fibonacci | 1 | 0 | 165.581 |
+
+These are sequential acceptance smoke timings, not a controlled speedup study.
+The declared GPU stage is segment Poseidon2 Merkle folds; recursion/identity stay
+CPU and the same local emulated Groth16 helper dominates total time. The two
+Fibonacci hybrid runs and CPU regression match expected public outputs and
+unchanged-verifier acceptance. Peak logical Metal staging was 524,288 bytes
+for every segment. Native RSS samples exclude VM/helper memory and are not
+combined as if unified memory supplied a second independent GPU budget.
+
+See evidence/hybrid-validation.json and hybrid-measurements.csv for exact stage
+timings, sampled RSS, source/binary identities and retained failures. Five
+alternating runs per mode, thermal controls and twenty-request worker stability
+remain unrun. No performance improvement or production readiness is claimed.
