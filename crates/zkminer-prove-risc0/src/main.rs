@@ -4,14 +4,17 @@
 //! Stderr is used for logging (captured and forwarded by host).
 
 use std::io::{self, BufReader, BufWriter};
+#[cfg(not(feature = "macos"))]
 use std::time::Instant;
 
 #[cfg(all(feature = "macos", not(all(target_os = "macos", target_arch = "aarch64"))))]
 compile_error!("the macos worker requires aarch64-apple-darwin");
 #[cfg(all(feature = "macos", any(feature = "cuda", feature = "rocm")))]
-compile_error!("macos CPU mode cannot be combined with CUDA or ROCm");
+compile_error!("macos mode cannot be combined with CUDA or ROCm");
 #[cfg(feature = "macos")]
 mod macos;
+#[cfg(feature = "macos-metal")]
+mod macos_metal;
 
 use anyhow::{Context, Result};
 #[cfg(not(feature = "macos"))]
@@ -28,6 +31,19 @@ include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
+    // Isolated, bounded capability probe: no IPC, guest, helper or network path.
+    #[cfg(feature = "macos-metal")]
+    if std::env::args().nth(1).as_deref() == Some("--macos-metal-probe") {
+        let result = (|| -> anyhow::Result<serde_json::Value> {
+            let budget: usize = std::env::args().nth(2)
+                .context("missing Metal staging budget")?.parse()?;
+            macos_metal::probe(budget)
+        })();
+        match result {
+            Ok(value) => { println!("{value}"); return; }
+            Err(error) => { eprintln!("Metal probe failed: {error:#}"); std::process::exit(1); }
+        }
+    }
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_env_filter(
@@ -147,7 +163,11 @@ fn run_worker_loop() -> Result<()> {
                     segments: None,
                 };
                 write_message(&mut stdout, &started)?;
-                match run_proof(&elf, &input_data, po2) {
+                #[cfg(feature = "macos")]
+                let result = macos::prove(request_id, &elf, &input_data, po2);
+                #[cfg(not(feature = "macos"))]
+                let result = run_proof(&elf, &input_data, po2);
+                match result {
                     Ok((journal, seal, duration_secs, cycles)) => {
                         let resp = WorkerResponse::ProofResult {
                             request_id,
@@ -228,7 +248,12 @@ fn run_worker_loop() -> Result<()> {
                 // Nothing to set up before a first proof.
                 let resp = WorkerResponse::WarmupDone {
                     request_id,
-                    summary: if cfg!(feature = "macos") { "CPU ready; emulated Groth16 helper preflight passed" } else { "nothing to warm up" }.to_string(),
+                    summary: {
+                        #[cfg(feature = "macos")]
+                        { macos::warmup_summary() }
+                        #[cfg(not(feature = "macos"))]
+                        { "nothing to warm up".to_string() }
+                    },
                     groth16_helper: cfg!(feature = "macos"),
                 };
                 write_message(&mut stdout, &resp)?;
@@ -260,6 +285,8 @@ fn run_worker_loop() -> Result<()> {
 }
 
 fn detect_gpu() -> (bool, Option<String>) {
+    #[cfg(feature = "macos")]
+    return macos::capabilities();
     #[cfg(feature = "cuda")]
     {
         if let Ok(output) = std::process::Command::new("nvidia-smi")
@@ -300,7 +327,8 @@ fn detect_gpu() -> (bool, Option<String>) {
             return (true, Some("AMD GPU".to_string()));
         }
     }
-    (false, None)
+    #[cfg(not(feature = "macos"))]
+    { (false, None) }
 }
 
 /// Execute the guest WITHOUT proving, returning its true cycle count.
@@ -329,8 +357,13 @@ fn run_execute(elf: &[u8], input_data: &[u8]) -> anyhow::Result<(u64, f64)> {
         .build()
         .map_err(|e| anyhow::anyhow!("execute: env build failed: {e}"))?;
 
-    let session = risc0_zkvm::default_executor()
-        .execute(env, elf)
+    #[cfg(feature = "macos")]
+    let executor = risc0_zkvm::LocalProver::new("macos-cpu-executor");
+    #[cfg(feature = "macos")]
+    use risc0_zkvm::Executor as _;
+    #[cfg(not(feature = "macos"))]
+    let executor = risc0_zkvm::default_executor();
+    let session = executor.execute(env, elf)
         .map_err(|e| anyhow::anyhow!("execute: {e}"))?;
 
     // `SessionInfo::cycles()` is the total cycle count, matching what proving reports.
@@ -363,9 +396,6 @@ const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 ///
 /// Called whether the proof succeeded or not: a wrap that failed part-way can still have built the
 /// cache, and the retry that follows needs the room most.
-#[cfg(feature = "macos")]
-fn release_groth16_cache_if_tight() {}
-
 #[cfg(not(feature = "macos"))]
 fn release_groth16_cache_if_tight() {
     static DECISION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -392,12 +422,6 @@ fn release_groth16_cache_if_tight() {
             tracing::warn!("could not release the Groth16 SRS cache: {e:#}");
         }
     }
-}
-
-#[cfg(feature = "macos")]
-fn run_proof(elf: &[u8], input_data: &[u8], po2: Option<u8>) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
-    risc0_zkvm::compute_image_id(elf).context("invalid program binary")?;
-    run_proof_once(elf, input_data, po2)
 }
 
 #[cfg(not(feature = "macos"))]
@@ -448,6 +472,7 @@ fn run_proof(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("proof failed after {MAX_ATTEMPTS} attempts")))
 }
 
+#[cfg(not(feature = "macos"))]
 fn run_proof_once(
     elf: &[u8],
     input_data: &[u8],
@@ -683,6 +708,17 @@ fn run_benchmarks() -> Vec<BenchmarkEntry> {
     results
 }
 
+#[cfg(feature = "macos")]
+fn benchmark_program(
+    name: &str, elf: &[u8], input: &[u8], weight: f64, precompile: bool,
+) -> Option<BenchmarkEntry> {
+    match macos::benchmark(name, elf, input, weight, precompile) {
+        Ok(entry) => Some(entry),
+        Err(error) => { tracing::error!("{name}: benchmark failed: {error:#}"); None }
+    }
+}
+
+#[cfg(not(feature = "macos"))]
 fn benchmark_program(
     name: &str,
     elf: &[u8],

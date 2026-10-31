@@ -4,8 +4,12 @@ Gate 1 passed: genuine complete CPU-path proofs, including final Groth16,
 accepted by an independently built unchanged Hemi verifier. Gate 2 passed:
 real miner WorkerPool discovery/IPC/admission, multiple complete proofs,
 wrapping timeout/cleanup, restart and shutdown. This is a bounded experimental
-local CPU slice with an emulated wrapping helper. Gate 3 hybrid Metal and
-network acceptance are **not run**. The whole specification is not complete.
+local slice with an emulated wrapping helper. Subsequent hybrid harness and
+native-worker milestones are recorded below. Full Gate 3 stability/performance
+and network acceptance remain open. The whole specification is not complete.
+
+The earlier sections retain their milestone-specific results and failures; later
+sections supersede historical statements about Metal availability.
 
 ## Source/build evidence
 
@@ -129,7 +133,7 @@ also exposed an exit race where BSD info disappears before a process leaves
 the group; it now conservatively retains that enumerated member. All those
 logs remain under `target/macos/test-*.log`; no failed proving is averaged away.
 
-## Remaining gates / unexecuted tests
+## Remaining gates at the initial CPU milestone (historical)
 
 Metal compilation, kernel execution, CPU/Metal differential comparisons,
 Metal-buffer lifetime/error tests, controlled five-run-per-mode benchmarking,
@@ -178,7 +182,8 @@ The hybrid acceptance binary explicitly selects
 Poseidon2 Merkle-fold outputs in real segment proving. Witness generation,
 leaf hashing, transforms, constraint evaluation, FRI arithmetic, recursion and
 identity remain CPU; final Groth16 uses the same local emulated Linux/amd64
-helper. The worker's Metal mode remains disabled pending integration tests.
+helper. At that harness milestone the worker's Metal mode was still disabled; the
+native-worker continuation below supersedes that status.
 
 The engine adds a default-preserving CPU HAL strategy, an opt-in bounded fold
 bridge, explicit local prover selection and per-segment completed-work reports.
@@ -277,6 +282,119 @@ cases; `hemi-hybrid.patch` is the separately recorded engine diff since the
 primitive checkpoint. Raw attempts remain under `target/macos/runs`. No failed
 proof attempt occurred in this milestone; all earlier failures are retained.
 
-Next: expose the validated stage through the native worker, then test repeated
-requests, failure/restart and cancellation before enabling worker auto/Metal
-selection. Full Gate 3 stability/performance and network acceptance remain open.
+That milestone's next step was native-worker integration, now recorded below.
+Full Gate 3 stability/performance and network acceptance remain open.
+
+
+## Native hybrid worker milestone (2026-10-31)
+
+The native worker now selects the validated segment Merkle-fold stage through
+its existing WorkerPool/generic slot. CPU and Metal builds are separate; one
+implementation handles `cpu|metal|auto`. A bounded real GPU differential probe
+precedes Metal capability reporting. Forced Metal cannot fall back; auto records
+a startup fallback reason. Explicit CPU avoids both the probe and GPU proving.
+Per-request evidence records actual GPU completions before recursion/wrapping
+and binds final image, journal and seal. No protocol fields changed.
+
+Miner changes start at `3b2720110c1721a53d19c09a6ff2a16235aeb9be`; reviewed
+uncommitted source hashes are bound in each worker/test build seal. Engine HEAD
+is unchanged `0d5b41e8e44876c1e8b5a8a671aabc154e33106c`. The original Git pin
+and independent verifier remain `f8dcbdf8124a3f1528146bb01d539c55545cbb3d`.
+Cargo.lock adds only four existing dependency edges to the worker, with no
+version/source-pin updates. The root manifest deliberately does not request a
+feature absent from the original pin; the local build explicitly enables the
+reviewed SDK feature using exact local overrides.
+
+Executed builds and focused checks, with `scripts/macos/env.sh` sourced:
+
+```sh
+python3 scripts/macos/build-worker.py --mode metal --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --config target/macos/local-engine.toml --revision 0d5b41e8e44876c1e8b5a8a671aabc154e33106c
+python3 scripts/macos/build-worker.py --mode cpu --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --config target/macos/local-engine.toml --revision 0d5b41e8e44876c1e8b5a8a671aabc154e33106c
+cargo +1.93.0 test -p zkminer-prove-risc0 --bin zkminer-prove-risc0 --features macos-metal,risc0-zkvm/metal-hybrid --release --config target/macos/local-engine.toml --target-dir target/macos/worker-metal macos::tests -- --nocapture
+python3 scripts/macos/test-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --worker-kind metal --mode metal --context colima-hemi-macos-cpu --repeat 3
+```
+
+Both final worker builds passed actual source checks and were sealed. The two
+mode/deadline unit tests passed; the temporary local-source lock was audited
+and the original Git root lock restored. Runtime probe equality passed at
+4096, 4097, 524288, 16777216-byte budgets (129, 129, 2, 1 completed GPU commands);
+4095 and 16777217 reject. Probe evidence is `/private/tmp/hemi-native-metal-probe.json`.
+A changed temporary worker binary and wrong upstream checkout were rejected by
+provenance guards. These controls are not proof-generation evidence.
+
+Native Metal run `f8ff5abb2cef4a19bb02e24fbcb318d0` passed **2 tests, 0 failed,
+0 ignored**, 777.73 seconds. Four real complete Groth16 outputs and three
+negative checks per output passed the unchanged verifier. The first three
+requests stayed in PID 8653; each recorded 194 completed GPU dispatches. The
+production supervisor cancelled PID 8653 during a running owned helper; a
+separate 70-second watchdog killed PID 12543 (observed elapsed 71.723s). Both
+interrupted requests had 194 completed Metal dispatches and verified succinct
+receipts before wrapping. They count as expected failures, never proof successes.
+After owned helpers were removed, PID 13430 produced another verified proof and
+shutdown left no worker/helper. Proof seconds: 163.997,159.590,159.140,164.465.
+
+The suite also executes real mode selection/capability and warmup checks,
+invalid mode/dev/skip-verification/budget startup rejection, protocol mismatch,
+missing-helper rejection, real execution and invalid-guest failure. The runner
+requires exact watchdog/cancellation logs for the observed worker PIDs; a generic
+error or early crash cannot satisfy those cases. It binds acceptance source and
+executable before and after the run, requires saved verified proof artifacts,
+and cannot count an ignored or empty test run as successful proving.
+
+Optional non-Mac check actually attempted:
+
+```sh
+cargo +1.93.0 metadata --locked --offline --manifest-path crates/zkminer-prove-risc0/Cargo.toml --features cuda --filter-platform x86_64-unknown-linux-gnu --format-version 1
+```
+
+It exited 101 because `approx v0.5.1` was not cached. No packages were updated or
+downloaded to bypass this; log `target/macos/native-worker-linux-cuda-metadata.log`.
+Non-Mac guards were reviewed, but Linux/CUDA/ROCm build/runtime validation is not
+claimed. The first Metal build was rebuilt after separating the parent-death
+cleanup deadline from shorter startup probes; only the final seal is used for
+accepted native proofs. No failed proof attempt is concealed by this rebuild.
+
+### Completed mode matrix and evidence
+
+The following additional commands were actually executed sequentially:
+
+```sh
+python3 scripts/macos/test-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --worker-kind cpu --mode auto --context colima-hemi-macos-cpu --proof-only --repeat 1
+python3 scripts/macos/test-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --worker-kind metal --mode cpu --context colima-hemi-macos-cpu --proof-only --repeat 1
+python3 scripts/macos/test-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --worker-kind metal --mode auto --context colima-hemi-macos-cpu --proof-only --repeat 1
+```
+
+| Run | Build / requested → observed | Verified proofs | Proof seconds | GPU commands per proof |
+|---|---|---:|---|---:|
+| `f8ff5abb2cef4a19bb02e24fbcb318d0` | metal / metal → metal |4|163.997,159.590,159.140,164.465|194|
+| `2b17330c44b84da099de8089a72032aa` | cpu / auto → cpu |1|164.497|0|
+| `0a20964eec5f4643b0805f52e49a4d44` | metal / cpu → cpu |1|164.718|0|
+| `ac9cf5773bf34427925ab5f29ce18ac5` | metal / auto → metal |1|164.798|194|
+
+All four source-bound attempts passed, with two actual tests and zero ignored
+per run. Seven complete real Groth16 outputs passed independent verification
+and 21 total tamper rejections. The CPU-only auto run records the explicit
+reason `worker was compiled without the macos-metal feature`; the Metal build's
+explicit CPU mode produces no GPU proving work, and auto selects validated
+Metal. Expected public outputs, program/input hashes, image and cycle/segment
+stats agree across modes; proof bytes are not required to match.
+
+`evidence/native-worker-validation.json` preserves all four run reports, exact
+commands/build seals, independent verification, artifact hashes, expected-failure
+ledger and optional Linux metadata failure. `native-worker-measurements.csv`
+retains every successful and deliberately interrupted request with timing/memory
+limits. Raw artifacts remain in `target/macos/worker-runs/<id>`. The complete
+miner diff is saved as `target/macos/native-worker-metal.patch`; engine diff for
+this continuation is empty. Separate prior engine diffs remain committed.
+
+The dedicated VM was stopped after `docker --context colima-hemi-macos-cpu ps -a`
+showed no remaining containers. No privileged installation or global toolchain
+change was needed. No push or network mining was performed.
+
+This is bounded native hybrid correctness/lifecycle acceptance. Extended
+20-request stability, native-worker hash/multi-segment/memory-pressure coverage,
+GPU hardware-fault recovery, driver allocation/growth measurements, benchmark/
+calibration IPC execution and controlled five-measured-runs-per-mode performance
+remain unrun. Prior harness hash/multi-segment coverage is retained separately.
+Exact contract-adapter and deployed/network verification remain unrun. None of
+these limits is bypassed by a build, mocked test or skipped test.

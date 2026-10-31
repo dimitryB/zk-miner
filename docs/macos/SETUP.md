@@ -42,8 +42,9 @@ cd /Users/dbur/dev/zk-miner
 export HEMI_MINER_DIR=/Users/dbur/dev/zk-miner
 source scripts/macos/env.sh
 rustup toolchain list
-ENGINE_REV=$(git -C /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 rev-parse HEAD)
-python3 scripts/macos/local-engine.py /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 target/macos/local-engine.toml --revision "$ENGINE_REV"
+ENGINE_DIR=/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0
+ENGINE_REV=0d5b41e8e44876c1e8b5a8a671aabc154e33106c
+python3 scripts/macos/local-engine.py "$ENGINE_DIR" target/macos/local-engine.toml --revision "$ENGINE_REV"
 ```
 
 Review the engine commit/diff before supplying ENGINE_REV. The generator requires
@@ -78,7 +79,7 @@ python3 scripts/macos/build-guest.py fibonacci --config target/macos/local-engin
 python3 scripts/macos/build-guest.py sha256-chain --config target/macos/local-engine.toml
 python3 scripts/macos/build-guest.py segment-boundary --config target/macos/local-engine.toml
 sh scripts/macos/build-verifier.sh
-python3 scripts/macos/build-worker.py --config target/macos/local-engine.toml --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0
+python3 scripts/macos/build-worker.py --mode cpu --engine "$ENGINE_DIR" --config target/macos/local-engine.toml --revision "$ENGINE_REV"
 cargo +1.93.0 build --locked --release -p zkminer-cli --bin zkminer --target-dir target/macos/miner
 ```
 
@@ -112,9 +113,9 @@ rebuild. Do not reuse a CPU result as evidence that new Metal kernels ran.
 
 The new local API `LocalProver::new_metal(name, staging_bytes)` requires the
 `risc0-zkvm/metal-hybrid` feature. The isolated `tools/macos-hybrid` manifest
-selects it explicitly and shares the proof harness's source. CPU builds and the
-native worker keep their existing defaults. Review the selected commit before
-supplying its full SHA:
+selects it explicitly and shares the proof harness's source. CPU builds retain
+their defaults; native-worker Metal support is selected separately below. Review
+the selected commit before supplying its full SHA:
 
 ```sh
 ENGINE_DIR=/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0
@@ -136,6 +137,51 @@ Witness generation, NTTs, leaf hashing, other segment operations, recursion and
 identity remain CPU. Final Groth16 wrapping still uses the pinned local
 Linux/amd64 helper under emulation. The staging cap is not the whole process or
 VM memory budget. See [METAL.md](METAL.md) for API limits and synchronization.
+
+## Build and configure the native Metal worker
+
+The native-worker integration has passed bounded forced-Metal lifecycle
+acceptance: three consecutive complete proofs, observed wrapping cancellation
+and watchdog cleanup, a verified proof after restart, and clean shutdown.
+Run `f8ff5abb2cef4a19bb02e24fbcb318d0` contains four unchanged-verifier-accepted
+Groth16 proofs with 194 completed Metal commands each. The CPU-build auto
+fallback and Metal-build forced-CPU/auto cases also passed. Across four
+source-bound runs, seven complete proofs (five Metal, two CPU) passed independent
+verification and 21 negative checks. Full Gate 3 remains open for extended
+stability and controlled measurements. See [VALIDATION.md](VALIDATION.md) for
+actual outcomes, separately from the standalone hybrid harness.
+
+```sh
+ENGINE_DIR=/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0
+ENGINE_REV=0d5b41e8e44876c1e8b5a8a671aabc154e33106c
+python3 scripts/macos/build-worker.py --mode metal --engine "$ENGINE_DIR" --config target/macos/local-engine.toml --revision "$ENGINE_REV"
+```
+
+The `macos-metal` worker feature is a marker plus optional host dependencies.
+The build script explicitly adds the local SDK's `risc0-zkvm/metal-hybrid`
+feature while preserving the original Git pin in the root manifests and lock.
+The Metal-capable executable is
+`target/macos/worker-metal/release/zkminer-prove-risc0`; CPU remains
+`target/macos/worker/release/zkminer-prove-risc0`. The basename, discovery and
+wire protocol are unchanged. Build CPU and Metal serially; source/binary seals
+must match before acceptance.
+
+Set `ZKMINER_RISC0_MODE=cpu`, `metal`, or `auto` before the supervisor starts the
+worker. Selection is frozen at startup. CPU skips the GPU probe. Forced Metal
+requires a successful isolated three-second probe that compiles retained kernels
+and compares actual GPU folds with CPU. Auto selects Metal on success or records
+a reason for CPU fallback on startup failure. Once selected, request failures do
+not trigger a backend change. A CPU-only build in auto mode records the missing
+Metal feature as its fallback reason.
+
+`ZKMINER_RISC0_METAL_STAGING_BYTES` defaults to `524288` bytes and must be within
+`4096..=16777216`. This bounds fold staging, not whole-process or VM memory.
+Optional `ZKMINER_RISC0_EVIDENCE_DIR` enables request JSON sidecars with
+requested/observed mode, actual segment work, timings, proof phases and hashes;
+the acceptance runner creates fresh sidecar directories automatically. Proof and
+benchmark requests share the bounded staged proving path and final verification.
+No new fields are added to the worker protocol. See [METAL.md](METAL.md) for the
+stage boundary and probe details.
 
 ## Local acceptance
 
@@ -167,34 +213,60 @@ attempts and intermediate receipts remain recorded. These commands are
 reproduction instructions; consult [VALIDATION.md](VALIDATION.md) for actual
 executed outcomes.
 
-For real discovery/IPC/admission/lifecycle testing, run from the sourced shell:
+For source-bound discovery/IPC/admission/lifecycle testing, use the new runner
+from the sourced shell after building the chosen worker and unchanged verifier:
 
 ```sh
-mkdir -p target/macos/worker-work
-export ZKMINER_RISC0_DOCKER_CONTEXT=colima-hemi-macos-cpu
-export ZKMINER_RISC0_WORK_ROOT=/Users/dbur/dev/zk-miner/target/macos/worker-work
-export ZKMINER_RISC0_MODE=cpu
-export ZKMINER_MACOS_WORKER=/Users/dbur/dev/zk-miner/target/macos/worker/release/zkminer-prove-risc0
-export ZKMINER_MACOS_PROGRAM=/Users/dbur/dev/zk-miner/target/macos/guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin
-export ZKMINER_MACOS_VERIFIER=/Users/dbur/dev/zk-miner/target/macos/verifier/release/hemi-macos-proof
-export ZKMINER_MACOS_EVIDENCE_DIR=/Users/dbur/dev/zk-miner/target/macos/worker-acceptance-new
-cargo +1.93.0 test --locked -p zkminer-prover --test macos_worker -- --ignored --nocapture
+python3 scripts/macos/test-worker.py --engine "$ENGINE_DIR" --worker-kind cpu --mode auto --context colima-hemi-macos-cpu --repeat 1 --proof-only
+python3 scripts/macos/test-worker.py --engine "$ENGINE_DIR" --worker-kind metal --mode cpu --context colima-hemi-macos-cpu --repeat 1 --proof-only
+python3 scripts/macos/test-worker.py --engine "$ENGINE_DIR" --worker-kind metal --mode metal --context colima-hemi-macos-cpu --repeat 3 --staging-bytes 524288
+python3 scripts/macos/test-worker.py --engine "$ENGINE_DIR" --worker-kind metal --mode auto --context colima-hemi-macos-cpu --repeat 1 --proof-only
 ```
 
-Use a fresh evidence-directory name each time. This test is ignored by default
-because it requires substantial local prerequisites; `--ignored` explicitly
-executes it. A skipped test is not a successful proof. Default is three
-consecutive successful requests, an intentional wrapping timeout, and a
-successful proof after restart. `ZKMINER_MACOS_REPEAT=20` requests the extended
-suite; it has not yet been run. It may take approximately an hour with QEMU.
+The worker kind selects the sealed CPU or Metal-capable binary; mode selects
+its startup policy. The CPU/auto case requires an explicit recorded fallback
+reason. The Metal/auto case expects actual Metal selection. Every command
+requires complete Groth16 proofs accepted by the unchanged verifier, including
+wrong-image, changed-journal and corrupted-seal rejection. Metal proofs also
+require positive bounded GPU work for every segment. The forced-Metal lifecycle
+command and the three listed CPU/auto cases have passed for this worker
+revision. The CPU-build auto case recorded an explicit missing-feature fallback;
+forced CPU in the Metal-capable build produced no GPU proof work, and auto in
+that build recorded 194 GPU proof commands. Exact run IDs and times appear in
+[METAL.md](METAL.md); these are correctness checks rather than a benchmark.
 
-Do not manually run the worker as a second server. The miner's WorkerPool
-launches it and supplies the helper lease. CPU and auto use one generic slot;
-forced metal still fails. The separate hybrid acceptance harness does not
-enable worker Metal selection or an extra worker slot. Hybrid worker integration
-and repeated lifecycle validation remain separate work. Calibration is
-unsupported. The two tiny benchmark inputs are not the GPU benchmark suite and
-must not produce comparative rankings.
+Each run acquires the same one-proof lock as smoke tests, creates a fresh
+`target/macos/worker-runs/<id>` directory, verifies build seals before and after,
+and preserves reports and failed attempts. The runner explicitly executes the
+ignored real-worker test; skipped tests are not accepted. Full lifecycle runs
+require at least three consecutive proofs, observed running-helper cancellation
+and timeout failures, and one independently verified proof after restart.
+`--proof-only` excludes lifecycle cases. `--repeat 20` requests extended stability
+coverage, which has not been established; it can take roughly an hour with QEMU.
+The default acceptance-execution bound is 3600 seconds, excluding test
+compilation; `--timeout` changes it, and
+`--failure-timeout` bounds the intentional timeout case (default 70 seconds).
+Owned native-worker RSS is sampled against 32 GiB; helper VM memory is excluded.
+The accepted forced-Metal lifecycle attempt reached a maximum sampled worker
+RSS of 2,013,675,520 bytes. This is the per-process maximum over the whole attempt,
+not a per-proof peak, and does not establish a GPU allocation peak or memory-growth
+trend. The stage cap is logical fold staging, excluding
+fixed kernel constants and driver overhead. Metal's recommended working-set
+size is a performance recommendation, not an entitlement to allocate that much.
+
+Keep the 20-request stability target and controlled benchmarks as separate
+checks. Performance comparisons require a cold-start record, warm-up and at
+least five complete measured runs per mode with identical engine, guest/input,
+po2, proof kind and thread/resource settings. Report median/range, failures and
+thermal/background-load limitations. Native worker hash/precompile,
+multi-segment and bounded memory-pressure workloads remain separate coverage;
+this runner currently exercises the Fibonacci fixture.
+
+Do not manually start a second worker server. The existing WorkerPool launches
+one generic macOS slot and supplies the helper lease for either selected mode.
+Calibration remains unsupported. The two tiny benchmark fixtures now use the
+same verified staged path as proofs, but do not establish comparative GPU
+rankings, speedup or profitability.
 
 ## Stop / remove
 

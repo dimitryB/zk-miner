@@ -9,10 +9,14 @@ verifier, circuits and keys are unchanged. Nothing has been pushed.
 The first integrated stage is in engine commit
 `0d5b41e8e44876c1e8b5a8a671aabc154e33106c`: segment Poseidon2 Merkle pair
 folds run on Metal while the rest of proving keeps its CPU implementations.
-This is exposed through a separate experimental acceptance harness. The native
-worker's forced-Metal mode remains disabled. See [VALIDATION.md](VALIDATION.md)
-and [HANDOFF.md](HANDOFF.md) for actual complete-proof outcomes; the commands
-and implementation described here do not by themselves establish a passing proof.
+This is exposed through the experimental acceptance harness and the opt-in
+native-worker integration described below. The bounded native forced-Metal
+proof/lifecycle milestone has passed: three consecutive proofs, controlled
+cancellation and watchdog cleanup, a verified restart proof, and shutdown.
+The current-revision CPU/auto matrix also passed: seven complete proofs across
+four source-bound runs, comprising five Metal and two CPU proofs. Full Gate 3
+remains open for extended stability and controlled measurements. See
+[VALIDATION.md](VALIDATION.md) and [HANDOFF.md](HANDOFF.md) for executed outcomes.
 
 ## Toolchain provisioning
 
@@ -148,7 +152,8 @@ python3 scripts/macos/smoke.py --context colima-hemi-macos-cpu --mode metal --en
 `tools/macos-proof`, and builds `target/macos/hybrid/release/hemi-macos-hybrid-proof`.
 The CPU executable remains under `target/macos/cpu`; `smoke.py` defaults to CPU.
 `--mode metal` and its required `--engine` select the explicit experimental
-harness. They do not enable `ZKMINER_RISC0_MODE=metal` in the native worker.
+harness. Native-worker selection has its own build and startup probe, described
+below.
 
 The build requires the whole hybrid feature chain, not only a linked Metal HAL.
 CPU, primitive-only and unchanged-verifier guards reject an unexpected hybrid
@@ -172,15 +177,135 @@ journal and corrupted seal. A successful primitive test, composite receipt or
 succinct receipt does not satisfy that acceptance condition. There is no speedup
 claim from these first complete-job tests.
 
+## Native-worker integration
+
+The native worker now has an opt-in `macos-metal` feature marker. The reviewed
+local build script additionally enables `risc0-zkvm/metal-hybrid`; the marker
+alone deliberately does not refer to this local-only engine feature. This keeps
+the original Hemi Git pin resolvable for CPU and existing non-Mac builds. The
+build verifies the exact local overrides and engine revision, checks metadata
+and feature closure, seals source and binary inputs, and restores the root
+Git-source lock after its bounded source-identity changes.
+
+From the sourced miner shell, after preparing the packed guests and verifier:
+
+```sh
+ENGINE_DIR=/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0
+ENGINE_REV=0d5b41e8e44876c1e8b5a8a671aabc154e33106c
+python3 scripts/macos/local-engine.py "$ENGINE_DIR" target/macos/local-engine.toml --revision "$ENGINE_REV"
+python3 scripts/macos/build-worker.py --mode cpu --engine "$ENGINE_DIR" --config target/macos/local-engine.toml --revision "$ENGINE_REV"
+python3 scripts/macos/build-worker.py --mode metal --engine "$ENGINE_DIR" --config target/macos/local-engine.toml --revision "$ENGINE_REV"
+```
+
+Both executables retain the basename `zkminer-prove-risc0`. CPU output stays in
+`target/macos/worker/release`; the Metal-capable build uses
+`target/macos/worker-metal/release`. Run builds serially because they inspect and
+temporarily rewrite the root lock. The worker still uses the existing discovery,
+IPC and admission paths; it adds no protocol fields or extra worker slot.
+
+`ZKMINER_RISC0_MODE` is read once at startup and frozen for that worker:
+
+| Requested mode | Startup behavior |
+|---|---|
+| `cpu` | Select CPU without running the Metal probe, including in a Metal-capable build |
+| `metal` | Require the isolated real Metal probe to succeed; otherwise startup fails |
+| `auto` (default) | Select Metal after a successful probe, or select CPU with a recorded fallback reason |
+
+The probe runs in a child process with a three-second deadline. It queries the
+actual device and memory capabilities, compiles retained kernels, and compares
+a bounded Metal fold against CPU, including sliced buffers and chunk tails.
+Positive completed GPU work is required. The reported
+`recommended_working_set_bytes` is Metal's performance recommendation, not a
+physical-memory guarantee or a second memory allowance alongside host RAM.
+The maximum buffer size is a capability limit, not an admission budget.
+A crash, compiler/dispatch failure or
+timeout can cause `auto` fallback only during startup; after mode selection a
+proving failure fails the request rather than changing backend.
+
+`ZKMINER_RISC0_METAL_STAGING_BYTES` defaults to `524288` and accepts
+`4096..=16777216`. It limits temporary fold staging, with fixed kernel constants
+and the rest of proving memory outside that cap. Proof and benchmark requests
+both use the same bounded staged pipeline: composite verification, CPU
+recursion, final pinned-helper Groth16 wrapping and receipt verification. The
+two tiny benchmark fixtures are not comparative GPU performance evidence.
+
+Optional `ZKMINER_RISC0_EVIDENCE_DIR` writes JSON sidecars in addition to logs.
+They record requested/observed mode, fallback reason, stage timings, proof
+phases, input/ELF and output hashes, and actual per-segment Metal counters.
+Partial stage evidence remains partial when wrapping or verification fails.
+These diagnostics do not alter the existing worker wire format.
+
+Timing fields disclose the boundaries currently available: `execution_and_segment`
+combines guest execution with segment proving; `recursion` measures succinct
+compression; `identity_and_wrap` combines final identity/compression and helper
+wrapping; `verification` times final receipt verification. Intermediate receipt
+verification and report overhead contribute to `total_ms`, which measures the
+request body and excludes worker startup and IPC overhead. The implementation
+does not claim separate execution/segment or identity/helper timings.
+
+The runner's per-worker sampled RSS peak excludes the helper VM and is not a
+Metal driver-allocation peak. The fold staging high-water mark is bounded
+logical storage; it excludes fixed kernel constants and driver overhead.
+Neither measure alone proves stable resident memory across repeated requests.
+
+The source-bound native acceptance runner is separate from `smoke.py`:
+
+```sh
+python3 scripts/macos/test-worker.py --engine "$ENGINE_DIR" --worker-kind metal --mode metal --context colima-hemi-macos-cpu --repeat 3 --staging-bytes 524288
+```
+
+It checks the worker and unchanged-verifier build seals, uses the shared
+one-proof lock, and saves each attempt under `target/macos/worker-runs`. The
+full suite requires three repeated proofs, observed wrapping cancellation and
+timeout cases, and a verified proof after worker restart. `--proof-only` omits
+those lifecycle cases and allows `--repeat 1`; it does not establish lifecycle
+acceptance. [SETUP.md](SETUP.md) includes CPU and auto-mode commands.
+
+The bounded forced-Metal lifecycle run
+`f8ff5abb2cef4a19bb02e24fbcb318d0` passed with four complete Groth16 proofs
+accepted by the unchanged verifier and all three negative-verification checks.
+The first three requests reused one worker and took 163.997, 159.590 and
+159.140 seconds; the independently verified proof after restart took 164.465
+seconds. Each proof recorded 194 completed Metal commands. Controlled
+cancellation and a 70-second watchdog case each observed a running owned helper
+after positive Metal work; helper cleanup, slot recovery, restart and shutdown
+passed. These two deliberate failures remain failure evidence, not extra proofs.
+
+The runner result is under
+`target/macos/worker-runs/f8ff5abb2cef4a19bb02e24fbcb318d0/result.json`.
+Its largest sampled worker RSS was 2,013,675,520 bytes, a per-process peak over
+the entire attempt rather than a separate peak for each proof; helper/VM memory
+is excluded. This is bounded lifecycle evidence, not a controlled benchmark,
+20-request stability result or driver-allocation growth study.
+
+The remaining startup-mode matrix also passed unchanged-verifier acceptance:
+
+| Worker build / requested mode | Observed mode | Request-body time | Proof GPU commands | Run |
+|---|---|---:|---:|---|
+| CPU / auto | CPU, explicit missing-`macos-metal` fallback reason | 164.497 s | 0 | `2b17330c44b84da099de8089a72032aa` |
+| Metal-capable / cpu | CPU, no fallback | 164.718 s | 0 | `0a20964eec5f4643b0805f52e49a4d44` |
+| Metal-capable / auto | Metal | 164.798 s | 194 | `ac9cf5773bf34427925ab5f29ce18ac5` |
+
+Together, the four source-bound attempts produced **seven complete proofs**
+(five Metal, two CPU) and **21 negative-verifier rejections**. The Rust runners
+reported eight executed tests and zero ignored tests; proof counts come from
+saved complete-proof evidence, not test counts. All attempts and individual
+worker/verifier records remain under `target/macos/worker-runs/<run-id>`.
+These mode checks establish selection behavior and correctness, not a controlled
+CPU-versus-Metal performance comparison.
+
 ## Historical primitive outcomes
 
 The records below describe the prior primitive milestone, before the integrated
 fold hook. Current hybrid build and complete-proof evidence belongs in
 [VALIDATION.md](VALIDATION.md) and the accompanying evidence files.
 
-Final committed engine: `130f98fb91f6c5ccb1d243a498bf303c760c6388`.
-The final sealed build and run used this exact clean engine checkout; no working
-diff. Actual commands were the build/test commands above, with mode `all`.
+Primitive-milestone engine: `130f98fb91f6c5ccb1d243a498bf303c760c6388`.
+That sealed build and run used this exact clean engine checkout, without a
+working diff, and the then-current `build-metal.sh` / `test-metal.py --mode all`
+from miner `0070e0b45c105ce9488bd9d2d2fef1b14af61e1f`. The current harness also
+contains bridge tests and requires the newer reviewed hybrid engine; its `all`
+mode is not the historical 222-case suite.
 The build manifest binds the binary hash to engine path/HEAD/diff, harness
 source/lock, generated overrides and resolved metadata. A changed binary or
 source state is rejected before GPU execution. Matching inputs, an incorrect
@@ -234,24 +359,40 @@ trusted setup, keys, verifier parameters or proof encoding changed. Existing
 CPU Buffer::to_vec slice behavior was observed but not changed; tests read the
 CPU reference through its view contract instead of repeating that defect.
 
-The CPU-only harness was rebuilt with Metal absent from its feature closure.
-Regression run `f738364b836b4e3a902203f6151f6276` completed a genuine Fibonacci
+At the primitive milestone, the CPU-only harness was rebuilt with Metal absent
+from its feature closure. Regression run `f738364b836b4e3a902203f6151f6276` completed a genuine Fibonacci
 Groth16 proof in 166.672 seconds, accepted by the unchanged verifier, with
 wrong-image/journal/seal rejection. The dedicated helper VM was stopped after
-testing; no helper remained. Root miner/engine lockfiles stayed unchanged; the
-isolated Metal lock introduces no dependency versions absent from the miner lock.
+that milestone's testing; no helper remained then. Root miner/engine lockfiles
+stayed unchanged during that milestone. Native-worker integration now records
+its added dependency edges in the miner lock without changing the Hemi engine
+pin or existing dependency versions. The isolated Metal lock introduces no
+dependency versions absent from the miner lock.
 
 ## Remaining scope
 
 The first segment fold hook and its staging budget are implemented. Full Gate 3
 also requires repeated hybrid worker stability and controlled complete-job
 measurements; those are separate from this experimental acceptance harness.
-Keep the native worker's forced-Metal mode disabled until its own integration,
-resource recovery and repeat tests are validated. Recursion, identity and
-wrapping retain their current CPU/helper implementations.
+The opt-in native worker has passed the bounded forced-Metal proof, cancellation,
+watchdog, restart and shutdown milestone described above, plus the source-bound
+CPU/auto proof matrix. Extended repeated-worker and controlled performance gates
+remain open. Recursion, identity and wrapping
+retain their current CPU/helper implementations.
 
 No production memory budget, GPU-fault recovery, sustained hybrid-worker
 stability, speedup or profitability is established. The current runtime path
 needs no manual installation. Optional future offline tooling would need
 compatible Xcode provisioning, with approval before any privileged setup.
+Before recommending unattended test use, run the configurable suite through at
+least 20 successful requests and retain all failed attempts. Controlled timing
+claims require a separate cold-start record, warm-up, and at least five measured
+complete runs per mode with identical engine, ELF/input, po2, proof format and
+thread/resource limits. Report counts, median, range and failures, plus thermal
+or power observations where available and background-load limitations.
+
+This Fibonacci worker lifecycle suite does not establish native hybrid hash/
+precompile, multi-segment or bounded memory-pressure coverage; earlier harness
+results remain separate evidence. Driver-level GPU fault recovery and existing
+non-Mac runtime tests must also be reported as unrun when not exercised.
 Network acceptance remains unrun and unauthorized.

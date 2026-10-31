@@ -1,117 +1,190 @@
-# Native CPU proving implementation
+# Native macOS CPU and hybrid proving architecture
 
-The miner keeps backend `risc0` and protocol v5 unchanged. It discovers the
-new generic executable `zkminer-prove-risc0` using existing discovery. A
-`macos` feature compiles the shared worker for aarch64-apple-darwin without
-CUDA/ROCm. Existing non-Mac code paths remain behind their original features.
-One generic worker serializes requests; CPU and Metal are not separate devices.
-No marketplace commands are invoked by setup or acceptance scripts.
+The native miner and worker keep backend `risc0`, protocol v5 and the generic
+executable basename `zkminer-prove-risc0`. Existing discovery launches one Mac
+worker slot and serializes requests; CPU and Metal are not separate devices.
+The worker shares the existing protocol implementation and keeps non-Mac paths
+behind their original features. Setup and acceptance scripts perform local work
+without invoking marketplace commands.
 
-## Cryptographic boundary
+The CPU baseline and standalone hybrid harness have complete independently
+verified Groth16 evidence. The native forced-Metal worker has also passed a
+bounded lifecycle milestone: three consecutive proofs, controlled wrapping
+cancellation/watchdog cleanup, one verified proof after restart, and shutdown.
+Its four proofs each recorded 194 Metal completions and passed the unchanged
+verifier and negative checks. CPU-build auto fallback, Metal-build forced CPU,
+and Metal-build auto selection also passed: seven complete proofs across four
+source-bound runs (five Metal, two CPU), with 21 negative-verifier rejections.
+Full Gate 3 remains open for extended stability and controlled measurements.
+Exact results and failures belong in [VALIDATION.md](VALIDATION.md) and
+[HANDOFF.md](HANDOFF.md).
 
-All engine packages derive from Hemi commit
-`f8dcbdf8124a3f1528146bb01d539c55545cbb3d`. Six engine files change: explicit
-Metal feature propagation/build gating and opt-in macOS helper ownership.
-Circuit code, kernels, security parameters, keys, verifier parameters, public
-inputs and raw 256-byte Groth16 seal format are unchanged. Upstream 5.0.0
-HEAD is a reference only; its restored Metal circuit APIs are not a drop-in
-replacement for this SDK 3.0.6 tree.
+## Cryptographic and source boundary
 
-The harness directly constructs LocalProver. Worker preflight rejects remote,
-dev, skip-build and injection overrides, then selects local executor/prover;
-metadata confirms no Bonsai/GPU feature closure. Both compile with
-`disable-dev-mode`. The independent verifier is a separate build with the
-original Git source, no local patches and no proving features. It accepts the
-complete receipt or reconstructs the expected receipt claim from raw worker
-seal/journal, then rejects wrong image, changed journal and corrupted seal.
-This tests the worker's real output format, not a deployed contract adapter.
+The reviewed engine is `0d5b41e8e44876c1e8b5a8a671aabc154e33106c`, descended
+from Hemi's pinned `f8dcbdf8124a3f1528146bb01d539c55545cbb3d`. The miner's
+Git pin remains unchanged. The adaptation retains the pinned circuit, exact
+field arithmetic, security parameters, keys, verifier parameters, public inputs
+and raw 256-byte Groth16 seal format. Retained Metal buffer and empty-input
+handling fixes are checked against CPU behavior; they do not replace the proof
+system. Supplied upstream remains a read-only reference rather than a replacement
+for the SDK 3.0.6 engine.
+
+CPU construction uses `LocalProver::new`; explicit hybrid construction uses
+`LocalProver::new_metal(name, staging_bytes)`. Worker preflight rejects remote,
+dev, skip-build, skip-verification and injection overrides, then selects the
+local executor/prover. Acceptance builds disable development proofs. Source
+metadata checks the complete local dependency graph and expected feature closure;
+a linked Metal framework alone is not proof of GPU execution.
+
+The independent verifier uses the unchanged pinned Git source, no local patches
+and no proving features. It accepts complete receipts or reconstructs the
+expected claim from raw worker seal/journal, then rejects wrong image, changed
+journal and corrupted seal. Exact contract-adapter encoding and deployed-verifier
+execution remain unrun; library verification does not establish those results.
 
 Guests are unchanged miner fixtures built in isolated workspaces. The v3
 ProgramBinary contains the authentic user ELF plus the pinned V1COMPAT kernel;
 a raw user ELF is not accepted as that container. Source, ELF, kernel, packed
-program, image and input hashes are retained. Patches are explicit for both
-crates.io and Git sources and for each independent guest workspace. Metadata
-is checked, not inferred from manifest entries. Root lock changes add only
-existing `libc` and `risc0-binfmt` dependencies to the worker: no package/version
-updates. `build-worker.py` records a temporary local-source lock and restores
-the Git lock after validating its diff. Do not run concurrent Cargo commands
-that mutate that root lock during this script.
+program, image and input hashes are retained. Explicit overrides cover crates.io,
+Git sources and independent guest workspaces. Root lock changes record dependency
+edges using already-resolved packages without changing the engine pin or package
+versions. `build-worker.py` validates a temporary local-source lock, records it,
+then restores the root Git-source lock. Builds that mutate that lock run serially.
 
-## New interfaces and limits
+## Selection and interfaces
 
-* Build feature `macos`, binary `zkminer-prove-risc0`, authentic packed guests
-  supplied through `ZKMINER_RISC0_GUEST_DIR`; absent/stub guests fail the build.
-* `ZKMINER_RISC0_MODE=cpu|auto|metal`. Default auto reports CPU fallback because
-  Metal is not validated. Forced metal fails before handshake. CPU means native
-  CPU execution/segments/recursion/identity with emulated final wrapping.
-* `ZKMINER_RISC0_DOCKER_CONTEXT`: explicit local Unix-socket context with the
-  pinned image already present. `ZKMINER_RISC0_WORK_ROOT`: existing shared local
-  directory. The parent creates a unique owned subdirectory and helper name.
-* Internal supervisor settings `RISC0_GROTH16_CONTAINER_NAME` and
-  `RISC0_WORK_DIR` are per worker lease; sequential requests reuse the lease,
-  and each helper is `--rm`. Normal worker use requires the parent supervisor.
-* Prove/Execute: at most 4M guest cycles, po2 14..18 (default 18), six Rayon
-  threads, no Mac proof retry ladder. Inputs outside those bounds fail.
-* Two small genuine benchmark programs are advertised: Fibonacci(20) and
-  SHA-256-chain(10). Calibration is explicitly unsupported. Benchmark values
-  are not comparable to existing GPU suite scores because input sizes differ.
-* Warmup reports helper preflight, not a fabricated proof or GPU warmup.
-  IPC stdout remains binary-only; mode and stage diagnostics use stderr.
+* `macos` builds the native CPU-capable worker. `macos-metal` is an opt-in worker
+  marker with host dependencies; the local build script additionally enables the
+  reviewed SDK's `risc0-zkvm/metal-hybrid` feature. Keeping that local-only feature
+  out of the marker preserves resolution against the original Git pin.
+* CPU and Metal-capable binaries have the same basename under separate
+  `target/macos/worker` and `target/macos/worker-metal` directories. Build seals
+  bind source inputs, engine revision/diff, fixtures, features, locks and binary.
+* `ZKMINER_RISC0_MODE=cpu|metal|auto` is frozen at startup. CPU skips the GPU probe.
+  Metal requires a usable device and fails startup otherwise. Auto selects Metal
+  after a successful probe or records an explicit CPU fallback reason. Fallback
+  occurs only at startup; a later proving failure does not change backend.
+* The isolated three-second probe compiles retained kernels, queries actual
+  device capabilities and compares real bounded Metal folds with CPU. Positive
+  completed GPU work is required. A CPU-only build reports its missing Metal
+  feature as the reason for auto fallback.
+* `ZKMINER_RISC0_METAL_STAGING_BYTES` defaults to `524288`, range
+  `4096..=16777216`. Optional `ZKMINER_RISC0_EVIDENCE_DIR` enables per-request JSON
+  sidecars. Mode, fallback reason, stage timings and counters are diagnostics,
+  not additions to the positional worker wire format.
+* `ZKMINER_RISC0_DOCKER_CONTEXT` names an explicit local Unix-socket context with
+  the pinned helper image already present. `ZKMINER_RISC0_WORK_ROOT` names the
+  shared local directory. The supervisor creates a unique owned directory and
+  helper lease through internal `RISC0_GROTH16_CONTAINER_NAME` and `RISC0_WORK_DIR`.
+* Authentic packed guests come from `ZKMINER_RISC0_GUEST_DIR`; absent or stub
+  guests fail the build. Prove/Execute allow at most 4M guest cycles, po2 14..18
+  (default 18), six Rayon threads and no Mac proof retry ladder.
+* The genuine Fibonacci(20) and SHA-256-chain(10) benchmark fixtures use the same
+  staged proving and final-verification path as proof requests. Calibration is
+  explicitly unsupported. Tiny-fixture results are not comparable GPU rankings.
+
+Warmup returns the completed startup preflight/capability summary; it does not
+claim a complete proof. The existing capability response reports the observed
+GPU availability and device name. Normal worker stdout remains binary IPC;
+structured diagnostics use stderr or sidecars. Only the isolated internal probe
+uses captured JSON stdout. The dispatcher's legacy `[cpu]` label can describe an
+unindexed generic slot; the capability response and per-request
+`requested_mode`/`observed_stages` evidence identify actual acceleration.
+
+## Stage boundary, ownership and timing
+
+Only segment Poseidon2 Merkle pair folding runs on Metal. Witness generation,
+NTTs, constraints, leaf hashing, FRI arithmetic, other segment operations,
+recursion and identity retain their pinned CPU implementations. Final Groth16
+wrapping uses the pinned local Linux/amd64 helper under QEMU emulation. This is
+not a fully native final-wrapping pipeline.
+
+CPU buffers own the proving state. Each fold chunk copies required digests into
+bounded shared Metal staging, dispatches the retained exact-arithmetic kernel,
+waits for `Completed`, and copies results back into the CPU buffer consumed by
+the proof. Staging owners and autoreleased command resources are released before
+the next chunk. Fixed constants and driver overhead are outside the staging cap.
+No selected fold silently falls back to CPU. Each completed proof segment must
+report positive GPU commands, fold calls and output digests, consistent input
+counts and staging within the configured cap.
+
+The worker verifies composite, succinct and final Groth16 receipts. Sidecars
+preserve proof phases and actual per-segment evidence even if a later stage
+fails. Current timings combine execution with segment proving and combine final
+identity transformation with wrapping; recursion and final verification have
+separate measurements. `total_ms` covers the request body, excluding startup and
+IPC overhead. These boundaries are disclosed rather than presented as finer
+measurements than the instrumentation supports.
 
 ## Resource and lifecycle policy
 
-The supplied default Colima VM was full. A separate local VM uses 6 CPUs,
-32 GiB RAM and 80 GiB disk; Rosetta is not installed, so its x86 helper uses
-QEMU binfmt. Image and proving artifacts are pinned (see evidence). Each
-worker helper has `--pull never --network none --memory 24g --cpus 6` and an
-internal 1800-second `timeout` backstop. The parent owns the exact helper name
-and removes only that helper on shutdown/timeout/drop. No global prune/kill
-is used. A worker parent-watch thread also cleans its lease if the parent dies.
-If both processes are forcibly killed or Docker is unreachable, the helper's
-internal deadline is the remaining bound; daemon failure recovery is not tested.
+The dedicated Colima VM uses 6 CPUs, 32 GiB RAM and 80 GiB disk. Rosetta is not
+installed, so the x86 helper uses QEMU binfmt. Image and proving artifacts are
+pinned. Helpers have `--pull never --network none --memory 24g --cpus 6` and an
+internal 1800-second timeout. Sequential requests reuse the worker lease; each
+helper is `--rm`. The supervisor removes only its exact helper on
+shutdown/timeout/drop, and a worker parent-watch thread cleans that lease if the
+parent dies. If both processes are killed or Docker is unreachable, the helper's
+internal deadline is the remaining bound; daemon-failure recovery is untested.
 
-macOS process identity uses proc_pidinfo start time, parent PID and group
-leader identity; missing identity fails closed. Each worker owns its process
-group. Native proc_listpids enumerates surviving group members, excluding
-zombies, while an unreaped leader pins its identity. Process-group unit tests
-exercise real child processes. Linux proc/cgroup paths are preserved.
+macOS process identity uses proc_pidinfo start time, parent PID and group-leader
+identity; missing identity fails closed. Workers own process groups. Native
+proc_listpids enumerates surviving members, excluding zombies, while an unreaped
+leader pins identity. Process-group tests use real children. Existing Linux
+proc/cgroup paths are preserved; unavailable non-Mac runtime tests remain unrun.
 
-Host capacity comes from hw.memsize. Admission uses a conservative *estimate*
+Host capacity comes from hw.memsize. Admission estimates available memory as
 `(free_pages + min(file_backed_pages, inactive_pages)/2) * page_size`, then
 reserves 16 GiB. This is not Darwin's guarantee of allocatable memory or a
-memory-pressure metric. Free pages alone proved unusable after filesystem
-cache growth. Anonymous/compressed pages receive no separate credit; overlapping
-cache counters are not added. A one-second watchdog checks worker RSS <=32 GiB
-and the available estimate >=8 GiB; failed observations terminate only the
-identity-checked owned process group. Sampling is not a kernel memory limit.
-Helper memory is capped separately inside the 32 GiB VM, whose host footprint
-already reduces host availability. There is no invented GPU capacity and no
-second 128 GiB budget. Native worker cgroup-style anonymous/high-water metrics
-remain unavailable; the existing scheduler may conservatively recycle a warm
-worker instead of crediting unknown retained memory. Harness RSS samples exclude
-the VM/helper and are explicitly labeled; do not add overlapping figures.
+memory-pressure metric. Anonymous/compressed pages receive no separate credit,
+and overlapping cache counters are not added. A one-second watchdog requires
+worker RSS <=32 GiB and the available estimate >=8 GiB; failed observations
+terminate only the identity-checked owned group. Sampling is not a kernel limit.
+The helper cap is inside the 32 GiB VM, whose host footprint already reduces
+host availability. CPU and GPU never receive independent 128 GiB allowances.
 
-Synchronous proving cannot consume IPC Cancel mid-proof. The parent deadline
-kills the owned worker group and cleans its helper, releases the slot and
-permits a restart. The real acceptance suite deliberately times out while a
-helper exists, then requires another independently verified complete proof.
-Malformed/oversized framing and version checks use the existing protocol.
+Metal maximum-buffer size is a device limit; recommended working-set size is a
+performance recommendation, not an allocation entitlement. The small configurable
+staging cap operates within the existing host admission policy. Native cgroup-like
+anonymous/high-water observations remain unavailable, so the scheduler can
+conservatively recycle a warm worker. Sampled native RSS excludes helper/VM
+memory; logical staging peaks exclude driver allocations. These figures must not
+be added together or treated as proof of leak-free repeated operation.
 
-## Known envelope and next Metal step
+Synchronous proving cannot consume IPC Cancel mid-proof. The parent watchdog
+terminates the owned group, removes its helper, releases the slot and permits
+restart. The source-bound acceptance suite requires observed wrapping
+cancellation/timeout cases and a complete independently verified proof after
+restart. Existing framing and version checks handle malformed/oversized requests.
+Native forced-Metal run `f8ff5abb2cef4a19bb02e24fbcb318d0` passed those bounded
+proof/lifecycle requirements. Its per-process RSS high-water mark over the whole
+attempt was 2,013,675,520 bytes, excluding the helper VM; this does not establish
+a per-proof allocation trend. The current-revision CPU/auto matrix also passed:
+a CPU-only build's auto mode recorded its missing-feature fallback, forced CPU
+in a Metal-capable build performed no GPU proof work, and auto selected the
+validated fold stage when available. The three additional requests each produced
+a complete independently verified Groth16 proof.
+
+## Known envelope and remaining gates
 
 The pinned recursion archive lacks `lift_rv32im_v2_13.zkr`; a tiny final segment
-can fail after valid segment proving. A boundary run at po2 14 exposed this.
-No artifact/key regeneration or upstream parameter substitution is permitted.
-A different supported segmentation must be verified explicitly; this worker
-cannot claim support for all marketplace jobs. Keccak-specific coverage and
-other guest precompiles are not established by SHA-256-chain coverage.
+can fail after valid segment proving. A po2-14 boundary run exposed this; the
+supported five-segment fixture was verified at po2 16. No key/artifact regeneration
+or upstream parameter substitution is permitted. This does not establish support
+for arbitrary marketplace jobs. Keccak and other precompile coverage are not
+established by SHA-256-chain tests.
 
-No complete proof uses Metal yet. The explicit experimental runtime compiler
-route now passes retained HAL arithmetic/NTT/hash differential tests; see
-METAL.md. The offline compiler is still absent (`xcrun --find metal` exits 72;
-no full Xcode). Provision it only with any required privileged-change approval.
-The next proving step is selecting one compatible segment stage. Newer upstream circuit/recursion
-code must be adapted selectively to the pinned engine, not imported wholesale.
-Feature gating and standalone HAL validation do not establish a hybrid prover.
-The Metal budget/synchronization and offset/boundary/error tests remain future
-work; no speedup, unattended stability or profitability claim is made.
+Standalone complete hybrid proofs and retained primitive/bridge differential
+results are recorded separately from native-worker acceptance. The runtime
+Metal compiler works without manual installation; offline `xcrun metal` and full
+Xcode remain absent. Any future privileged provisioning requires approval.
+
+Full Gate 3 still needs repeated hybrid-worker stability and controlled complete
+job measurements. Twenty successful requests precede unattended-use advice;
+comparative measurements require cold-start disclosure, warmup and at least five
+complete measured runs per mode with matched settings. Native hybrid workload
+and memory-pressure coverage, GPU-fault/driver-allocation observations, exact
+contract-adapter validation and non-Mac runtime coverage remain separate work.
+No speedup, unattended stability or profitability is claimed. Network acceptance
+is unrun and unauthorized.

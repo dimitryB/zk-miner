@@ -19,7 +19,11 @@ path = "src/main.rs"
 required-features = ["rocm"]
 
 [features]
-macos = ["risc0-zkvm/disable-dev-mode"]
+macos = ["risc0-zkvm/disable-dev-mode", "dep:serde_json", "dep:sha2"]
+# The local build script also enables risc0-zkvm/metal-hybrid explicitly.
+# Do not reference that local-only engine feature here: the unchanged Git pin
+# must still resolve for existing CPU/CUDA/ROCm builds.
+macos-metal = ["macos", "dep:risc0-zkp", "dep:metal"]
 cuda = ["risc0-zkvm/cuda", "risc0-groth16/cuda"]
 rocm = ["risc0-zkvm/rocm", "risc0-groth16/rocm"]
 
@@ -58,3 +62,7 @@ risc0-binfmt = "3.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+serde_json = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
+risc0-zkp = { version = "3.0", default-features = false, optional = true }
+metal = { version = "0.29", optional = true }

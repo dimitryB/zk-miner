@@ -1,6 +1,129 @@
-//! Conservative CPU bootstrap. No Metal path is claimed by this worker.
+//! Local macOS CPU / bounded Metal worker selection and proof diagnostics.
 use anyhow::{bail, ensure, Context, Result};
-use std::{path::PathBuf, process::Command, time::Duration};
+use risc0_zkvm::{LocalProver, Prover, ProverOpts};
+use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
+use std::{
+    path::PathBuf,
+    process::Command,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
+    time::{Duration, Instant},
+};
+
+#[cfg(feature = "macos-metal")]
+const STAGE: &str = "segment_poseidon2_merkle_fold";
+const DEFAULT_STAGING_BYTES: usize = 512 * 1024;
+const HELPER_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+#[cfg(feature = "macos-metal")]
+const METAL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+struct Config {
+    requested: String,
+    metal: bool,
+    fallback: Option<String>,
+    probe: Option<Value>,
+    staging_bytes: usize,
+    evidence_dir: Option<PathBuf>,
+    helper_container: String,
+}
+static CONFIG: OnceLock<Config> = OnceLock::new();
+fn config() -> &'static Config {
+    CONFIG.get().expect("macOS preflight precedes worker loop")
+}
+
+fn hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn select_mode(
+    requested: &str,
+    available: Result<Value>,
+) -> Result<(bool, Option<Value>, Option<String>)> {
+    match requested {
+        "cpu" => Ok((false, None, None)),
+        "metal" => Ok((
+            true,
+            Some(available.context("forced Metal unavailable")?),
+            None,
+        )),
+        "auto" => match available {
+            Ok(probe) => Ok((true, Some(probe), None)),
+            Err(error) => Ok((false, None, Some(format!("{error:#}")))),
+        },
+        other => bail!("unknown ZKMINER_RISC0_MODE {other:?}; use cpu, auto, or metal"),
+    }
+}
+
+#[cfg(feature = "macos-metal")]
+fn probe_metal(staging_bytes: usize) -> Result<Value> {
+    let (status, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
+        Command::new(std::env::current_exe()?)
+            .args(["--macos-metal-probe", &staging_bytes.to_string()]),
+        METAL_PROBE_TIMEOUT,
+        64 * 1024,
+    );
+    ensure!(
+        matches!(
+            status,
+            zkminer_prover_protocol::proc::Outcome::Ran { success: true, .. }
+        ),
+        "bounded Metal probe failed: {}",
+        status.describe()
+    );
+    let probe: Value = serde_json::from_str(&stdout).context("invalid Metal probe response")?;
+    ensure!(
+        probe["stage"] == STAGE
+            && probe["staging_limit_bytes"] == staging_bytes
+            && probe["completed_dispatches"]
+                .as_u64()
+                .is_some_and(|v| v > 0)
+            && probe["device_name"].as_str().is_some_and(|s| !s.is_empty())
+            && probe["unified_memory"] == true
+            && probe["max_buffer_bytes"]
+                .as_u64()
+                .is_some_and(|n| n >= staging_bytes as u64),
+        "Metal probe did not establish the required stage and device capabilities"
+    );
+    Ok(probe)
+}
+#[cfg(not(feature = "macos-metal"))]
+fn probe_metal(_staging_bytes: usize) -> Result<Value> {
+    bail!("worker was compiled without the macos-metal feature")
+}
+
+pub fn capabilities() -> (bool, Option<String>) {
+    let c = config();
+    (
+        c.metal,
+        c.probe
+            .as_ref()
+            .and_then(|p| p["device_name"].as_str().map(str::to_owned)),
+    )
+}
+
+pub fn warmup_summary() -> String {
+    let c = config();
+    if c.metal {
+        format!("Metal ready: segment Poseidon2 Merkle folds; other native stages CPU; emulated Groth16 helper preflight passed; staging={} bytes", c.staging_bytes)
+    } else {
+        format!(
+            "CPU ready; emulated Groth16 helper preflight passed; requested={}; fallback={}",
+            c.requested,
+            c.fallback.as_deref().unwrap_or("none")
+        )
+    }
+}
+
+fn prover() -> LocalProver {
+    #[cfg(feature = "macos-metal")]
+    if config().metal {
+        return LocalProver::new_metal("macos-metal-worker", config().staging_bytes);
+    }
+    LocalProver::new("macos-cpu-worker")
+}
 
 const IMAGE: &str = "risczero/risc0-groth16-prover:v2025-04-03.1";
 const DIGEST: &str = "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee";
@@ -8,7 +131,7 @@ const DIGEST: &str = "sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c6
 fn output(command: &mut Command) -> Result<String> {
     let (status, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
         command,
-        Duration::from_secs(10),
+        HELPER_PROBE_TIMEOUT,
         64 * 1024,
     );
     ensure!(
@@ -25,6 +148,10 @@ fn output(command: &mut Command) -> Result<String> {
 pub fn preflight() -> Result<()> {
     for key in [
         "RISC0_DEV_MODE",
+        "RISC0_SKIP_VERIFY",
+        "RISC0_SERVER_PATH",
+        "RISC0_API_URL",
+        "DOCS_RS",
         "RISC0_PROVER",
         "RISC0_EXECUTOR",
         "BONSAI_API_URL",
@@ -38,19 +165,19 @@ pub fn preflight() -> Result<()> {
             "unset {key} for native worker acceptance"
         );
     }
-    match std::env::var("ZKMINER_RISC0_MODE")
-        .as_deref()
-        .unwrap_or("auto")
-    {
-        "cpu" => {
-            tracing::info!("requested=cpu observed=cpu; Groth16 helper=linux/amd64 (emulated)")
-        }
-        "auto" => tracing::info!(
-            "requested=auto observed=cpu; fallback reason: Metal proving is not validated"
-        ),
-        "metal" => bail!("forced Metal is unavailable: no validated Metal proving stages"),
-        other => bail!("unknown ZKMINER_RISC0_MODE {other:?}; use cpu, auto, or metal"),
-    }
+    let requested = std::env::var("ZKMINER_RISC0_MODE").unwrap_or_else(|_| "auto".into());
+    ensure!(
+        ["cpu", "auto", "metal"].contains(&requested.as_str()),
+        "unknown ZKMINER_RISC0_MODE {requested:?}; use cpu, auto, or metal"
+    );
+    let staging_bytes: usize = std::env::var("ZKMINER_RISC0_METAL_STAGING_BYTES")
+        .map(|s| s.parse())
+        .unwrap_or(Ok(DEFAULT_STAGING_BYTES))
+        .context("invalid ZKMINER_RISC0_METAL_STAGING_BYTES")?;
+    ensure!(
+        (4096..=16 * 1024 * 1024).contains(&staging_bytes),
+        "Metal staging budget must be 4096..=16777216 bytes"
+    );
     let context = std::env::var("ZKMINER_RISC0_DOCKER_CONTEXT")
         .context("set a dedicated local Docker context")?;
     let endpoint = output(Command::new("docker").args([
@@ -88,6 +215,34 @@ pub fn preflight() -> Result<()> {
             .context("supervisor must supply a shared work directory")?,
     );
     ensure!(dir.is_dir(), "shared helper work directory does not exist");
+    let available = if requested == "cpu" {
+        Err(anyhow::anyhow!("CPU explicitly selected"))
+    } else {
+        probe_metal(staging_bytes)
+    };
+    let (metal, probe, fallback) = select_mode(&requested, available)?;
+    let evidence_dir = std::env::var_os("ZKMINER_RISC0_EVIDENCE_DIR").map(PathBuf::from);
+    if let Some(path) = &evidence_dir {
+        std::fs::create_dir_all(path).context("create worker evidence directory")?;
+    }
+    let state = Config {
+        requested,
+        metal,
+        fallback,
+        probe,
+        staging_bytes,
+        evidence_dir,
+        helper_container: name.clone(),
+    };
+    tracing::info!(
+        "macos_mode {}",
+        json!({"requested_mode":state.requested,"observed_mode":if metal {"metal"} else {"cpu"},
+        "fallback_reason":state.fallback,"probe":state.probe,"staging_limit_bytes":staging_bytes,
+        "other_native_stages":"cpu","groth16":"local_linux_amd64_helper"})
+    );
+    CONFIG
+        .set(state)
+        .map_err(|_| anyhow::anyhow!("macOS mode already initialized"))?;
     std::env::set_var("DOCKER_CONTEXT", &context);
     std::env::set_var("RISC0_PROVER", "local");
     std::env::set_var("RISC0_EXECUTOR", "local");
@@ -102,8 +257,12 @@ pub fn preflight() -> Result<()> {
         .spawn(move || loop {
             std::thread::sleep(Duration::from_secs(1));
             if unsafe { libc::getppid() } != parent {
-                let _ =
-                    output(Command::new("docker").args(["--context", &context, "rm", "-f", &name]));
+                // Cleanup keeps its own deadline; the shorter startup probes must
+                // not truncate parent-death removal of an already-running helper.
+                let _ = zkminer_prover_protocol::proc::output_with_timeout(
+                    Command::new("docker").args(["--context", &context, "rm", "-f", &name]),
+                    Duration::from_secs(10), 64 * 1024,
+                );
                 std::process::exit(1);
             }
         })?;
@@ -113,7 +272,7 @@ pub fn preflight() -> Result<()> {
 pub fn bound_env(builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>, po2: Option<u8>) -> Result<()> {
     ensure!(
         po2.is_none_or(|value| (14..=18).contains(&value)),
-        "po2 value out of valid range 14..=18 for macOS CPU bootstrap"
+        "po2 value out of valid range 14..=18 for macOS worker"
     );
     builder
         .segment_limit_po2(po2.unwrap_or(18) as u32)
@@ -138,4 +297,225 @@ pub fn benchmarks() -> &'static [(&'static str, &'static [u8], &'static [u8], f6
             true,
         ),
     ]
+}
+
+fn write_report(report: &Value, filename: &str) -> Result<()> {
+    tracing::info!("macos_proof {}", report);
+    if let Some(dir) = &config().evidence_dir {
+        let path = dir.join(filename);
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&temporary, serde_json::to_vec_pretty(report)?)?;
+        std::fs::rename(temporary, path)?;
+    }
+    Ok(())
+}
+
+struct Completed {
+    journal: Vec<u8>,
+    seal: Vec<u8>,
+    total_secs: f64,
+    cycles: u64,
+    stark_secs: f64,
+    wrap_secs: f64,
+}
+
+fn prove_staged(
+    request_id: u64,
+    operation: &str,
+    elf: &[u8],
+    input: &[u8],
+    po2: Option<u8>,
+) -> Result<Completed> {
+    let c = config();
+    let total = Instant::now();
+    let filename = if operation == "prove" {
+        format!("{}-{request_id}.json", std::process::id())
+    } else {
+        format!("{}-benchmark-{request_id}.json", std::process::id())
+    };
+    let mut report = json!({"schema_version":1,"worker_pid":std::process::id(),"request_id":request_id,
+        "operation":operation,"requested_mode":c.requested,"observed_mode":if c.metal {"metal"} else {"cpu"},
+        "fallback_reason":c.fallback,"phase":"started","proof_kind":null,"image_id":null,
+        "elf_sha256":hash(elf),"input_sha256":hash(input),"po2":po2.unwrap_or(18),
+        "helper_container":c.helper_container,"helper_arch":"linux/amd64 (emulated)",
+        "staging_limit_bytes":c.staging_bytes,"stage_ms":{},"error":null});
+    write_report(&report, &filename)?;
+    let result = (|| -> Result<Completed> {
+        let image = risc0_zkvm::compute_image_id(elf).context("invalid program binary")?;
+        report["image_id"] = json!(image.to_string());
+        let mut builder = risc0_zkvm::ExecutorEnv::builder();
+        builder.write_slice(input);
+        bound_env(&mut builder, po2)?;
+        let env = builder.build()?;
+        let prover = prover();
+        let started = Instant::now();
+        let info = prover.prove_with_opts(env, elf, &ProverOpts::composite())?;
+        let segment_secs = started.elapsed().as_secs_f64();
+        info.receipt
+            .verify(image)
+            .context("verify composite receipt")?;
+        report["stats"] = serde_json::to_value(&info.stats)?;
+        let mut observed = json!({"other_segment_operations":"cpu","recursion":"cpu",
+            "identity":"cpu","groth16":"local_linux_amd64_helper"});
+        #[cfg(feature = "macos-metal")]
+        if c.metal {
+            let segments = prover.metal_stage_reports();
+            ensure!(
+                segments.len() == info.stats.segments,
+                "Metal evidence missing for a proved segment"
+            );
+            for (index, stage) in segments.iter().enumerate() {
+                ensure!(
+                    stage.segment_index as usize == index
+                        && stage.completed_dispatches > 0
+                        && stage.fold_calls > 0
+                        && stage.output_digests > 0
+                        && stage.input_digests == 2 * stage.output_digests
+                        && stage.peak_staging_bytes <= stage.staging_limit_bytes
+                        && stage.staging_limit_bytes == c.staging_bytes,
+                    "inconsistent or absent Metal work in segment {index}"
+                );
+            }
+            let completed: u64 = segments.iter().map(|s| s.completed_dispatches).sum();
+            observed["metal_stage"] = json!({"name":STAGE,"segments":segments,"completed_dispatches":completed,
+                "kernel_source_sha256":hash(risc0_zkp::hal::metal::runtime_kernel_source().as_bytes())});
+        }
+        if !c.metal {
+            observed["segment"] = json!("cpu");
+        }
+        report["observed_stages"] = observed;
+        report["phase"] = json!("segments_complete");
+        report["proof_kind"] = json!("composite");
+        report["stage_ms"]["execution_and_segment"] = json!(segment_secs * 1000.0);
+        report["total_ms"] = json!(total.elapsed().as_secs_f64() * 1000.0);
+        write_report(&report, &filename)?;
+
+        let started = Instant::now();
+        let succinct = prover.compress(&ProverOpts::succinct(), &info.receipt)?;
+        let recursion_secs = started.elapsed().as_secs_f64();
+        succinct.verify(image).context("verify succinct receipt")?;
+        report["stage_ms"]["recursion"] = json!(recursion_secs * 1000.0);
+        report["phase"] = json!("wrapping");
+        report["proof_kind"] = json!("succinct");
+        report["total_ms"] = json!(total.elapsed().as_secs_f64() * 1000.0);
+        write_report(&report, &filename)?;
+
+        let started = Instant::now();
+        let receipt = prover.compress(&ProverOpts::groth16(), &succinct)?;
+        let wrap_secs = started.elapsed().as_secs_f64();
+        let started = Instant::now();
+        receipt
+            .verify(image)
+            .context("final Groth16 receipt verification failed")?;
+        let seal = receipt
+            .inner
+            .groth16()
+            .context("expected complete Groth16 receipt")?
+            .seal
+            .clone();
+        ensure!(seal.len() == 256, "unexpected Groth16 seal size");
+        let journal = receipt.journal.bytes.clone();
+        report["stage_ms"]["identity_and_wrap"] = json!(wrap_secs * 1000.0);
+        report["stage_ms"]["verification"] = json!(started.elapsed().as_secs_f64() * 1000.0);
+        report["phase"] = json!("complete");
+        report["proof_kind"] = json!("groth16");
+        // Bound diagnostics even if a guest produces a large public journal.
+        report["journal_hex"] = if journal.len() <= 4096 {
+            json!(journal
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>())
+        } else {
+            Value::Null
+        };
+        report["journal_sha256"] = json!(hash(&journal));
+        report["seal_sha256"] = json!(hash(&seal));
+        report["total_ms"] = json!(total.elapsed().as_secs_f64() * 1000.0);
+        write_report(&report, &filename)?;
+        Ok(Completed {
+            journal,
+            seal,
+            total_secs: total.elapsed().as_secs_f64(),
+            cycles: info.stats.total_cycles,
+            stark_secs: segment_secs + recursion_secs,
+            wrap_secs,
+        })
+    })();
+    if let Err(error) = &result {
+        report["phase"] = json!("failed");
+        report["error"] = json!(format!("{error:#}"));
+        report["total_ms"] = json!(total.elapsed().as_secs_f64() * 1000.0);
+        if let Err(write_error) = write_report(&report, &filename) {
+            tracing::error!("failed to save proof error diagnostic: {write_error:#}");
+        }
+    }
+    result
+}
+
+pub fn prove(
+    request_id: u64,
+    elf: &[u8],
+    input: &[u8],
+    po2: Option<u8>,
+) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
+    let proof = prove_staged(request_id, "prove", elf, input, po2)?;
+    Ok((proof.journal, proof.seal, proof.total_secs, proof.cycles))
+}
+
+pub fn benchmark(
+    name: &str,
+    elf: &[u8],
+    input: &[u8],
+    weight: f64,
+    precompile: bool,
+) -> Result<zkminer_prover_protocol::BenchmarkEntry> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let proof = prove_staged(
+        NEXT.fetch_add(1, Ordering::Relaxed),
+        "benchmark",
+        elf,
+        input,
+        None,
+    )?;
+    Ok(zkminer_prover_protocol::BenchmarkEntry {
+        program_name: name.into(),
+        prover_backend: "risc0".into(),
+        cycles: proof.cycles,
+        duration_secs: proof.stark_secs,
+        throughput: proof.cycles as f64 / proof.stark_secs,
+        weight,
+        precompile,
+        wrap_secs: Some(proof.wrap_secs),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_selection_never_falls_back_for_forced_metal() {
+        assert!(select_mode("metal", Err(anyhow::anyhow!("device unavailable"))).is_err());
+        let (metal, probe, reason) =
+            select_mode("auto", Err(anyhow::anyhow!("device unavailable"))).unwrap();
+        assert!(!metal && probe.is_none());
+        assert!(reason.unwrap().contains("device unavailable"));
+        assert!(select_mode("invalid", Ok(json!({}))).is_err());
+        let (metal, _, reason) = select_mode("cpu", Err(anyhow::anyhow!("ignored"))).unwrap();
+        assert!(!metal && reason.is_none());
+        assert!(
+            select_mode("auto", Ok(json!({"available":true})))
+                .unwrap()
+                .0
+        );
+    }
+
+    #[test]
+    fn startup_probe_budgets_fit_the_existing_handshake() {
+        use zkminer_prover_protocol::proc::{max_overhead, HANDSHAKE_TIMEOUT};
+        let probes = 2 * (HELPER_PROBE_TIMEOUT + max_overhead());
+        #[cfg(feature = "macos-metal")]
+        let probes = probes + METAL_PROBE_TIMEOUT + max_overhead();
+        assert!(probes + Duration::from_millis(500) < HANDSHAKE_TIMEOUT);
+    }
 }
