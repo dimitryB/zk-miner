@@ -241,8 +241,9 @@ and preserves reports and failed attempts. The runner explicitly executes the
 ignored real-worker test; skipped tests are not accepted. Full lifecycle runs
 require at least three consecutive proofs, observed running-helper cancellation
 and timeout failures, and one independently verified proof after restart.
-`--proof-only` excludes lifecycle cases. `--repeat 20` requests extended stability
-coverage, which has not been established; it can take roughly an hour with QEMU.
+`--proof-only` excludes lifecycle cases. `--repeat 20` has now passed twenty
+consecutive WorkerPool requests under normal recycling; it took roughly an hour
+with QEMU and does not establish twenty proofs in one long-lived process.
 The default acceptance-execution bound is 3600 seconds, excluding test
 compilation; `--timeout` changes it, and
 `--failure-timeout` bounds the intentional timeout case (default 70 seconds).
@@ -254,19 +255,89 @@ trend. The stage cap is logical fold staging, excluding
 fixed kernel constants and driver overhead. Metal's recommended working-set
 size is a performance recommendation, not an entitlement to allocate that much.
 
-Keep the 20-request stability target and controlled benchmarks as separate
-checks. Performance comparisons require a cold-start record, warm-up and at
+Keep the accepted 20-request operational repeat check and controlled benchmarks
+as separate checks. Performance comparisons require a cold-start record, warm-up and at
 least five complete measured runs per mode with identical engine, guest/input,
 po2, proof kind and thread/resource settings. Report median/range, failures and
-thermal/background-load limitations. Native worker hash/precompile,
-multi-segment and bounded memory-pressure workloads remain separate coverage;
-this runner currently exercises the Fibonacci fixture.
+thermal/background-load limitations. The completed mode/lifecycle milestone
+used Fibonacci. The additional SHA/admission-recovery, five-segment and 4 KiB
+staging runs below have also passed. The twenty-request run also completed with
+zero failed requests, across sixteen worker PIDs under normal memory-driven
+recycling; the longest same-PID success streak was two.
 
 Do not manually start a second worker server. The existing WorkerPool launches
 one generic macOS slot and supplies the helper lease for either selected mode.
 Calibration remains unsupported. The two tiny benchmark fixtures now use the
 same verified staged path as proofs, but do not establish comparative GPU
 rankings, speedup or profitability.
+
+## Additional workload and resource checks
+
+The first three commands below passed complete independently verified proofs:
+SHA/admission recovery (`71387ac25ac74d4395278a3459680152`), five segments
+(`3c0b5d8179934bafb482174615a05d22`) and 4 KiB staging
+(`d93743621b584487accb84c7df1833c6`). Their request-body times were 171.639,
+237.596 and 168.982 seconds, with 593, 1,269 and 16,680 completed GPU commands
+respectively. The final twenty-request command passed as
+`28bdd9ca009a4f6eacda4e11df402aed`, with twenty consecutive accepted WorkerPool
+requests, zero failed requests and 60 negative-verifier rejections. Across the
+four runs, 23 complete proofs passed 69 negative checks; all eight tests executed
+with none ignored. The logical-admission refusal is separate failure evidence.
+All retained the 600-second per-proof watchdog and existing memory guards.
+`--timeout` sets the outer acceptance-run
+bound, excluding test compilation; it does not relax the per-proof watchdog.
+Run one command at a time through the shared acceptance lock.
+
+```sh
+python3 scripts/macos/test-worker.py --engine "$ENGINE_DIR" --worker-kind metal --mode metal --context colima-hemi-macos-cpu --workload sha256-chain --repeat 1 --proof-only --admission-pressure --staging-bytes 524288
+python3 scripts/macos/test-worker.py --engine "$ENGINE_DIR" --worker-kind metal --mode metal --context colima-hemi-macos-cpu --workload segment-boundary --po2 16 --repeat 1 --proof-only --staging-bytes 524288
+python3 scripts/macos/test-worker.py --engine "$ENGINE_DIR" --worker-kind metal --mode metal --context colima-hemi-macos-cpu --workload fibonacci --repeat 1 --proof-only --staging-bytes 4096
+python3 scripts/macos/test-worker.py --engine "$ENGINE_DIR" --worker-kind metal --mode metal --context colima-hemi-macos-cpu --workload fibonacci --repeat 20 --proof-only --staging-bytes 524288 --timeout 7200
+```
+
+`--workload` selects `fibonacci`, `sha256-chain`, or `segment-boundary`. Inputs
+and expected journals are calculated independently of receipts. SHA uses ten
+hash iterations; the boundary fixture uses mode 1/parameter 8 and requires at
+least five segments. `--po2` accepts 14..18, defaulting to 16 for boundary and 18
+otherwise. Keep the tested boundary po2 16 because the pinned tiny-tail recursion
+artifact limitation still applies. SHA coverage does not imply Keccak or all
+other precompile coverage.
+
+`--admission-pressure` is opt-in and requires `--proof-only`. It exercises
+**logical in-flight reservation pressure**, using the actual WorkerPool admission
+policy and live host observations. Small reservation handles fill the accounting
+budget without allocating the represented memory. The next real proof request
+must be refused with typed `HostMemoryShortage { attempted: false }`, no proof
+sidecar or helper launch, and unchanged held reservations. Dropping the handles
+must restore the ledger to zero; the following normal request must produce a
+complete independently verified proof. The refusal is expected failure evidence,
+not a proof. No physical host-memory exhaustion or RSS-limit kill is induced;
+those remain unrun. The accepted SHA case held 107 one-GiB logical reservations,
+refused the six-GiB proof budget before dispatch, dropped all reservations to
+zero, and verified the recovery proof after the production path recycled the
+warm worker. No 107-GiB physical allocation occurred.
+
+The 4 KiB case stresses the supported staging boundary and synchronization with
+a complete proof. It does not impose physical GPU-memory pressure. It permits
+only 32 output digests per dispatch, compared with 4096 at the default 512 KiB,
+so it creates many more command completions. The accepted run recorded exactly
+16,680 and stayed within 4,096 bytes of logical staging. No speedup is claimed.
+The multi-segment acceptance used the default budget to isolate these cases.
+
+Per-request `resource.json` preserves owned process identity, before-request
+RSS, periodic samples/peak, and idle RSS after independent verification and a
+one-second settle interval. Compare warm-request baselines and
+idle observations within one PID; distinguish cold initialization and any
+recycle. The normal policy can recycle earlier for memory admission as well as
+at the 20-proof periodic threshold; neither behavior was disabled. The accepted
+twenty-request run used sixteen worker PIDs, with a longest same-PID success
+streak of two. Report this as twenty consecutive accepted WorkerPool requests,
+not twenty proofs in one long-lived worker. Request-body times had a 164.845-second
+median and 157.222–166.442-second range; these are acceptance observations, not a
+controlled comparison. RSS excludes helper/VM memory and unmeasured driver
+allocations. This establishes bounded repeat/recovery evidence under the current
+policy, not leak-free retention, physical host-pressure recovery, resident-limit
+kill behavior or the controlled benchmark gate.
 
 ## Stop / remove
 

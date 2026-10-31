@@ -398,3 +398,120 @@ calibration IPC execution and controlled five-measured-runs-per-mode performance
 remain unrun. Prior harness hash/multi-segment coverage is retained separately.
 Exact contract-adapter and deployed/network verification remain unrun. None of
 these limits is bypassed by a build, mocked test or skipped test.
+
+
+## Completed workload and stability milestone
+
+This continuation starts from miner `b871d7ed0f0de83d99cc3e5674bfba95c3f04d7f`
+and preserves both sealed worker binaries and engine
+`0d5b41e8e44876c1e8b5a8a671aabc154e33106c`. Production worker, protocol, engine,
+root manifest and dependency lock are unchanged. The changes are acceptance
+code, evidence collection and documentation. The new Rust test compiled; actual
+proving results below remain distinct from compilation and code review.
+
+`test-worker.py` now accepts `--workload`, optional `--po2`, and optional
+`--admission-pressure`. Inputs and journals are computed independently for
+Fibonacci(20), SHA-256-chain(10), and boundary input(1,8); the boundary defaults
+to po2 16 and requires at least five proved segments. Selected packed guest,
+user ELF, source/build provenance and input are checked before/after the run.
+Imported validation modules are included in the test source seal. Every
+successful record must match the actual requested staging budget.
+
+Twenty-request acceptance means twenty ordered independently verified requests
+in one WorkerPool, with no hidden failure or retry. Unique worker/request pairs,
+consistent deterministic cycle/segment stats and all negative verifier checks
+are mandatory. PID changes and longest same-process streak are reported
+separately; production memory guards and worker recycling remain enabled.
+
+Each successful request records RSS before/during proving and after independent
+verification plus a one-second settling interval. Process start identity and
+parent/process-group ownership are checked before and after each observation.
+Unavailable/recycled identities are explicit, never assigned zero memory.
+Host available/total memory uses the existing production observation functions.
+These samples exclude the helper VM from worker RSS and do not measure Metal
+driver allocation peaks; global available memory already reflects VM effects.
+
+The pressure case uses actual production reservation guards in bounded 1 GiB
+accounting increments. It does not allocate the corresponding pages. A typed
+HostMemoryShortage with attempted=false, unchanged sidecar count, no helper,
+and zero reservations after release are required. A real full proof after
+release is mandatory. Physical host-memory exhaustion and the 32 GiB RSS-kill
+branch are not induced by this test.
+
+First new result: SHA run `71387ac25ac74d4395278a3459680152` passed two actual
+tests, zero ignored, in 192.21s. It refused dispatch with 107 GiB logically held,
+then released all reservations and produced a genuine SHA-256 Groth16 proof
+in 171.639s with 593 completed Metal commands. All three unchanged-verifier
+negative checks passed. Peak sampled request RSS was 2,449,637,376 bytes;
+post-verification idle RSS was 929,841,152 bytes. This is one sample, not a
+performance comparison or proof of allocation stability.
+
+Collector validation retained one tooling failure: the initial summary refused
+two zero outer RSS samples from this successful run as invalid. The collector
+now preserves them as unavailable_nonpositive_rss with phase/time and unknown
+cause; they are excluded from positive sample counts and memory metrics. The
+identity-checked Rust resource record and positive samples remain independently
+validated. Recollection passed with 1 complete proof, 3 negative rejections and
+1 expected admission refusal; no proof result was changed or regenerated.
+
+Five-segment run `3c0b5d8179934bafb482174615a05d22` passed a complete proof
+in 237.596s with 1,269 GPU completions across all five segments; all negative
+checks passed. Sampled request peak was 2,756,018,176 bytes; settled idle was
+1,551,286,272 bytes. Fibonacci run `d93743621b584487accb84c7df1833c6` passed
+at the exact minimum 4,096-byte staging budget in 168.982s, recording 16,680
+completed GPU commands and positive/negative unchanged-verifier acceptance.
+Its sampled peak and idle were 1,975,173,120 bytes. Each run executed two tests
+with zero ignored; these are full proofs, not only kernel comparisons.
+
+Twenty consecutive independently verified requests passed in 3341.356s (55.69 minutes),
+with zero failed requests. Normal memory-driven recycling used 16 proving processes; the
+longest same-PID streak was 2. Proof seconds ranged 157.222–166.442, median 164.845.
+Sampled request peaks ranged 1,970,487,296–1,996,292,096 bytes. All twenty outputs
+passed 60 tamper rejections and recorded 3,880 completed GPU commands.
+
+Run `28bdd9ca009a4f6eacda4e11df402aed` executed two actual tests, zero ignored,
+in 3340.69s. All four runs together produced 23 independently accepted complete
+Groth16 outputs and 69 tamper rejections, with 8 tests passed and zero ignored.
+No unexpected proof failure was averaged away. Four process-identity groups
+contain two successful requests; the others contain one. This establishes
+consecutive WorkerPool request acceptance with normal recycling, not twenty
+proofs in one uninterrupted process or leak-free long-lived operation.
+
+Commands actually executed, after sourcing the task-local environment:
+
+```sh
+python3 scripts/macos/test-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --worker-kind metal --mode metal --context colima-hemi-macos-cpu --proof-only --repeat 1 --workload sha256-chain --admission-pressure
+python3 scripts/macos/test-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --worker-kind metal --mode metal --context colima-hemi-macos-cpu --proof-only --repeat 1 --workload segment-boundary --po2 16
+python3 scripts/macos/test-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --worker-kind metal --mode metal --context colima-hemi-macos-cpu --proof-only --repeat 1 --workload fibonacci --staging-bytes 4096
+python3 scripts/macos/test-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --worker-kind metal --mode metal --context colima-hemi-macos-cpu --proof-only --repeat 20 --workload fibonacci --timeout 7200
+python3 scripts/macos/summarize-worker.py --runs 71387ac25ac74d4395278a3459680152 3c0b5d8179934bafb482174615a05d22 d93743621b584487accb84c7df1833c6 28bdd9ca009a4f6eacda4e11df402aed --output docs/macos/evidence/worker-stability-validation.json --csv docs/macos/evidence/worker-stability-measurements.csv
+python3 scripts/macos/test-worker-summary-controls.py --output docs/macos/evidence/worker-stability-controls.json
+```
+
+The final collector additionally exposed one-ULP timing differences introduced
+by JSON number round-tripping through Rust. It now allows only finite,
+nonnegative, at-most-one-ULP differences in `total_ms` and `stage_ms` values,
+records each difference and retains both raw hashes. All proof hashes, public
+identities, stage counters and other fields remain exact. Larger timing changes
+and changed proof identities are rejected by dedicated collector controls;
+those controls are not additional proof-generation successes. The runnable
+`test-worker-summary-controls.py` passed all 12 guards with zero proofs generated
+or verified; its exact command and outcomes are in
+`evidence/worker-stability-controls.json`. Both collector
+refusals are retained in this record; no raw accepted artifact was edited.
+
+`evidence/worker-stability-validation.json` binds the four finalized reports,
+source/build seals, every ledger status, raw proof/resource artifact hashes,
+per-identity memory summaries and collector limitations.
+`worker-stability-measurements.csv` retains chronological requests/refusal events
+using LF endings. Raw logs, receipts and observations remain under the four
+`target/macos/worker-runs/<id>` directories. The separate miner diff is
+`target/macos/worker-stability-miner.patch`; this continuation's engine diff is
+empty. CPU/Metal worker and unchanged-verifier seals are rechecked before commit.
+
+The dedicated helper VM was stopped after confirming no containers remained.
+Production worker/engine/CPU source and root dependency lock did not change.
+Non-Mac runtime coverage is not claimed. Controlled benchmarks, benchmark IPC,
+physical memory-pressure/RSS-kill recovery, longer same-process allocation
+stability, GPU faults, exact contract-adapter and network acceptance remain open.
+No wallet, marketplace, privileged installation or push was used.

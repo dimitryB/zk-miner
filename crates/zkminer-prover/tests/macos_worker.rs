@@ -34,6 +34,90 @@ fn observed_mode() -> String {
 fn worker_kind() -> String {
     std::env::var("ZKMINER_MACOS_WORKER_KIND").unwrap_or_else(|_| "cpu".into())
 }
+struct Workload {
+    name: String,
+    input: Vec<u8>,
+    expected: Vec<u8>,
+    expected_hex: String,
+    elf_sha256: String,
+    po2: u8,
+    min_segments: u64,
+}
+
+impl Workload {
+    fn from_environment(elf: &[u8]) -> Self {
+        const KEYS: [&str; 5] = [
+            "ZKMINER_MACOS_WORKLOAD",
+            "ZKMINER_MACOS_INPUT",
+            "ZKMINER_MACOS_EXPECTED_JOURNAL_HEX",
+            "ZKMINER_MACOS_PO2",
+            "ZKMINER_MACOS_MIN_SEGMENTS",
+        ];
+        let supplied = KEYS
+            .iter()
+            .filter(|key| std::env::var_os(key).is_some())
+            .count();
+        assert!(
+            supplied == 0 || supplied == KEYS.len(),
+            "supply all five workload settings together"
+        );
+        let (name, input, expected, po2, min_segments) = if supplied == 0 {
+            (
+                "fibonacci".to_owned(),
+                20u32.to_le_bytes().to_vec(),
+                6765u64.to_le_bytes().to_vec(),
+                18,
+                1,
+            )
+        } else {
+            let name = std::env::var(KEYS[0]).unwrap();
+            assert!(
+                ["fibonacci", "sha256-chain", "segment-boundary"].contains(&name.as_str()),
+                "unsupported acceptance workload"
+            );
+            let input_path = required(KEYS[1]);
+            assert!(
+                (1..=65536).contains(&fs::metadata(&input_path).unwrap().len()),
+                "acceptance input must be 1..65536 bytes"
+            );
+            (
+                name,
+                fs::read(input_path).unwrap(),
+                hex::decode(std::env::var(KEYS[2]).unwrap()).expect("invalid expected journal hex"),
+                std::env::var(KEYS[3])
+                    .unwrap()
+                    .parse()
+                    .expect("invalid acceptance po2"),
+                std::env::var(KEYS[4])
+                    .unwrap()
+                    .parse()
+                    .expect("invalid minimum segment count"),
+            )
+        };
+        assert!(
+            (14..=18).contains(&po2),
+            "acceptance po2 must be in 14..=18"
+        );
+        assert!(
+            (1..=256).contains(&min_segments),
+            "minimum segment count must be in 1..=256"
+        );
+        assert!(
+            (1..=4096).contains(&expected.len()),
+            "expected journal must be 1..4096 bytes"
+        );
+        Self {
+            name,
+            input,
+            expected_hex: hex::encode(&expected),
+            expected,
+            elf_sha256: hash(elf),
+            po2,
+            min_segments,
+        }
+    }
+}
+
 fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -125,16 +209,18 @@ fn positive(value: &Value, field: &str) -> u64 {
         .filter(|n| *n > 0)
         .unwrap_or_else(|| panic!("missing positive {field}: {value}"))
 }
-fn validate_stage(record: &Value) {
+fn validate_stage(record: &Value, workload: &Workload) {
     assert_eq!(record["schema_version"], 1);
     assert_eq!(record["operation"], "prove");
     assert_eq!(record["requested_mode"], mode());
     assert_eq!(record["observed_mode"], observed_mode());
-    assert_eq!(record["input_sha256"], hash(&20u32.to_le_bytes()));
+    assert_eq!(record["elf_sha256"], workload.elf_sha256);
+    assert_eq!(record["input_sha256"], hash(&workload.input));
     if record["phase"] == "complete" {
-        assert_eq!(record["journal_hex"], "6d1a000000000000");
+        assert_eq!(record["journal_hex"], workload.expected_hex);
+        assert_eq!(record["journal_sha256"], hash(&workload.expected));
     }
-    assert_eq!(record["po2"], 18);
+    assert_eq!(record["po2"], workload.po2);
     if mode() == "auto" && observed_mode() == "cpu" {
         assert!(
             !record["fallback_reason"].as_str().unwrap_or("").is_empty(),
@@ -142,6 +228,10 @@ fn validate_stage(record: &Value) {
         );
     }
     let count = positive(&record["stats"], "segments");
+    assert!(
+        count >= workload.min_segments,
+        "workload did not cover the required segment count"
+    );
     let stage = &record["observed_stages"]["metal_stage"];
     if observed_mode() == "cpu" {
         assert!(stage.is_null(), "CPU mode unexpectedly executed Metal");
@@ -168,6 +258,14 @@ fn validate_stage(record: &Value) {
             segment["staging_limit_bytes"],
             record["staging_limit_bytes"]
         );
+        let requested: u64 = std::env::var("ZKMINER_RISC0_METAL_STAGING_BYTES")
+            .unwrap_or_else(|_| "524288".into())
+            .parse()
+            .unwrap();
+        assert_eq!(
+            budget, requested,
+            "worker did not use the requested staging budget"
+        );
         assert!(positive(segment, "peak_staging_bytes") <= budget);
     }
     assert_eq!(stage["completed_dispatches"], dispatches);
@@ -180,6 +278,309 @@ fn ledger(evidence: &Path, value: &Value) {
         .unwrap();
     writeln!(file, "{value}").unwrap();
 }
+// Observation only: this never allocates a synthetic workload or changes the worker.
+fn rss_observation(pid: u32, expected_start: Option<u64>, started: Instant, phase: &str) -> Value {
+    let host_available = zkminer_prover::memory::mem_available_bytes();
+    let host_total = zkminer_prover::memory::mem_total_bytes();
+    let mut sample = json!({"worker_pid":pid,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"phase":phase,
+        "host_available_bytes":host_available,"host_total_bytes":host_total});
+    if host_available.is_none() || host_total.is_none() {
+        sample["host_memory_unavailable_reason"] =
+            json!("production host memory observation unavailable; unknown values are null");
+    }
+    let identity = zkminer_prover::memory::pid_starttime(pid);
+    if pid == 0 || identity.is_none() {
+        sample["unavailable_reason"] = json!("no live worker start identity");
+        return sample;
+    }
+    let identity = identity.unwrap();
+    sample["worker_start_time_us"] = json!(identity);
+    if expected_start.is_some_and(|value| value != identity)
+        || !zkminer_prover::memory::pid_is_our_worker(pid, Some(identity))
+    {
+        sample["unavailable_reason"] =
+            json!("worker identity or parent/group ownership changed before RSS observation");
+        return sample;
+    }
+    let (status, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
+        Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]),
+        Duration::from_secs(2),
+        4096,
+    );
+    if !matches!(
+        status,
+        zkminer_prover_protocol::proc::Outcome::Ran { success: true, .. }
+    ) {
+        sample["unavailable_reason"] =
+            json!(format!("ps observation failed: {}", status.describe()));
+        return sample;
+    }
+    if zkminer_prover::memory::pid_starttime(pid) != Some(identity)
+        || !zkminer_prover::memory::pid_is_our_worker(pid, Some(identity))
+    {
+        sample["unavailable_reason"] =
+            json!("worker identity or parent/group ownership changed during RSS observation");
+        return sample;
+    }
+    match stdout
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|value| value.checked_mul(1024))
+        .filter(|value| *value > 0)
+    {
+        Some(bytes) => sample["rss_bytes"] = json!(bytes),
+        None => {
+            sample["unavailable_reason"] = json!("ps did not return a positive bounded RSS value")
+        }
+    }
+    sample
+}
+
+fn measured_prove(
+    pool: &WorkerPool,
+    elf: &[u8],
+    workload: &Workload,
+) -> (anyhow::Result<zkminer_prover::engine::ProofOutput>, Value) {
+    let started = Instant::now();
+    let baseline = rss_observation(
+        pool.worker_pid(KEY).unwrap_or(0),
+        None,
+        started,
+        "before_prove_call",
+    );
+    let done = Arc::new(AtomicBool::new(false));
+    let (result, mut observations) = std::thread::scope(|scope| {
+        let stop = done.clone();
+        let observer = scope.spawn(move || {
+            let mut samples = Vec::new();
+            while !stop.load(Ordering::Acquire) {
+                samples.push(rss_observation(
+                    pool.worker_pid(KEY).unwrap_or(0),
+                    None,
+                    started,
+                    "periodic_during_prove_call",
+                ));
+                // One-second cadence, interruptible so joining does not add a full second.
+                for _ in 0..10 {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            samples
+        });
+        let result = pool.prove(
+            "risc0",
+            elf,
+            &workload.input,
+            Some(workload.po2),
+            Some(Duration::from_secs(600)),
+            None,
+        );
+        done.store(true, Ordering::Release);
+        (result, observer.join().unwrap())
+    });
+    observations.insert(0, baseline.clone());
+    observations.push(rss_observation(
+        pool.worker_pid(KEY).unwrap_or(0),
+        None,
+        started,
+        "after_prove_call",
+    ));
+    (
+        result,
+        json!({"schema_version":1,
+        "method":"ps -o rss=, converted from KiB; PID start identity and parent/process-group ownership checked before and after each observation",
+        "scope":"native worker process RSS only; excludes helper VM and is not a Metal driver allocation peak",
+        "observation_window":"immediately before WorkerPool::prove through its return; post-verification idle observation is separate",
+        "host_memory_method":"production Darwin available-memory estimate (free pages plus conservative reclaim credit); includes all host pressure and is not added to worker RSS or treated as an allocation guarantee",
+        "sampling_interval_ms":1000,"request_elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
+        "baseline_before_prove_call":baseline,"observations":observations}),
+    )
+}
+
+fn finish_resources(dir: &Path, record: &Value, resources: &mut Value) {
+    let pid = record["worker_pid"].as_u64().unwrap();
+    let observations = resources["observations"].as_array().unwrap();
+    let identity = observations
+        .iter()
+        .rev()
+        .find(|sample| sample["worker_pid"] == pid && sample["rss_bytes"].as_u64().is_some())
+        .and_then(|sample| sample["worker_start_time_us"].as_u64())
+        .expect("no identity-checked RSS observation for the worker that produced this proof");
+    let samples: Vec<_> = observations
+        .iter()
+        .filter(|sample| {
+            sample["worker_pid"] == pid
+                && sample["worker_start_time_us"] == identity
+                && sample["rss_bytes"].as_u64().is_some()
+        })
+        .cloned()
+        .collect();
+    let periodic = samples
+        .iter()
+        .filter(|sample| sample["phase"] == "periodic_during_prove_call")
+        .count();
+    assert!(
+        periodic > 0,
+        "no periodic RSS observation during the real proving request"
+    );
+    let peak = samples
+        .iter()
+        .map(|sample| sample["rss_bytes"].as_u64().unwrap())
+        .max()
+        .unwrap();
+    assert!(
+        peak <= 32 * 1024u64.pow(3),
+        "sampled native request RSS exceeded the worker bound"
+    );
+    let identities: BTreeSet<_> = observations
+        .iter()
+        .filter(|sample| sample["rss_bytes"].as_u64().is_some())
+        .filter_map(|sample| {
+            Some((
+                sample["worker_pid"].as_u64()?,
+                sample["worker_start_time_us"].as_u64()?,
+            ))
+        })
+        .collect();
+    resources["observed_worker_identities"] = json!(identities.into_iter().map(|(worker_pid, worker_start_time_us)|
+        json!({"worker_pid":worker_pid,"worker_start_time_us":worker_start_time_us})).collect::<Vec<_>>());
+    resources["worker_pid"] = json!(pid);
+    resources["worker_start_time_us"] = json!(identity);
+    resources["sample_count"] = json!(samples.len());
+    resources["periodic_sample_count"] = json!(periodic);
+    resources["peak_rss_bytes"] = json!(peak);
+    resources["first_sample"] = samples.first().unwrap().clone();
+    resources["last_sample"] = samples.last().unwrap().clone();
+    resources["baseline_matches_request_worker"] = json!(
+        resources["baseline_before_prove_call"]["worker_pid"] == pid
+            && resources["baseline_before_prove_call"]["worker_start_time_us"] == identity
+            && resources["baseline_before_prove_call"]["rss_bytes"]
+                .as_u64()
+                .is_some()
+    );
+    resources["idle_settle_ms"] = json!(1000);
+    let idle_started = Instant::now();
+    std::thread::sleep(Duration::from_secs(1));
+    let mut idle = rss_observation(
+        pid as u32,
+        Some(identity),
+        idle_started,
+        "after_independent_verification_and_settle",
+    );
+    idle["elapsed_ms_reference"] =
+        json!("time since the post-verification settling interval began");
+    resources["idle_after_verification_and_settle"] = idle;
+    fs::write(
+        dir.join("resource.json"),
+        serde_json::to_vec_pretty(resources).unwrap(),
+    )
+    .unwrap();
+}
+
+fn admission_pressure(pool: &WorkerPool, elf: &[u8], workload: &Workload, evidence: &Path) {
+    const STEP: u64 = 1024 * 1024 * 1024;
+    let total =
+        zkminer_prover::memory::mem_total_bytes().expect("cannot observe real host total memory");
+    let available = zkminer_prover::memory::mem_available_bytes()
+        .expect("cannot observe real host available memory");
+    let reserve = zkminer_prover::memory::DEFAULT_HOST_RESERVE_BYTES;
+    let needed = pool.expected_host_peak_at_po2("risc0", Some(workload.po2));
+    assert!(
+        available >= STEP + reserve,
+        "insufficient live headroom for the logical reservation test prerequisite"
+    );
+    assert_eq!(
+        pool.reserved_host_memory(),
+        0,
+        "reservation test requires an idle ledger"
+    );
+    let before = sidecar_paths();
+    assert!(helpers().is_empty());
+    let pid_before = pool.worker_pid(KEY).unwrap_or(0);
+    ledger(
+        evidence,
+        &json!({"case":"admission-pressure","status":"started", "kind":"in_flight_reservation_admission",
+        "physical_memory_pressure":false,"host_total_bytes":total,"host_available_bytes":available}),
+    );
+    // These are the real production ledger guards. They reserve accounting only;
+    // no corresponding host/GPU pages are allocated or touched by this test.
+    let mut guards = Vec::new();
+    let limit = total / STEP + 1;
+    assert!(limit <= 4096, "logical reservation test bound exceeded");
+    while pool
+        .reserved_host_memory()
+        .saturating_add(needed)
+        .saturating_add(reserve)
+        <= total
+    {
+        assert!(
+            (guards.len() as u64) < limit,
+            "logical reservation loop exceeded its host-derived bound"
+        );
+        guards.push(pool.reserve_host_memory(STEP, KEY)
+            .expect("live host headroom changed before the intended committed-reservation condition; prerequisite failure"));
+    }
+    let held = pool.reserved_host_memory();
+    let refusal = pool
+        .prove(
+            "risc0",
+            elf,
+            &workload.input,
+            Some(workload.po2),
+            Some(Duration::from_secs(30)),
+            None,
+        )
+        .expect_err("proof unexpectedly ran while real in-flight reservations exhausted admission");
+    let shortage = refusal
+        .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+        .expect("admission case did not return typed HostMemoryShortage");
+    assert!(
+        !shortage.attempted,
+        "admission case unexpectedly attempted a proof"
+    );
+    assert_eq!(shortage.slot_key, KEY);
+    assert_eq!(shortage.needed, needed);
+    assert_eq!(shortage.reserved, held);
+    assert_eq!(
+        sidecar_paths(),
+        before,
+        "admission refusal started a worker request"
+    );
+    let helper_count_after = helpers().len();
+    assert_eq!(
+        helper_count_after, 0,
+        "admission refusal started or leaked a helper"
+    );
+    let mut report = json!({"kind":"in_flight_reservation_admission","physical_memory_pressure":false,"attempted":false,
+        "reserved_before_bytes":0,"reserved_held_bytes":held,"needed_bytes":needed,"host_total_bytes":total,
+        "host_available_bytes":available,"host_available_at_refusal_bytes":shortage.available,"host_reserve_bytes":reserve,
+        "reservation_count":guards.len(),"step_bytes":STEP,"sidecar_count_before":before.len(),"sidecar_count_after":sidecar_paths().len(),
+        "helper_count_after":helper_count_after,"worker_pid_before":pid_before,"worker_pid_after":pool.worker_pid(KEY).unwrap_or(0),
+        "error":format!("{refusal:#}")});
+    drop(guards);
+    assert_eq!(
+        pool.reserved_host_memory(),
+        0,
+        "logical reservations were not released"
+    );
+    report["reserved_after_bytes"] = json!(pool.reserved_host_memory());
+    fs::write(
+        evidence.join("pressure.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    ledger(
+        evidence,
+        &json!({"case":"admission-pressure","status":"expected_admission_refusal","pressure":report}),
+    );
+    // The normal proof loop immediately following this case must produce and
+    // independently verify a genuine full proof after releasing the guards.
+}
+
 fn verify(
     verifier: &Path,
     program: &Path,
@@ -187,15 +588,16 @@ fn verify(
     dir: &Path,
     proof: zkminer_prover::engine::ProofOutput,
     record: &Value,
+    workload: &Workload,
 ) {
     fs::create_dir(dir).unwrap();
-    assert_eq!(proof.journal, 6765u64.to_le_bytes());
+    assert_eq!(proof.journal, workload.expected);
     assert_eq!(proof.seal.len(), 256);
     assert!(proof.cycles > 0);
     assert_eq!(record["phase"], "complete");
     assert_eq!(record["proof_kind"], "groth16");
     assert_eq!(record["seal_sha256"], hash(&proof.seal));
-    validate_stage(record);
+    validate_stage(record, workload);
     fs::write(
         dir.join("worker.json"),
         serde_json::to_vec_pretty(record).unwrap(),
@@ -207,9 +609,9 @@ fn verify(
         .arg("verify-seal")
         .arg(program)
         .arg(input)
-        .arg("6d1a000000000000")
+        .arg(&workload.expected_hex)
         .arg(dir)
-        .arg("18")
+        .arg(workload.po2.to_string())
         .output()
         .unwrap();
     fs::write(dir.join("verifier.stdout"), &output.stdout).unwrap();
@@ -223,7 +625,8 @@ fn verify(
         serde_json::from_slice(&fs::read(dir.join("verification.json")).unwrap()).unwrap();
     assert_eq!(verification["image_id"], record["image_id"]);
     assert_eq!(verification["verification"], "passed");
-    assert_eq!(verification["journal_hex"], "6d1a000000000000");
+    assert_eq!(verification["journal_hex"], workload.expected_hex);
+    assert_eq!(verification["elf_sha256"], workload.elf_sha256);
     assert_eq!(
         verification["negative_tests"],
         json!(["wrong_image", "modified_journal", "corrupt_seal"])
@@ -324,8 +727,13 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
     fs::create_dir(&evidence).expect("use a fresh evidence directory");
     assert!(helpers().is_empty(), "use an idle dedicated VM");
     let input = evidence.join("input.bin");
-    fs::write(&input, 20u32.to_le_bytes()).unwrap();
     let elf = fs::read(&program).unwrap();
+    let workload = Workload::from_environment(&elf);
+    fs::write(&input, &workload.input).unwrap();
+    fs::write(evidence.join("workload.json"), serde_json::to_vec_pretty(&json!({
+        "name":workload.name,"input_sha256":hash(&workload.input),"elf_sha256":workload.elf_sha256,
+        "expected_journal_hex":workload.expected_hex,"po2":workload.po2,"min_segments":workload.min_segments,
+    })).unwrap()).unwrap();
     let repeats: usize = std::env::var("ZKMINER_MACOS_REPEAT")
         .unwrap_or_else(|_| "3".into())
         .parse()
@@ -385,7 +793,7 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         pool.execute_cycles(
             "risc0",
             &elf,
-            &20u32.to_le_bytes(),
+            &workload.input,
             Some(Duration::from_secs(30))
         )
         .unwrap()
@@ -399,28 +807,49 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             Some(Duration::from_secs(10))
         )
         .is_err());
+    let pressure = match std::env::var("ZKMINER_MACOS_ADMISSION_PRESSURE")
+        .as_deref()
+        .unwrap_or("0")
+    {
+        "0" => false,
+        "1" => true,
+        _ => panic!("admission pressure must be 0 or 1"),
+    };
+    assert!(
+        !pressure || !lifecycle,
+        "logical admission pressure requires proof-only acceptance"
+    );
+    if pressure {
+        admission_pressure(&pool, &elf, &workload, &evidence);
+    }
+    let mut request_identities = BTreeSet::new();
     for index in 0..repeats {
         let before = sidecar_paths();
         ledger(
             &evidence,
             &json!({"case":format!("proof-{index}"),"status":"started"}),
         );
-        let result = pool.prove(
-            "risc0",
-            &elf,
-            &20u32.to_le_bytes(),
-            Some(18),
-            Some(Duration::from_secs(600)),
-            None,
-        );
+        let (result, mut resources) = measured_prove(&pool, &elf, &workload);
+        fs::write(
+            evidence.join(format!("proof-{index}-resource-observations.json")),
+            serde_json::to_vec_pretty(&resources).unwrap(),
+        )
+        .unwrap();
         if let Err(error) = &result {
             ledger(
                 &evidence,
-                &json!({"case":format!("proof-{index}"),"status":"failed","error":format!("{error:#}")}),
+                &json!({"case":format!("proof-{index}"),"status":"failed","error":format!("{error:#}"),"resources":resources}),
             );
         }
         let proof = result.unwrap();
         let (_, record) = require_sidecar(&before);
+        assert!(
+            request_identities.insert((
+                record["worker_pid"].as_u64().unwrap(),
+                record["request_id"].as_u64().unwrap()
+            )),
+            "duplicate completed request identity"
+        );
         verify(
             &verifier,
             &program,
@@ -428,10 +857,16 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             &evidence.join(format!("proof-{index}")),
             proof,
             &record,
+            &workload,
+        );
+        finish_resources(
+            &evidence.join(format!("proof-{index}")),
+            &record,
+            &mut resources,
         );
         ledger(
             &evidence,
-            &json!({"case":format!("proof-{index}"),"status":"complete_independently_verified","worker":record}),
+            &json!({"case":format!("proof-{index}"),"status":"complete_independently_verified","worker":record,"resources":resources}),
         );
         assert!(helpers().is_empty(), "helper survived a successful proof");
     }
@@ -448,8 +883,8 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
                 pool.prove(
                     "risc0",
                     &elf,
-                    &20u32.to_le_bytes(),
-                    Some(18),
+                    &workload.input,
+                    Some(workload.po2),
                     Some(Duration::from_secs(600)),
                     None,
                 )
@@ -462,7 +897,7 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
                             .as_str()
                             .expect("missing helper lease identity");
                         if helper_running(name) {
-                            validate_stage(&record);
+                            validate_stage(&record, &workload);
                             pool.cancel(KEY, record["request_id"].as_u64().unwrap())
                                 .unwrap();
                             observed = Some(record);
@@ -517,8 +952,8 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         let failure = pool.prove(
             "risc0",
             &elf,
-            &20u32.to_le_bytes(),
-            Some(18),
+            &workload.input,
+            Some(workload.po2),
             Some(Duration::from_secs(seconds)),
             None,
         );
@@ -536,7 +971,7 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             "request failed before the configured watchdog deadline"
         );
         let observed = observed.expect("watchdog did not reach this request's running helper");
-        validate_stage(&observed);
+        validate_stage(&observed, &workload);
         assert!(helpers().is_empty(), "owned helper survived watchdog");
         assert_group_gone(observed["worker_pid"].as_u64().unwrap() as u32);
 
@@ -545,17 +980,27 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             &evidence,
             &json!({"case":"proof-after-restart","status":"started"}),
         );
-        let proof = pool
-            .prove(
-                "risc0",
-                &elf,
-                &20u32.to_le_bytes(),
-                Some(18),
-                Some(Duration::from_secs(600)),
-                None,
-            )
-            .unwrap();
+        let (proof, mut resources) = measured_prove(&pool, &elf, &workload);
+        fs::write(
+            evidence.join("proof-after-restart-resource-observations.json"),
+            serde_json::to_vec_pretty(&resources).unwrap(),
+        )
+        .unwrap();
+        if let Err(error) = &proof {
+            ledger(
+                &evidence,
+                &json!({"case":"proof-after-restart","status":"failed","error":format!("{error:#}"),"resources":resources}),
+            );
+        }
+        let proof = proof.unwrap();
         let (_, record) = require_sidecar(&before);
+        assert!(
+            request_identities.insert((
+                record["worker_pid"].as_u64().unwrap(),
+                record["request_id"].as_u64().unwrap()
+            )),
+            "duplicate completed request identity"
+        );
         verify(
             &verifier,
             &program,
@@ -563,10 +1008,16 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             &evidence.join("proof-after-restart"),
             proof,
             &record,
+            &workload,
+        );
+        finish_resources(
+            &evidence.join("proof-after-restart"),
+            &record,
+            &mut resources,
         );
         ledger(
             &evidence,
-            &json!({"case":"proof-after-restart","status":"complete_independently_verified","worker":record}),
+            &json!({"case":"proof-after-restart","status":"complete_independently_verified","worker":record,"resources":resources}),
         );
     }
     let pid = pool.worker_pid(KEY).unwrap();
@@ -579,6 +1030,8 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
     fs::write(evidence.join("complete.json"), serde_json::to_vec_pretty(&json!({
         "status":"complete_independently_verified", "requested_mode":mode(),"observed_mode":observed_mode(),
         "verified_proofs":repeats + usize::from(lifecycle), "helper_cancel":lifecycle,"helper_timeout":lifecycle,
-        "restart":lifecycle,"shutdown":true,
+        "restart":lifecycle,"shutdown":true,"workload":workload.name,"po2":workload.po2,
+        "min_segments":workload.min_segments,"expected_journal_hex":workload.expected_hex,
+        "admission_pressure":pressure,"unique_completed_requests":request_identities.len(),
     })).unwrap()).unwrap();
 }

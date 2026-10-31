@@ -1,19 +1,65 @@
 # macOS proving handoff
 
 Updated 2026-10-31. CPU Gates 1/2 and the bounded native hybrid worker milestone
-passed. Segment Poseidon2 Merkle folds run on Metal and complete Groth16 outputs
-pass the unchanged pinned verifier. Full Gate 3 remains open: extended stability,
-additional worker workloads and controlled performance measurements are not done.
+passed. Expanded workloads and twenty consecutive supervised-worker requests
+also passed. Segment Poseidon2 Merkle folds run on Metal; complete Groth16
+outputs pass the unchanged pinned verifier. Full Gate 3 remains open for
+controlled performance measurements and additional fault/memory coverage.
 No push, privileged installation, wallet access, job claim or transaction.
+
+## Current completed workload/stability milestone
+
+Current acceptance changes start at miner
+`b871d7ed0f0de83d99cc3e5674bfba95c3f04d7f`; the containing/latest local commit
+records this milestone. Worker binaries, production worker/protocol code,
+engine, dependency pins and root lock remain unchanged. Changed code is
+`crates/zkminer-prover/tests/macos_worker.rs`,
+`scripts/macos/test-worker.py`, new `scripts/macos/summarize-worker.py` and
+its runnable `test-worker-summary-controls.py` guards.
+
+Four source-bound runs passed: SHA/admission recovery
+`71387ac25ac74d4395278a3459680152`; five segments
+`3c0b5d8179934bafb482174615a05d22`; minimum 4 KiB staging
+`d93743621b584487accb84c7df1833c6`; twenty requests
+`28bdd9ca009a4f6eacda4e11df402aed`. Total: **23 complete Groth16 proofs,
+69 negative-verifier rejections, 8 actual tests, zero ignored or failed tests**.
+All outputs use the unchanged pinned verifier. The logical admission refusal
+is separately recorded and never counted as a completed proof.
+
+Twenty consecutive independently verified requests passed in 3341.356s (55.69 minutes),
+with zero failed requests. Normal memory-driven recycling used 16 proving processes; the
+longest same-PID streak was 2. Proof seconds ranged 157.222–166.442, median 164.845.
+Sampled request peaks ranged 1,970,487,296–1,996,292,096 bytes. All twenty outputs
+passed 60 tamper rejections and recorded 3,880 completed GPU commands.
+
+The admission test holds real production accounting reservations without
+allocating their pages: 107 GiB held, typed attempted=false refusal before any
+proof/helper, ledger released to zero, then a complete SHA proof. The five-
+segment proof records 1,269 GPU completions; the 4 KiB proof records 16,680
+completions with exactly 4,096 bytes peak staging. Physical host-memory pressure,
+RSS-limit kills and sustained same-process memory behavior remain untested.
+
+Aggregate evidence: `docs/macos/evidence/worker-stability-validation.json` and
+`worker-stability-measurements.csv`; raw run artifacts are under
+`target/macos/worker-runs/<id>`. The collector rechecks source-bound acceptance,
+raw proof/artifact hashes and resource observations. Nonpositive outer RSS
+readings are preserved as unavailable. One-ULP JSON timing round-trip differences
+are explicitly recorded; cryptographic fields and counters compare exactly.
+No raw proof or measurement file was rewritten to make collection pass.
+All 12 collector guards passed separately and count as zero proving tests;
+results and prior collection refusals are in `worker-stability-controls.json`.
+
+The dedicated VM is stopped after checking no containers remained. No privileged
+installation, push, wallet access, job claim or transaction occurred.
 
 ## Repositories and refs
 
 Implementation branch: `codex/hemi-macos-metal` in both implementation worktrees.
 
 * Miner `/Users/dbur/dev/zk-miner`, remote `https://github.com/hemilabs/zk-miner.git`:
-  this native-worker change is based on `3b2720110c1721a53d19c09a6ff2a16235aeb9be`;
-  its source-bound builds were made with the reviewed uncommitted changes.
-  The containing/latest local commit records this milestone (`git log -1`).
+  the native-worker checkpoint was based on `3b2720110c1721a53d19c09a6ff2a16235aeb9be`;
+  its sealed worker builds remain unchanged for this acceptance-only continuation.
+  Current acceptance work starts from `b871d7e`; resolve the latest local commit with `git log -1`.
 * Engine `/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0`, remote
   `https://github.com/hemilabs/risc0.git`: unchanged during this milestone at
   `0d5b41e8e44876c1e8b5a8a671aabc154e33106c`.
@@ -26,8 +72,8 @@ Implementation branch: `codex/hemi-macos-metal` in both implementation worktrees
 Miner pin and independent verifier remain
 `f8dcbdf8124a3f1528146bb01d539c55545cbb3d`; the local engine descends from it.
 No circuit, field constant, key, proof format, dependency version or pinned
-revision changed. Root Cargo.lock only adds four existing worker dependency
-edges: metal, risc0-zkp, serde_json and sha2. No broad updates/upstream import.
+revision changed. The previous native-worker milestone added four existing dependency edges:
+metal, risc0-zkp, serde_json and sha2. This continuation leaves Cargo.lock unchanged. No broad updates/upstream import.
 CPU checkpoints remain miner `3503563849661f0e99b5ad9c7da7229bd561ea4f` and
 engine `e274e19ee6e77bcd5704ca25c9880bd143f0783c`.
 
@@ -46,7 +92,7 @@ to 512 KiB, configurable from 4 KiB through 16 MiB. Final Groth16 still uses the
 pinned local Linux/amd64 helper under QEMU emulation. This is not fully native
 wrapping. IPC and non-Mac proving branches retain their existing semantics.
 
-Changed implementation: `crates/zkminer-prove-risc0/{Cargo.toml,src/main.rs,
+Previously committed production implementation: `crates/zkminer-prove-risc0/{Cargo.toml,src/main.rs,
 src/macos.rs,src/macos_metal.rs}`, four root lock dependency edges,
 `scripts/macos/{build-worker.py,worker_provenance.py,test-worker.py}` and
 `crates/zkminer-prover/tests/macos_worker.rs`. Build seals bind worker sources,
@@ -55,7 +101,7 @@ acceptance runner additionally binds the real WorkerPool test and unchanged
 verifier. Optional atomic per-request JSON preserves stage evidence before
 wrapping, including interrupted requests, without changing positional IPC.
 
-## Executed evidence
+## Earlier native-worker evidence
 
 Native Metal lifecycle run `f8ff5abb2cef4a19bb02e24fbcb318d0` passed:
 2 tests, 0 failed, 0 ignored, 777.73 seconds. Four complete Groth16 proofs were
@@ -113,7 +159,7 @@ The verifier target is separate, built from original Git pin without local
 patches/proving features. Raw runs, seals and logs are under
 `target/macos/worker-runs/<id>`; aggregate evidence is `docs/macos/evidence/native-worker-validation.json` and
 `native-worker-measurements.csv`, with executed commands in VALIDATION.md.
-The separate miner diff is `target/macos/native-worker-metal.patch`; no engine
+The current separate miner diff is `target/macos/worker-stability-miner.patch`; no engine
 diff was introduced in this milestone. Previous engine patches remain under
 docs/macos/evidence. Source changes require rebuilding sealed artifacts.
 
@@ -126,12 +172,12 @@ Pinned helper image digest:
 
 ## Next work and limits
 
-Next concrete step after this milestone: extend the source-bound native worker
-suite to hash/multi-segment and bounded memory-pressure cases, then run at least
-20 consecutive successful requests before recommending unattended test use.
-Run warmup plus at least five measured complete runs per mode with identical
-settings, cold-start separation, failure retention and thermal/background-load
-context before performance claims. Current smoke timings are not benchmarks.
+Next concrete step: run controlled CPU/Metal comparisons with warmup plus at
+least five measured complete runs per mode, identical inputs/resources, cold-
+start separation and thermal/background-load context. Benchmark/calibration IPC
+acceptance remains separate. The completed twenty-request run retained normal
+recycling; longer same-process and physical-memory-pressure recovery coverage
+remain open. Current correctness timings are not performance benchmarks.
 
 GPU hardware-fault recovery, driver allocation peaks/growth trends and full
 Linux/CUDA/ROCm runtime regression remain unrun. Optional offline Linux CUDA

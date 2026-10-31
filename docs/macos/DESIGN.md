@@ -166,6 +166,28 @@ in a Metal-capable build performed no GPU proof work, and auto selected the
 validated fold stage when available. The three additional requests each produced
 a complete independently verified Groth16 proof.
 
+Additional native acceptance now covers SHA-256-chain(10) after controlled
+admission refusal/recovery, five-segment proving at requested po2 16, and a
+complete Fibonacci proof at the minimum 4 KiB Metal staging budget. Those three
+proofs passed unchanged verification and negative checks with 593, 1,269 and
+16,680 GPU completions respectively. The admission case held 107 GiB of logical
+reservations using small bookkeeping handles, received a typed pre-dispatch
+refusal, released the ledger to zero and verified a proof after worker recycle.
+It did not allocate that physical memory or exercise the resident-limit kill.
+
+The twenty-request run `28bdd9ca009a4f6eacda4e11df402aed` passed twenty
+consecutive independently verified WorkerPool requests with zero failed
+requests and 60 negative-verifier rejections. Normal memory-driven recycling
+used sixteen worker PIDs, with a longest same-PID success streak of two. This
+covers the accepted-request/recovery path under the production policy, not twenty
+requests in one process or leak-free long-lived retention. With the three added
+workload/resource runs, this continuation produced 23 complete proofs, 69
+negative checks, and eight executed tests with none ignored.
+Per-request RSS baseline, periodic peak and post-verification idle observations
+preserve PID/start identity and exclude helper/VM and unmeasured driver memory.
+The production engine, workers, CPU binary and pin were unchanged for this
+coverage; changes were confined to acceptance tooling and documentation.
+
 ## Known envelope and remaining gates
 
 The pinned recursion archive lacks `lift_rv32im_v2_13.zkr`; a tiny final segment
@@ -180,11 +202,14 @@ results are recorded separately from native-worker acceptance. The runtime
 Metal compiler works without manual installation; offline `xcrun metal` and full
 Xcode remain absent. Any future privileged provisioning requires approval.
 
-Full Gate 3 still needs repeated hybrid-worker stability and controlled complete
-job measurements. Twenty successful requests precede unattended-use advice;
-comparative measurements require cold-start disclosure, warmup and at least five
-complete measured runs per mode with matched settings. Native hybrid workload
-and memory-pressure coverage, GPU-fault/driver-allocation observations, exact
-contract-adapter validation and non-Mac runtime coverage remain separate work.
+The twenty-request operational repeat target is met under normal recycling.
+Full Gate 3 still needs controlled complete-job comparisons and further resource
+characterization; long-lived single-process retention remains unvalidated.
+Comparative measurements require cold-start disclosure, warmup and at least five
+complete measured runs per mode with matched settings. SHA, five-segment,
+logical-admission and minimum-staging coverage now has real native proofs.
+Broader precompile coverage, physical host-pressure/resident-limit failure,
+GPU-fault/driver-allocation observations, exact contract-adapter validation and
+non-Mac runtime coverage remain separate work.
 No speedup, unattended stability or profitability is claimed. Network acceptance
 is unrun and unauthorized.

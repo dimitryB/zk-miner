@@ -369,30 +369,87 @@ its added dependency edges in the miner lock without changing the Hemi engine
 pin or existing dependency versions. The isolated Metal lock introduces no
 dependency versions absent from the miner lock.
 
+## Workload and resource validation
+
+Three additional source-bound native-worker runs passed complete Groth16 and
+unchanged-verifier acceptance, including the three negative checks per proof:
+
+| Case | Segments | Request-body time | Proof GPU commands | Peak logical staging | Run |
+|---|---:|---:|---:|---:|---|
+| SHA-256-chain(10), admission refusal then recovery | 1 | 171.639 s | 593 | 524,288 bytes | `71387ac25ac74d4395278a3459680152` |
+| Segment boundary, requested po2 16 | 5 | 237.596 s | 1,269 | 524,288 bytes | `3c0b5d8179934bafb482174615a05d22` |
+| Fibonacci, minimum staging budget | 1 | 168.982 s | 16,680 | 4,096 bytes | `d93743621b584487accb84c7df1833c6` |
+
+The production engine, worker implementation and CPU executable were unchanged
+for these runs; only acceptance tooling and documentation changed. The Hemi pin
+and unchanged verifier remain intact. [SETUP.md](SETUP.md) contains the
+`--workload`, `--po2`, `--admission-pressure`, `--staging-bytes` and repeat commands.
+
+The SHA run held 107 one-GiB **logical in-flight reservations**, then exercised
+the actual WorkerPool admission path. The next valid proof request needed a
+six-GiB budget and was refused with `HostMemoryShortage { attempted: false }`.
+No request sidecar or helper was launched. The held ledger was unchanged by
+refusal and returned to zero after the handles dropped. Production policy
+recycled the warm worker; the replacement completed the accepted SHA proof.
+Only small bookkeeping handles were allocated, not 107 GiB of physical memory.
+This proves bounded admission refusal/release/recovery, not physical host-memory
+exhaustion or the 32 GiB resident-set kill threshold; those remain unrun.
+
+The 4 KiB proof used exactly 16,680 GPU command completions, checking the staging
+boundary with the output consumed by a complete verified proof. It does not
+impose physical GPU-memory pressure or establish a speedup. The five-segment
+coverage used the default budget to keep the cases separate.
+
+Per-request `resource.json` records before-call RSS, periodic samples/peak and
+idle RSS after independent verification and a one-second settle interval.
+Observations use `ps -o rss=` with PID start identity and parent/process-group
+ownership checked before and after each reading. Host-availability estimates
+are retained separately. These observations exclude helper/VM memory and
+unmeasured driver allocations; shared/overlapping figures are not added.
+
+The twenty-request run `28bdd9ca009a4f6eacda4e11df402aed` passed with twenty
+consecutive independently verified WorkerPool requests, zero failed requests
+and 60 negative-verifier rejections. Every proof recorded 194 GPU commands
+(3,880 total). Request-body times had a median of 164.845 seconds and range
+157.222–166.442 seconds; the whole acceptance attempt took 3,341.356 seconds.
+These are observed acceptance timings, not a controlled performance comparison.
+
+Normal memory-driven recycling used **16 worker PIDs**, with a longest
+same-PID success streak of **two**. This validates accepted requests and recovery
+under the production policy, not twenty proofs in one process or long-lived
+leak-free retention. The largest once-per-second sampled worker RSS was
+1,996,292,096 bytes over the attempt, excluding helper/VM and unmeasured driver
+allocations. The ordinary memory guards and 600-second per-proof watchdog stayed
+active; the outer run bound was 7200 seconds.
+
+Across these four additional runs, **23 complete proofs** passed independent
+verification and **69 negative checks**. The test executables reported eight
+executed tests and zero ignored tests. The separately recorded logical-admission
+refusal is expected failure evidence and is not counted as a proof. Raw reports,
+receipts, verification records and per-request resource observations remain under
+`target/macos/worker-runs/<run-id>`.
+
 ## Remaining scope
 
-The first segment fold hook and its staging budget are implemented. Full Gate 3
-also requires repeated hybrid worker stability and controlled complete-job
-measurements; those are separate from this experimental acceptance harness.
-The opt-in native worker has passed the bounded forced-Metal proof, cancellation,
-watchdog, restart and shutdown milestone described above, plus the source-bound
-CPU/auto proof matrix. Extended repeated-worker and controlled performance gates
-remain open. Recursion, identity and wrapping
-retain their current CPU/helper implementations.
+The native worker has passed bounded forced-Metal lifecycle acceptance, the
+CPU/auto selection matrix, SHA and five-segment workloads, admission
+refusal/recovery, the 4 KiB staging boundary, and twenty consecutive WorkerPool
+requests under normal recycling. Recursion, identity and wrapping retain their
+current CPU/helper implementations.
 
-No production memory budget, GPU-fault recovery, sustained hybrid-worker
-stability, speedup or profitability is established. The current runtime path
-needs no manual installation. Optional future offline tooling would need
-compatible Xcode provisioning, with approval before any privileged setup.
-Before recommending unattended test use, run the configurable suite through at
-least 20 successful requests and retain all failed attempts. Controlled timing
-claims require a separate cold-start record, warm-up, and at least five measured
-complete runs per mode with identical engine, ELF/input, po2, proof format and
-thread/resource limits. Report counts, median, range and failures, plus thermal
-or power observations where available and background-load limitations.
+Full Gate 3 remains open for controlled complete-job comparisons and further
+resource characterization. The 20-request repeat target is met, but long-lived
+single-process retention, calibrated production memory sizing and GPU fault
+recovery remain unvalidated. No speedup, unattended-use or profitability claim
+is made. Controlled timing claims require a separate cold-start record, warmup
+and at least five measured complete runs per mode with identical engine,
+ELF/input, po2, proof format and thread/resource limits. Report counts, median,
+range and failures, plus thermal/power observations where available and
+background-load limitations.
 
-This Fibonacci worker lifecycle suite does not establish native hybrid hash/
-precompile, multi-segment or bounded memory-pressure coverage; earlier harness
-results remain separate evidence. Driver-level GPU fault recovery and existing
-non-Mac runtime tests must also be reported as unrun when not exercised.
-Network acceptance remains unrun and unauthorized.
+SHA coverage does not establish every precompile. Physical host-pressure and
+resident-limit failures, driver-level allocation/fault behavior, exact contract
+adapter validation and unavailable non-Mac runtime tests remain unrun. Earlier
+standalone harness results remain separate evidence. The runtime Metal path
+needs no manual installation; future privileged offline-toolchain provisioning
+requires approval. Network acceptance remains unrun and unauthorized.

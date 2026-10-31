@@ -2,6 +2,7 @@
 """Bounded local WorkerPool acceptance with real proofs and preserved failure evidence."""
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -21,8 +22,27 @@ ROOT = Path(__file__).resolve().parents[2]
 BASE = ROOT / "target/macos"
 
 
+def workload(name):
+    """Expected public output is computed independently of all generated receipts."""
+    if name == "fibonacci":
+        a, b = 0, 1
+        for _ in range(20):
+            a, b = b, a + b
+        return (20).to_bytes(4, "little"), a.to_bytes(8, "little").hex(), 18, 1
+    if name == "sha256-chain":
+        digest = bytes(32)
+        for i in range(10):
+            digest = hashlib.sha256(digest + i.to_bytes(4, "little")).digest()
+        return (10).to_bytes(4, "little"), digest.hex(), 18, 1
+    if name == "segment-boundary":
+        return ((1).to_bytes(4, "little") + (8).to_bytes(4, "little"),
+                (0x123456789ABCDEF0 + 8192).to_bytes(8, "little").hex(), 16, 5)
+    raise ValueError("unknown workload")
+
+
 def test_sources():
     files = [ROOT / "Cargo.toml", ROOT / "Cargo.lock", Path(__file__).resolve()]
+    files += [ROOT / "scripts/macos" / name for name in ("smoke.py", "proof_provenance.py", "worker_provenance.py")]
     for crate in ("zkminer-prover", "zkminer-prover-protocol", "zkminer-config"):
         for path in (ROOT / "crates" / crate).rglob("*"):
             if path.is_file() and "target" not in path.relative_to(ROOT).parts:
@@ -68,7 +88,7 @@ def owned_process(pid, parent):
     return result.returncode == 0 and parts == [str(parent), str(pid)]
 
 
-def validate_results(attempt, args, expected):
+def validate_results(attempt, args, expected, fixture):
     acceptance = attempt / "acceptance"
     summary = json.loads((acceptance / "complete.json").read_text())
     count = args.repeat + (0 if args.proof_only else 1)
@@ -84,14 +104,71 @@ def validate_results(attempt, args, expected):
         verification = json.loads(path.with_name("verification.json").read_text())
         if (record.get("phase") != "complete" or record.get("requested_mode") != args.mode
                 or record.get("observed_mode") != expected or record.get("seal_sha256") != sha(path.with_name("seal.bin"))
-                or record.get("journal_hex") != "6d1a000000000000"
+                or record.get("journal_hex") != fixture["expected_journal_hex"]
+                or record.get("elf_sha256") != fixture["elf_sha256"]
+                or record.get("input_sha256") != fixture["input_sha256"]
+                or record.get("po2") != args.po2
+                or record.get("staging_limit_bytes") != args.staging_bytes
+                or record.get("stats", {}).get("segments", 0) < fixture["min_segments"]
                 or verification.get("image_id") != record.get("image_id") or verification.get("verification") != "passed"
-                or verification.get("journal_hex") != "6d1a000000000000"
+                or verification.get("journal_hex") != fixture["expected_journal_hex"]
+                or verification.get("elf_sha256") != fixture["elf_sha256"]
                 or set(verification.get("negative_tests", [])) != {"wrong_image", "modified_journal", "corrupt_seal"}):
             raise RuntimeError("worker proof binding or unchanged independent verification evidence is incomplete")
         validate_proof_evidence(dict(record, requested_mode=expected), expected)
         if args.mode == "auto" and expected == "cpu" and not record.get("fallback_reason"):
             raise RuntimeError("auto CPU fallback lacks a recorded reason")
+        resource = json.loads(path.with_name("resource.json").read_text())
+        if (resource.get("worker_pid") != record.get("worker_pid")
+                or resource.get("worker_start_time_us", 0) <= 0
+                or resource.get("periodic_sample_count", 0) <= 0
+                or not (0 < resource.get("peak_rss_bytes", 0) <= 32 * 1024**3)):
+            raise RuntimeError("missing owned-worker periodic RSS evidence for completed proof")
+        idle = resource.get("idle_after_verification_and_settle", {})
+        if "unavailable_reason" not in idle and (idle.get("rss_bytes", 0) <= 0
+                or idle.get("worker_pid") != record.get("worker_pid")
+                or idle.get("worker_start_time_us") != resource.get("worker_start_time_us")):
+            raise RuntimeError("idle resource evidence has the wrong worker identity")
+    ledger = [json.loads(line) for line in (acceptance / "requests.jsonl").read_text().splitlines()]
+    successes = [row for row in ledger if row.get("status") == "complete_independently_verified"]
+    expected_cases = [f"proof-{i}" for i in range(args.repeat)]
+    if not args.proof_only:
+        expected_cases.append("proof-after-restart")
+    if [row.get("case") for row in successes] != expected_cases:
+        raise RuntimeError("ordered successful request ledger is incomplete")
+    identities = [(row["worker"]["worker_pid"], row["worker"]["request_id"]) for row in successes]
+    if len(set(identities)) != count:
+        raise RuntimeError("successful worker request identity was reused")
+    if any(row["worker"]["stats"] != successes[0]["worker"]["stats"] for row in successes):
+        raise RuntimeError("same guest/input produced inconsistent cycle or segment statistics")
+    permitted = {"started", "complete_independently_verified"}
+    if args.admission_pressure:
+        permitted.add("expected_admission_refusal")
+    if args.proof_only and any(row.get("status") not in permitted for row in ledger):
+        raise RuntimeError("proof-only stability ledger contains a failed or retried request")
+    pressure_entries = [row for row in ledger if row.get("case") == "admission-pressure"]
+    pressure_rows = [row for row in pressure_entries if row.get("status") == "expected_admission_refusal"]
+    if args.admission_pressure:
+        pressure = json.loads((acceptance / "pressure.json").read_text())
+        if (len(pressure_entries) != 2 or pressure_entries[0].get("status") != "started"
+                or len(pressure_rows) != 1 or pressure_rows[0].get("status") != "expected_admission_refusal"
+                or pressure_rows[0].get("pressure") != pressure
+                or pressure.get("kind") != "in_flight_reservation_admission"
+                or pressure.get("attempted") is not False or pressure.get("reserved_after_bytes") != 0
+                or pressure.get("reserved_before_bytes") != 0 or pressure.get("reserved_held_bytes", 0) <= 0
+                or pressure.get("reserved_held_bytes", 0) + pressure.get("needed_bytes", 0) + pressure.get("host_reserve_bytes", 0) <= pressure.get("host_total_bytes", 0)
+                or pressure.get("sidecar_count_before") != pressure.get("sidecar_count_after")
+                or pressure.get("helper_count_after") != 0 or summary.get("admission_pressure") is not True):
+            raise RuntimeError("controlled admission pressure lacks production refusal/release evidence")
+    elif pressure_entries or summary.get("admission_pressure") is not False:
+        raise RuntimeError("unexpected admission-pressure case")
+    streak = longest = 0
+    previous = None
+    for pid, _ in identities[:args.repeat]:
+        streak = streak + 1 if pid == previous else 1
+        longest, previous = max(longest, streak), pid
+    summary.update(consecutive_verified_requests=args.repeat, worker_pids=list(dict.fromkeys(pid for pid, _ in identities)),
+                   longest_same_pid_success_streak=longest)
     if not args.proof_only:
         ledger = [json.loads(line) for line in (acceptance / "requests.jsonl").read_text().splitlines()]
         for case in ("helper-cancel", "helper-timeout"):
@@ -131,16 +208,23 @@ def main():
     parser.add_argument("--mode", choices=["cpu", "metal", "auto"], required=True)
     parser.add_argument("--context", required=True)
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--workload", choices=["fibonacci", "sha256-chain", "segment-boundary"], default="fibonacci")
+    parser.add_argument("--po2", type=int, choices=range(14, 19), help="defaults to 16 for boundary, 18 otherwise")
+    parser.add_argument("--admission-pressure", action="store_true", help="exercise bounded logical in-flight reservation pressure; does not exhaust physical RAM")
     parser.add_argument("--proof-only", action="store_true", help="verify selected mode without the separate cancellation/timeout/restart cases")
     parser.add_argument("--timeout", type=int, default=3600, help="total acceptance runtime bound, excluding test compilation")
     parser.add_argument("--failure-timeout", type=int, default=70)
     parser.add_argument("--staging-bytes", type=int, default=524288)
     args = parser.parse_args()
+    input_data, expected_journal, default_po2, minimum_segments = workload(args.workload)
+    args.po2 = default_po2 if args.po2 is None else args.po2
     if not (1 <= args.repeat <= 100 and 1 <= args.timeout <= 14400 and 1 <= args.failure_timeout <= 300
             and 4096 <= args.staging_bytes <= 16777216):
         parser.error("repeat 1..100, timeout 1..14400, failure timeout 1..300, staging bytes 4096..16777216 required")
     if not args.proof_only and args.repeat < 3:
         parser.error("lifecycle acceptance requires at least three complete repeat proofs")
+    if args.admission_pressure and not args.proof_only:
+        parser.error("admission pressure requires --proof-only; first real proof verifies recovery")
     if args.mode == "metal" and args.worker_kind != "metal":
         parser.error("forced Metal proving requires a Metal-capable worker build")
     for name in ("RISC0_DEV_MODE", "RISC0_SKIP_BUILD", "RISC0_SKIP_BUILD_KERNELS", "RISC0_SKIP_VERIFY", "DOCS_RS",
@@ -171,16 +255,37 @@ def main():
         work.mkdir()
         worker = worker_paths(args.worker_kind)["binary"]
         verifier = BASE / "verifier/release/hemi-macos-proof"
-        program = BASE / "guest-build/riscv32im-risc0-zkvm-elf/release/fibonacci.bin"
+        program = BASE / "guest-build/riscv32im-risc0-zkvm-elf/release" / (args.workload + ".bin")
+        fixture = {"workload":args.workload, "program_path":str(program), "elf_sha256":sha(program),
+                   "input_sha256":hashlib.sha256(input_data).hexdigest(), "expected_journal_hex":expected_journal,
+                   "po2":args.po2, "min_segments":minimum_segments}
+        guest = BASE / "guests" / args.workload
+        guest_build = json.loads((guest / "provenance.json").read_text())
+        guest_source = ROOT / "crates/zkminer-prover/guests/risc0" / args.workload / "src/main.rs"
+        if (guest_build.get("packing", {}).get("program_sha256") != fixture["elf_sha256"]
+                or guest_build.get("source_sha256") != sha(guest_source)
+                or guest_build.get("elf_sha256") != sha(program.with_suffix(""))):
+            raise RuntimeError("selected guest differs from its authentic source/build provenance")
+        guest_inputs = {str(path):sha(path) for path in [guest / "provenance.json", guest / "Cargo.toml",
+                        guest / "Cargo.lock", guest / "metadata.json", guest_source, program.with_suffix("")]}
+        (attempt / "guest-build.json").write_text(json.dumps({"provenance":guest_build, "inputs":guest_inputs}, indent=2) + "\n")
+        (attempt / "input.bin").write_bytes(input_data)
+        (attempt / "fixture.json").write_text(json.dumps(fixture, indent=2) + "\n")
         report = {"id":attempt.name, "status":"failed", "requested_mode":args.mode, "expected_mode":expected,
                   "worker_kind":args.worker_kind, "repeat":args.repeat, "lifecycle":not args.proof_only,
+                  "fixture":fixture, "admission_pressure":args.admission_pressure, "runner_command":[sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
                   "helper_arch":"linux/amd64", "helper_image":DIGEST, "helper_context":args.context,
                   "helper_endpoint":endpoint, "worker_peak_rss_bytes":{},
-                  "rss_method":"owned native worker RSS sampled once per second; excludes helper VM"}
+                  "rss_method":"owned native worker RSS sampled once per second with latest observed request phase; excludes helper VM and unmeasured driver allocations"}
         proc = None
         started = time.monotonic()
         print(attempt, flush=True)
         try:
+            miner_diff = subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=ROOT)
+            (attempt / "miner-acceptance.patch").write_bytes(miner_diff)
+            report.update(miner_head_at_acceptance=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+                          miner_working_diff_sha256=hashlib.sha256(miner_diff).hexdigest(),
+                          miner_revision_scope="acceptance source snapshot; worker build inputs are independently sealed")
             worker_build = verify_worker(args.worker_kind, args.engine, worker)
             verifier_build = verify_verifier("verifier", verifier)
             for name, value in (("worker-build", worker_build), ("verifier-build", verifier_build)):
@@ -189,6 +294,10 @@ def main():
             env = os.environ.copy()
             env.update(ZKMINER_MACOS_WORKER=str(worker), ZKMINER_MACOS_WORKER_KIND=args.worker_kind,
                        ZKMINER_MACOS_PROGRAM=str(program), ZKMINER_MACOS_VERIFIER=str(verifier),
+                       ZKMINER_MACOS_WORKLOAD=args.workload, ZKMINER_MACOS_INPUT=str(attempt / "input.bin"),
+                       ZKMINER_MACOS_EXPECTED_JOURNAL_HEX=expected_journal, ZKMINER_MACOS_PO2=str(args.po2),
+                       ZKMINER_MACOS_MIN_SEGMENTS=str(minimum_segments),
+                       ZKMINER_MACOS_ADMISSION_PRESSURE="1" if args.admission_pressure else "0",
                        ZKMINER_MACOS_EVIDENCE_DIR=str(attempt / "acceptance"), ZKMINER_RISC0_EVIDENCE_DIR=str(sidecars),
                        ZKMINER_RISC0_WORK_ROOT=str(work), ZKMINER_RISC0_DOCKER_CONTEXT=args.context,
                        ZKMINER_RISC0_MODE=args.mode, ZKMINER_MACOS_EXPECT_MODE=expected,
@@ -203,12 +312,21 @@ def main():
                 while proc.poll() is None:
                     if time.monotonic() - test_started > args.timeout:
                         raise TimeoutError("native worker acceptance deadline exceeded")
+                    latest = {}
                     for record in read_sidecars(sidecars):
+                        pid = record.get("worker_pid")
+                        if type(pid) is int and record.get("request_id", -1) > latest.get(pid, {}).get("request_id", -2):
+                            latest[pid] = record
+                    for record in latest.values():
                         pid = record.get("worker_pid")
                         if type(pid) is int and owned_process(pid, proc.pid):
                             rss = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
                             if rss.returncode == 0 and rss.stdout.strip():
                                 value = int(rss.stdout.strip()) * 1024
+                                with (attempt / "rss-samples.jsonl").open("a") as samples:
+                                    samples.write(json.dumps({"elapsed_seconds":time.monotonic()-test_started,
+                                        "worker_pid":pid,"request_id":record.get("request_id"),
+                                        "phase":record.get("phase"),"rss_bytes":value}) + "\n")
                                 key = str(pid)
                                 report["worker_peak_rss_bytes"][key] = max(report["worker_peak_rss_bytes"].get(key, 0), value)
                                 if value > 32 * 1024**3:
@@ -224,7 +342,10 @@ def main():
                 raise RuntimeError("worker/verifier sealed build changed during acceptance")
             if test_sources() != test_build["source_inputs"] or sha(binary) != test_build["binary_sha256"]:
                 raise RuntimeError("acceptance test source or executable changed during the run")
-            report["results"] = validate_results(attempt, args, expected)
+            if (sha(program) != fixture["elf_sha256"] or sha(attempt / "input.bin") != fixture["input_sha256"]
+                    or any(sha(Path(path)) != digest for path, digest in guest_inputs.items())):
+                raise RuntimeError("selected guest or input changed during acceptance")
+            report["results"] = validate_results(attempt, args, expected, fixture)
             report["status"] = "complete_independently_verified"
         except (Exception, KeyboardInterrupt) as error:
             report["error"] = str(error)
