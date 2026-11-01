@@ -140,10 +140,20 @@ impl JobJournal {
             lock_block: 0,
             lock_reopens: None,
         });
-        // A claim sent again (an earlier one stayed ambiguous): its age, which bounds how long an
-        // OPEN read is taken as "may still be pending", runs from this send.
-        if e.state == JournalState::Claiming {
-            e.claimed_at = now;
+        // A new claim: whatever was seen of an earlier lock on this job says nothing about it (a
+        // read showing the new claim pending, at a higher reopen count, would look like proof that
+        // the earlier lock is gone).
+        e.lock_block = 0;
+        e.lock_reopens = None;
+    }
+
+    /// A claim whose outcome is unknown went out: an OPEN read is taken as "may still be pending" for
+    /// as long after THIS send (a breadcrumb still `Claiming` ages from its latest claim).
+    pub fn note_claim_unconfirmed(&mut self, job_id: B256) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            if e.state == JournalState::Claiming {
+                e.claimed_at = chrono::Utc::now().timestamp();
+            }
         }
     }
 
@@ -273,19 +283,27 @@ mod tests {
         let jid = B256::repeat_byte(0x01);
         j.record_claim_intent(jid, 100, Some(B256::repeat_byte(0x02)));
         assert_eq!(j.entries[&jid].state, JournalState::Claiming);
-        // A second claim intent never overwrites an existing entry's data (it may track an
-        // unresolved earlier claim), but a claim sent again restarts its age: an OPEN read is "may
-        // still be pending" for as long after the LATEST send.
+        // A second claim intent never overwrites an existing entry's data or age (it may track an
+        // unresolved earlier claim), but drops what was seen of an earlier lock.
         j.entries.get_mut(&jid).unwrap().claimed_at = 1;
+        j.note_lock_seen(jid, Some(10), 1);
         j.record_claim_intent(jid, 999, None);
-        assert!(j.entries[&jid].claimed_at > 1);
+        assert_eq!(j.entries[&jid].claimed_at, 1);
+        assert_eq!(
+            (j.entries[&jid].lock_block, j.entries[&jid].lock_reopens),
+            (0, None)
+        );
         assert_eq!(j.entries[&jid].lock_deadline, 100);
         assert_eq!(j.entries[&jid].submit_tx, Some(B256::repeat_byte(0x02)));
+        // A claim whose outcome is unknown restarts the age: an OPEN read is "may still be pending"
+        // for as long after the LATEST such send.
+        j.note_claim_unconfirmed(jid);
+        assert!(j.entries[&jid].claimed_at > 1);
         j.mark_claimed(jid, None, 100);
         assert_eq!(j.entries[&jid].state, JournalState::Claimed);
         // Past Claiming, the age is the lock's and stays.
         j.entries.get_mut(&jid).unwrap().claimed_at = 1;
-        j.record_claim_intent(jid, 999, None);
+        j.note_claim_unconfirmed(jid);
         assert_eq!(j.entries[&jid].claimed_at, 1);
         j.mark_proving(jid);
         assert_eq!(j.entries[&jid].state, JournalState::Proving);

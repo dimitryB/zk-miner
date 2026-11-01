@@ -8,6 +8,9 @@ use zkminer_prover::dispatcher::WorkerPool;
 use zkminer_prover::engine::{init_worker_pool, worker_pool};
 
 pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Result<()> {
+    // Not beside a miner from this home: both would drive every GPU, and a live miner's proofs
+    // would run out of memory under the benchmark's (and the miner can't start during one).
+    super::run::hold_instance_lock()?;
     // Spawn the prover workers BEFORE benchmarking. `benchmark::run_benchmark`
     // sources every per-device (GPU) result from `engine::worker_pool()`; when the
     // pool is uninitialized it silently degrades to simulated CPU numbers with an

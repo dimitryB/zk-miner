@@ -36,12 +36,14 @@ pub struct ChainConfig {
     #[serde(default)]
     pub min_staking_age_secs: Option<u64>,
     /// How many blocks back to scan on startup for jobs this miner locked but
-    /// never fulfilled (crash/restart recovery). None = built-in default (50000).
+    /// never fulfilled (crash/restart recovery). None = built-in default (108,150: a lock can
+    /// live a 7-day window plus grace, a downtime extension and pause credit — keep it that long).
     #[serde(default)]
     pub recovery_lookback_blocks: Option<u64>,
     /// How many blocks to rewind the job monitor's start block, so it also claims
     /// jobs that were already Open when the miner started (not just newly-submitted
-    /// ones). None = built-in default (5000); 0 = forward-only.
+    /// ones). None = built-in default: back to `scan_from_block` (5000 on a chain with no known
+    /// deployment); 0 = forward-only.
     #[serde(default)]
     pub monitor_backfill_blocks: Option<u64>,
     /// Job monitor poll interval in seconds. Lower = jobs seen sooner (better in a
@@ -126,7 +128,8 @@ pub struct ContractAddresses {
     /// HEMI token (ERC20) address.
     #[serde(default)]
     pub hemi_token: String,
-    /// ProgramRegistry contract address (advisory ELF/program metadata).
+    /// ProgramRegistry contract address: where programs' ELF sources are read from. Unset: the known
+    /// deployment's for the chain. On a known chain it must be the live one.
     #[serde(default)]
     pub program_registry: String,
 }

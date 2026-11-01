@@ -122,6 +122,7 @@ hemi_prove          = "0x..."       # router (diamond proxy)
 hemi_prove_staking  = "0x..."
 hemi_prove_registry = "0x..."
 hemi_token          = "0x..."
+program_registry    = "0x..."       # where programs' ELF sources are read; defaults to the known deployment's
 
 [wallet]
 key_source  = "env"                 # reads $ZKMINER_PRIVATE_KEY
@@ -133,8 +134,11 @@ skip_benchmark_gate   = true
 ```
 
 `zkminer init` will scaffold a config, but **verify the contract addresses it writes
-against the deployment you intend to use** before running against a live market — a
-wrong address set produces a miner that starts cleanly, sees no jobs, and has no stake.
+against the deployment you intend to use** before running against a live market. On a
+chain zkminer knows (743111), `run` checks the addresses, their wiring and their code
+against the live deployment; a mismatch starts the miner without claiming anything (it
+still drives locks it already holds) and logs a `PAGE:` line naming the difference, so
+fix `[contracts]` and restart.
 
 ## Run
 
@@ -181,12 +185,29 @@ Worth knowing:
   collateral permanently. This surfaces as a throttled warning at default verbosity.
 - **Stopping costs locks.** Ctrl-C (SIGINT) stops claiming and lets the jobs in flight
   finish, for up to 50 minutes; a second signal stops waiting, and every lock still held is
-  then released. SIGTERM (a supervisor's stop, `systemctl stop`) releases every held lock at
-  once. Each release costs 5% of that lock's collateral. A miner that dies without releasing
-  picks its locks up again when it restarts, and drives each one with enough time left.
-- **One miner per home directory.** `run` holds `~/.zkminer/miner.lock`, and a second one
-  refuses to start (two would drive the same locks), including while the first is still
-  draining. `--watch-only` takes no lock.
+  then released. SIGTERM (a supervisor's stop: `systemctl stop` or `restart`, `docker stop`,
+  a Kubernetes rollout) releases every held lock at once. Each release costs 5% of that
+  lock's collateral. A miner that dies without releasing (SIGKILL) picks its locks up again
+  when it restarts, and drives each one that still has time; its workers die with it.
+  So to restart without paying for the locks — to upgrade the binary, say — send SIGINT
+  (it stops claiming), then SIGKILL (`systemctl kill -s KILL`, `docker kill`), and start
+  it again promptly. Exit status 75 means it stopped with locks still held: start it again
+  before their deadlines.
+- **One miner per key.** Two miners on one key drive the same locks and replace each
+  other's transactions. `run` holds `~/.zkminer/miner.lock`, so a second one from the same
+  home refuses to start (including while the first is still draining); it can't see one in
+  another home or on another host. `--watch-only` takes no lock.
+- **`PAGE:` lines need a human.** They say claiming has stopped (the deployment or proof
+  system failed its check, the protocol is paused, the clock is off, funds are short) or a
+  lock is at risk. The dashboard shows them; headless, they go to stderr.
+- **Keep `~/.zkminer/risc0-sys-rand.key`.** It seeds guests' randomness, so a measurement
+  and the proof after it agree; a lock re-proved after a restart needs the same key. Don't
+  copy it off the host.
+- **Escape hatches, for after you've checked by hand:** `ZKMINER_SKIP_CODE_PINS=1` skips
+  the audited-code checks (router, Staking, Registry, facets, and the risc0 adapter and
+  verifier), `ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT=1` accepts contract addresses that aren't
+  the known deployment's, `ZKMINER_RISC0_SKIP_PROGRAM_ID_CHECK=1` proves an ELF whose image
+  id isn't the job's program id. Each one turns off a guard against losing collateral.
 - **Rebuild every worker with the miner.** A worker built for another protocol version is
   refused at start.
 
@@ -233,7 +254,7 @@ piping to `tail`, which buffers and can hide a hang.
 
 `crates/zkminer-cli/tests/localnet.rs` runs the real `zkminer` binary against a local anvil
 fork of Hemi testnet 743111. The fork carries the live HemiProve v2 contracts. On the fork,
-each test:
+the tests:
 
 - mints tHEMI and stakes a prover;
 - registers its programs, with storage URIs the test serves itself;
@@ -241,8 +262,9 @@ each test:
   (one of them assigned to another prover with no exclusivity window, which anyone may claim),
   and the rest (wrong FULL or FIELDS journals, jobs reserved for another prover, a job inside
   another prover's exclusivity window, a job whose 500% collateral exceeds the prover's whole
-  stake, the journal-prefix marker, a decoy ELF whose image id is not the job's program, an
-  unreachable ELF) it must refuse.
+  stake, the journal-prefix marker, an unreachable ELF, and — with the real risc0 worker, so in
+  the watch-only and mining tests — a decoy ELF whose image id is not the job's program) it must
+  refuse.
 
 Some jobs are submitted before the miner starts and some after, so both the startup backfill
 and the live monitor are covered; the backfill starts at the first job's block, so one that
@@ -250,7 +272,8 @@ starts a block late loses it. Nothing touches the real chain, and no key of your
 each miner runs with its own HOME and a cleaned environment.
 
 ```bash
-cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda
+env NVCC=/usr/local/cuda/bin/nvcc HIPCC=off \
+    cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda
 cargo build -p zkminer-prover --features testing --bin mock-worker
 cargo test -p zkminer-cli --test localnet -- --ignored --nocapture --test-threads=1
 ```

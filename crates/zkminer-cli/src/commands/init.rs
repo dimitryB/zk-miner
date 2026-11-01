@@ -3,7 +3,7 @@ use std::path::Path;
 use zkminer_config::ZkMinerConfig;
 
 /// The live Hemi testnet deployment (743111, 2026-10-29). Every older 743111 stack is abandoned;
-/// `zkminer run` refuses a config that names one.
+/// `zkminer run` claims nothing on a config that names one (and pages).
 use zkminer_chain::deployment::HEMI_TESTNET_743111 as TESTNET;
 const TESTNET_RPC: &str = "https://testnet.rpc.hemi.network/rpc";
 use zkminer_chain::staking::TESTNET_CHAIN_ID;

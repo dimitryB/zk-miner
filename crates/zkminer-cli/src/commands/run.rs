@@ -308,11 +308,14 @@ static RISC0_VERIFIED_ADAPTER: std::sync::Mutex<Option<alloy::primitives::Addres
     std::sync::Mutex::new(None);
 
 fn risc0_claimable() -> bool {
-    DEPLOYMENT_VERIFIED.load(std::sync::atomic::Ordering::SeqCst)
-        && RISC0_VERIFIED_ADAPTER
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_some()
+    DEPLOYMENT_VERIFIED.load(std::sync::atomic::Ordering::SeqCst) && risc0_adapter_verified()
+}
+
+fn risc0_adapter_verified() -> bool {
+    RISC0_VERIFIED_ADAPTER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some()
 }
 
 /// One miner per home directory: two would recover, prove and release the same locks, collide on
@@ -321,19 +324,32 @@ fn risc0_claimable() -> bool {
 /// held for the life of the process (the kernel drops it when the process exits, however it exits;
 /// the descriptor is close-on-exec, so no worker inherits it). Watch-only takes none: it never
 /// writes the journal or sends anything.
-fn hold_instance_lock() -> Result<()> {
+pub(crate) fn hold_instance_lock() -> Result<()> {
     static LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
     let dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".zkminer");
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    // Private to this user: anyone who can open the lock file can hold it (flock needs no write
+    // access), and a held lock keeps a restarted miner from recovering its locks.
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("create {}", dir.display()))?;
+    }
     let path = dir.join("miner.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?
+    };
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
@@ -350,6 +366,20 @@ fn hold_instance_lock() -> Result<()> {
     Ok(())
 }
 
+/// Whether new claims on a job of `proof_system_id` from `submitter` for `program_id` are held right
+/// now: the deployment or (risc0) the proof system failed verification, or the post-claim divergence
+/// breaker holds them.
+fn claims_held_for(
+    proof_system_id: B256,
+    submitter: alloy::primitives::Address,
+    program_id: B256,
+) -> bool {
+    let backend = resolve_backend(proof_system_id);
+    !DEPLOYMENT_VERIFIED.load(std::sync::atomic::Ordering::SeqCst)
+        || (backend == Some("risc0") && !risc0_claimable())
+        || backend.is_some_and(|b| divergence_blocks_claim(submitter, program_id, b))
+}
+
 /// Whether the deployment itself last passed `verify_deployment` (this chain's live stack, wired to
 /// itself, running the audited code). Like the proof-system check, a failure only stops NEW claims:
 /// locks we already hold sit in this router's custody and are still driven, and a miner that refused
@@ -358,10 +388,24 @@ fn hold_instance_lock() -> Result<()> {
 static DEPLOYMENT_VERIFIED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Run `verify_deployment` and record the outcome (see [`DEPLOYMENT_VERIFIED`]).
+/// How often a deployment that failed its check is checked again.
+const DEPLOYMENT_RETRY: Duration = Duration::from_secs(60);
+
+/// Run `verify_deployment` and record the outcome (see [`DEPLOYMENT_VERIFIED`]): a pass sets it, a
+/// definite refusal clears it, and an RPC error leaves it as it was — one 429 among its reads says
+/// nothing about the deployment.
 async fn reverify_deployment(client: &ChainClient) -> Result<Vec<String>> {
     let r = client.verify_deployment().await;
-    DEPLOYMENT_VERIFIED.store(r.is_ok(), std::sync::atomic::Ordering::SeqCst);
+    match &r {
+        Ok(_) => DEPLOYMENT_VERIFIED.store(true, std::sync::atomic::Ordering::SeqCst),
+        Err(e)
+            if e.downcast_ref::<zkminer_chain::deployment::DeploymentRefused>()
+                .is_some() =>
+        {
+            DEPLOYMENT_VERIFIED.store(false, std::sync::atomic::Ordering::SeqCst)
+        }
+        Err(_) => {}
+    }
     r
 }
 
@@ -1375,7 +1419,7 @@ fn divergence_blocks_claim(
 /// FULL/FIELDS-bound jobs seen while bound-job claiming is off. A property of the job's immutable
 /// descriptor, cached by jobId after its ONE descriptor fetch: the candidate loop then skips the job
 /// before the price-ordered measure budget, so a pile of high-priced bound decoys cannot starve an
-/// honest job's measurement. Consulted with the LIVE setting, so turning it on at runtime re-admits them.
+/// honest job's measurement. Consulted with the live setting (fixed for a run today: the config's).
 static BOUND_JOBS: std::sync::Mutex<Option<(std::collections::HashSet<B256>, std::collections::VecDeque<B256>)>> =
     std::sync::Mutex::new(None);
 
@@ -1434,22 +1478,37 @@ async fn prefetch_job_collateral_terms(client: &ChainClient, job_ids: &[B256]) {
     if missing.is_empty() {
         return;
     }
-    match client.get_job_snapshots_batch(&missing).await {
+    let failure = match client.get_job_snapshots_batch(&missing).await {
         Ok(rows) => {
             let mut g = JOB_COLLATERAL_TERMS
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let m = g.get_or_insert_with(Default::default);
+            let mut read = 0usize;
             for (jid, terms) in rows {
                 if let Some((_, min_collateral, collateral_bps)) = terms {
                     if m.len() >= MEASURED_CYCLES_CAP {
                         m.clear();
                     }
                     m.insert(jid, (min_collateral, collateral_bps));
+                    read += 1;
                 }
             }
+            (read == 0).then(|| "none of them could be read".to_string())
         }
-        Err(e) => tracing::debug!("collateral terms unreadable this tick: {e:#}"),
+        Err(e) => Some(format!("{e:#}")),
+    };
+    // Every claim needs them: say so if they keep failing (e.g. an RPC whose calls lag its own block
+    // number), at most once a minute of brain ticks.
+    static FAILS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    match failure {
+        Some(why) if FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 12 == 11 => {
+            tracing::warn!(
+                "jobs' collateral terms keep failing to read ({why}) — no new claims until they do"
+            )
+        }
+        Some(why) => tracing::debug!("collateral terms unreadable this tick: {why}"),
+        None => FAILS.store(0, std::sync::atomic::Ordering::Relaxed),
     }
 }
 
@@ -1459,6 +1518,27 @@ fn job_collateral_terms(job_id: B256) -> Option<(u128, u128)> {
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .and_then(|m| m.get(&job_id).copied())
+}
+
+/// PAGE lines waiting for the dashboard (see `PageToDashboard` in main.rs). Bounded: the oldest go.
+static PAGES: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Queue a PAGE line for the dashboard's log.
+pub(crate) fn note_page(msg: String) {
+    let mut q = PAGES.lock().unwrap_or_else(|p| p.into_inner());
+    if q.len() >= 64 {
+        q.pop_front();
+    }
+    q.push_back(msg);
+}
+
+fn take_pages() -> Vec<String> {
+    PAGES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain(..)
+        .collect()
 }
 
 /// Most candidates the brain evaluates per tick.
@@ -2203,7 +2283,8 @@ pub async fn run(
         }
         Err(e) => tracing::error!(
             "PAGE: deployment verification failed ({e:#}) — NOT claiming new jobs; locks already \
-             held are still recovered and driven. Re-checked every few minutes."
+             held are still recovered and driven. Re-checked every {}s.",
+            DEPLOYMENT_RETRY.as_secs()
         ),
     }
     // Resolve the RISC Zero groth16 seal selector (config override or the built-in risc0 v3.0.x
@@ -2221,8 +2302,12 @@ pub async fn run(
     // lock to a 100% slash. Claims for the proof system stay off until a re-check passes.
     match reverify_risc0(&client).await {
         Ok(adapter) => tracing::info!(
-            "startup check — risczero.groth16.v1: adapter {adapter} registered, audited verifier, \
-             SELECTOR 0x{}",
+            "startup check — risczero.groth16.v1: adapter {adapter} registered, {}, SELECTOR 0x{}",
+            if zkminer_chain::deployment::code_pins_skipped() {
+                "adapter and verifier code NOT checked (ZKMINER_SKIP_CODE_PINS=1)"
+            } else {
+                "audited verifier"
+            },
             alloy::hex::encode(risc0_seal_selector())
         ),
         Err(e) => tracing::error!(
@@ -4025,7 +4110,6 @@ async fn miner_brain(
         tracing::info!("watch-only: lock recovery and the nonce watchdog are off");
         RecoveryPass {
             deferred: false,
-            due_by: None,
             actions: Vec::new(),
             scan: None,
         }
@@ -4040,7 +4124,6 @@ async fn miner_brain(
         .await
     };
     let mut recovery_deferred = startup_pass.deferred;
-    let startup_due_by = startup_pass.due_by;
     let mut recovery_scan = startup_pass.scan;
     spawn_recovery_actions(
         startup_pass.actions,
@@ -4103,6 +4186,8 @@ async fn miner_brain(
                                           // ~5 min later. Floored so it can't hammer a still-storming endpoint every tick.
     const RECOVERY_DEFERRED_RETRY: Duration = Duration::from_secs(30);
     let mut tick_count: u64 = 0;
+    let mut pages_shown: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
     // Last host-memory pressure state reported to the ACTIVITY LOG, so the operator is told on each
     // transition rather than once per tick. `None` until the first classification, so the first
     // non-Ok state is always announced.
@@ -4117,10 +4202,9 @@ async fn miner_brain(
     // cadence. Resets the instant a pass completes without deferring.
     let mut consecutive_defers: u32 = recovery_deferred as u32;
     let mut last_recovery_at = std::time::Instant::now();
-    // The latest moment a deferred pass must re-run by (a room-short lock's release point).
-    let mut recovery_due_by: Option<std::time::Instant> = startup_due_by;
     let mut last_wedge_probe_at = std::time::Instant::now();
     let mut last_reverify_at = std::time::Instant::now();
+    let mut last_deployment_check_at = std::time::Instant::now();
 
     // Nonce-gap watchdog. A hole at the mined frontier (an evicted
     // external tx, or a below-`next` abort-gap no organic reserve refilled) leaves our
@@ -4263,6 +4347,24 @@ async fn miner_brain(
     loop {
         interval.tick().await;
         tick_count = tick_count.wrapping_add(1);
+        // PAGE lines logged since the last tick (only collected in TUI mode, where the log file is
+        // all the operator would otherwise see of them), each shown again at most every 10 minutes.
+        for msg in take_pages() {
+            let now = std::time::Instant::now();
+            if pages_shown
+                .get(&msg)
+                .is_none_or(|t| now.duration_since(*t) >= Duration::from_secs(600))
+            {
+                if pages_shown.len() >= 256 {
+                    pages_shown.clear();
+                }
+                pages_shown.insert(msg.clone(), now);
+                state
+                    .write()
+                    .await
+                    .add_log(LogLevel::Error, zkminer_chain::programs::sanitize_log(&msg));
+            }
+        }
 
         // Surface measure-pool unavailability to headless logs (see `measure_pool_down`).
         if let Some(pool) = zkminer_prover::engine::worker_pool() {
@@ -4390,33 +4492,83 @@ async fn miner_brain(
         // Re-verify the served proof system periodically (handoff §11: an adapter can be disabled,
         // swapped by `executePendingReactivation`, or re-enabled during a run). Claims follow the
         // latest verdict; locks already held are driven either way.
-        if last_reverify_at.elapsed() >= PROOF_SYSTEM_RECHECK
-            || (!risc0_claimable() && last_reverify_at.elapsed() >= RECOVERY_REQUEST_FLOOR)
+        // The deployment on its own cadence (it is ~30 reads): every PROOF_SYSTEM_RECHECK while it
+        // verifies, every DEPLOYMENT_RETRY while it doesn't. Not while stopping: the abandon releases
+        // need the RPC budget more.
+        let deployment_ok = DEPLOYMENT_VERIFIED.load(std::sync::atomic::Ordering::SeqCst);
+        if !SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+            && last_deployment_check_at.elapsed()
+                >= if deployment_ok {
+                    PROOF_SYSTEM_RECHECK
+                } else {
+                    DEPLOYMENT_RETRY
+                }
+        {
+            last_deployment_check_at = std::time::Instant::now();
+            let msg = match reverify_deployment(&client).await {
+                Ok(_) if !deployment_ok => Some((
+                    LogLevel::Warn,
+                    "deployment verified again — claiming can resume".to_string(),
+                )),
+                Err(e) if deployment_ok && !DEPLOYMENT_VERIFIED.load(std::sync::atomic::Ordering::SeqCst) => {
+                    Some((
+                        LogLevel::Error,
+                        format!(
+                            "PAGE: the deployment no longer verifies ({e:#}) — not claiming new jobs; \
+                             held locks are still driven. Re-checked every {}s.",
+                            DEPLOYMENT_RETRY.as_secs()
+                        ),
+                    ))
+                }
+                Err(e) => {
+                    tracing::debug!("deployment re-check: {e:#}");
+                    None
+                }
+                _ => None,
+            };
+            if let Some((level, msg)) = msg {
+                // A PAGE reaches the dashboard through the log (`take_pages`); the rest directly.
+                if level == LogLevel::Error {
+                    tracing::error!("{msg}");
+                } else {
+                    tracing::warn!("{msg}");
+                    state.write().await.add_log(level, msg);
+                }
+            }
+        }
+        if !SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+            && (last_reverify_at.elapsed() >= PROOF_SYSTEM_RECHECK
+                || (!risc0_adapter_verified()
+                    && last_reverify_at.elapsed() >= RECOVERY_REQUEST_FLOOR))
         {
             last_reverify_at = std::time::Instant::now();
-            let was = risc0_claimable();
-            let deployment_was = DEPLOYMENT_VERIFIED.load(std::sync::atomic::Ordering::SeqCst);
-            match reverify_deployment(&client).await {
-                Ok(_) if !deployment_was => {
-                    tracing::warn!("deployment verified again — claiming can resume")
+            let was = risc0_adapter_verified();
+            let msg = match reverify_risc0(&client).await {
+                Ok(adapter) if !was => Some((
+                    LogLevel::Warn,
+                    format!("risczero.groth16.v1 verified again (adapter {adapter}) — claiming can resume"),
+                )),
+                Err(e) if was && !risc0_adapter_verified() => Some((
+                    LogLevel::Error,
+                    format!(
+                        "PAGE: risczero.groth16.v1 no longer verifies ({e:#}) — not claiming risc0 jobs; \
+                         held locks are still driven"
+                    ),
+                )),
+                Err(e) => {
+                    tracing::debug!("risczero.groth16.v1 re-check: {e:#}");
+                    None
                 }
-                Err(e) if deployment_was => tracing::error!(
-                    "PAGE: the deployment no longer verifies ({e:#}) — not claiming new jobs; held \
-                     locks are still driven"
-                ),
-                Err(e) => tracing::debug!("deployment re-check: {e:#}"),
-                _ => {}
-            }
-            match reverify_risc0(&client).await {
-                Ok(adapter) if !was && risc0_claimable() => tracing::warn!(
-                    "risczero.groth16.v1 verified again (adapter {adapter}) — claiming resumes"
-                ),
-                Err(e) if was && !risc0_claimable() => tracing::error!(
-                    "PAGE: risczero.groth16.v1 no longer verifies ({e:#}) — not claiming risc0 jobs; \
-                     held locks are still driven"
-                ),
-                Err(e) => tracing::debug!("risczero.groth16.v1 re-check: {e:#}"),
-                _ => {}
+                _ => None,
+            };
+            if let Some((level, msg)) = msg {
+                // A PAGE reaches the dashboard through the log (`take_pages`); the rest directly.
+                if level == LogLevel::Error {
+                    tracing::error!("{msg}");
+                } else {
+                    tracing::warn!("{msg}");
+                    state.write().await.add_log(level, msg);
+                }
             }
         }
 
@@ -4431,13 +4583,10 @@ async fn miner_brain(
         // (`RECOVERY_REQUESTED`), or when a previous pass deferred work.
         let since = last_recovery_at.elapsed();
         let due_periodic = since >= RECOVERY_EVERY;
-        // Back-off floor: base << (consecutive_defers-1), capped at 8x (~4 min) — and never later than
-        // the release point of a room-short lock the last pass deferred.
+        // Back-off floor: base << (consecutive_defers-1), capped at 8x (~4 min).
         let retry_floor =
             RECOVERY_DEFERRED_RETRY * (1u32 << consecutive_defers.saturating_sub(1).min(3));
-        let due_deferred = recovery_deferred
-            && (since >= retry_floor
-                || recovery_due_by.is_some_and(|t| std::time::Instant::now() >= t));
+        let due_deferred = recovery_deferred && since >= retry_floor;
         let due_requested = RECOVERY_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
             && since >= RECOVERY_REQUEST_FLOOR;
         if !watch_only() && (due_periodic || due_deferred || due_requested) {
@@ -4516,7 +4665,6 @@ async fn miner_brain(
                     )
                     .await;
                     recovery_deferred = pass.deferred;
-                    recovery_due_by = pass.due_by;
                     recovery_scan = pass.scan;
                     // Reap tasks that finished DURING the pass first, so a lock whose task just
                     // ended can be picked up again.
@@ -4882,9 +5030,6 @@ async fn miner_brain(
                             "PAGE: CLOCK-SKEW — {why}; not claiming new work until they agree"
                         );
                         tracing::warn!("{msg}");
-                        if !clock_skew_held {
-                            state.write().await.add_log(LogLevel::Warn, msg);
-                        }
                     }
                     clock_skew_held = true;
                     continue;
@@ -5236,6 +5381,17 @@ async fn miner_brain(
             // (once resolved), so the prove path sizes its watchdog/VRAM/po2 on it, not on the
             // adversarial declared `expected_cycles`.
             let mut snapshot = JobStatusSnapshot::from_view(&view);
+            // A competitive job with a live bid: zkminer doesn't bid, the view's price is the ceiling
+            // frozen at the first bid (no direct claim gets it), and every claim reverts BiddingActive
+            // until the round ends. Set it aside until then.
+            if snapshot.current_bidder != alloy::primitives::Address::ZERO {
+                let left = snapshot
+                    .bid_deadline
+                    .saturating_sub(zkminer_chain::client::chain_now_floor());
+                tracing::debug!("Skipping {}: a bid is live for {left}s more", short_id(jid));
+                note_job_retry_after(jid, Duration::from_secs(left.clamp(30, 3600)));
+                continue;
+            }
             // EVICT a descriptor whose fulfill payload a prior measurement found to be over the
             // on-chain cap: claiming+proving it would waste a full proof on a fulfill that is
             // guaranteed to OOG-revert, then release at a penalty. over_cap is keyed by THIS
@@ -5366,6 +5522,15 @@ async fn miner_brain(
             // minimum), so a job we can never prove is a guaranteed loss. Skipping
             // costs nothing. In pure-simulated mode every backend reports present,
             // so this gate is a no-op there and doesn't break demo/test flows.
+            if !DEPLOYMENT_VERIFIED.load(std::sync::atomic::Ordering::SeqCst) {
+                // Whatever its proof system: the deployment it would be claimed on failed (or has not
+                // passed) verification.
+                tracing::debug!(
+                    "Skipping {}: the deployment is not verified right now",
+                    short_id(jid)
+                );
+                continue;
+            }
             match resolve_backend(snapshot.proof_system_id) {
                 None => {
                     tracing::debug!(
@@ -5896,20 +6061,6 @@ async fn miner_brain(
                 min_profit_threshold,
                 deadline_safety_margin,
             );
-            // The share of the speed premium a fulfil can still earn falls with every exit from a
-            // lock (a release or slash, which count as reopens, and a pause's grace release, which
-            // doesn't), and the job view doesn't carry it. Read it only for a job that the full
-            // premium would have us claim, and decide again on it. Unreadable: assume none is left.
-            if params.speed_premium > 0 && matches!(eval.recommendation, Recommendation::Claim) {
-                params.premium_cap = Some(client.get_premium_cap(jid).await.unwrap_or(0));
-                eval = evaluate_job(
-                    &benchmarks,
-                    &cost_params,
-                    &params,
-                    min_profit_threshold,
-                    deadline_safety_margin,
-                );
-            }
             tracing::debug!(
                 "eval {}: rec={:?} profit={:.2} HEMI/day feasible={} collateral={} cycles={} time_left={}s",
                 short_id(jid),
@@ -6236,9 +6387,27 @@ async fn miner_brain(
             // triggered above) and becomes claimable next tick on the real size. `claim_ceiling`/the
             // pre-feature `max_concurrent` cap are unchanged.
             let queue_bypass = !planner_active;
-            if (admission.is_some() || (queue_bypass && measurable && in_flight.len() < max_concurrent))
+            let would_commit = admission.is_some()
+                || (queue_bypass && measurable && in_flight.len() < max_concurrent);
+            // The share of the speed premium a fulfil can still earn falls with every exit from a
+            // lock (a release or slash, which count as reopens, and a pause's grace release, which
+            // doesn't), and the job view doesn't carry it. Read it only for a job about to take a
+            // slot, after every other gate — the evaluation above used the full premium, an upper
+            // bound — and decide again on it. Unreadable: assume none is left.
+            if would_commit
+                && params.speed_premium > 0
                 && matches!(eval.recommendation, Recommendation::Claim)
             {
+                params.premium_cap = Some(client.get_premium_cap(jid).await.unwrap_or(0));
+                eval = evaluate_job(
+                    &benchmarks,
+                    &cost_params,
+                    &params,
+                    min_profit_threshold,
+                    deadline_safety_margin,
+                );
+            }
+            if would_commit && matches!(eval.recommendation, Recommendation::Claim) {
                 claimed_this_tick = true;
                 // Reserve the slot + collateral NOW (like the single-claim path always
                 // did): inserting into in_flight immediately makes the loop-top
@@ -6569,6 +6738,9 @@ struct JobStatusSnapshot {
     /// How long the claim gate estimated this job's proof to take, when it evaluated it. A
     /// watch-only "would claim" holds its slot and collateral this long, as a real one would.
     estimated_prove_secs: Option<u64>,
+    /// A live bid's bidder on a competitive job (zero: none), and when its round ends.
+    current_bidder: alloy::primitives::Address,
+    bid_deadline: u64,
 }
 
 impl JobStatusSnapshot {
@@ -6599,6 +6771,8 @@ impl JobStatusSnapshot {
             verified_elf_hash: None,
             measured_journal: None,
             estimated_prove_secs: None,
+            current_bidder: v.currentBidder,
+            bid_deadline: u64::try_from(v.bidDeadline).unwrap_or(u64::MAX),
         }
     }
 }
@@ -7321,14 +7495,10 @@ async fn process_job_lifecycle(
     }
     // The same last-moment re-check for the divergence breaker and the proof system's verification
     // (either can flip while this task was being dispatched). Temporary, so the job is put back.
-    if !is_recovery
-        && (resolve_backend(snapshot.proof_system_id)
-            .is_some_and(|b| divergence_blocks_claim(submitter, program_id, b))
-            || (resolve_backend(snapshot.proof_system_id) == Some("risc0") && !risc0_claimable()))
-    {
+    if !is_recovery && claims_held_for(snapshot.proof_system_id, submitter, program_id) {
         tracing::debug!(
-            "Not claiming {} now: the divergence breaker or the proof-system check holds claims — \
-             nothing locked",
+            "Not claiming {} now: the divergence breaker, or the deployment or proof-system check, \
+             holds claims — nothing locked",
             short_id(job_id)
         );
         note_job_retry_after(job_id, Duration::from_secs(300));
@@ -7403,7 +7573,7 @@ async fn process_job_lifecycle(
             if !claim_predicate {
                 // FULL/FIELDS job and the operator opted out of journal-bound jobs (since the brain
                 // dispatched it). Recorded and put back, as the measure path does, not dropped: the
-                // operator can turn bound-job claiming on again at runtime.
+                // setting is read live (though only the config sets it today).
                 mark_job_bound(job_id);
                 requeue_open_job(state, requeue_job.clone()).await;
                 skip("journal-bound (claim_predicate_jobs=false)".into(), false).await;
@@ -7546,6 +7716,17 @@ async fn process_job_lifecycle(
         s.open_jobs.retain(|j| j.info.job_id != job_id);
         return Ok(());
     }
+    // The same holds as step 0, again: the descriptor and ELF fetches since can take minutes, and a
+    // re-check in the meantime may have closed a gate.
+    if !is_recovery && claims_held_for(snapshot.proof_system_id, submitter, program_id) {
+        tracing::debug!(
+            "Not claiming {} now: a claim gate closed during its pre-claim fetches — nothing locked",
+            short_id(job_id)
+        );
+        note_job_retry_after(job_id, Duration::from_secs(300));
+        requeue_open_job(state, requeue_job.clone()).await;
+        return Ok(());
+    }
 
     // Watch-only: every check above ran as it would before a real claim. Report what the claim would
     // meet instead of sending it; no breadcrumb is written.
@@ -7660,7 +7841,10 @@ async fn process_job_lifecycle(
             Err(e) => return Err(HandBack(format!("ownership re-read failed: {e:#}")).into()),
         }
     } else {
-        match client.claim_job_idempotent(job_id).await {
+        match client
+            .claim_job_idempotent(job_id, snapshot.current_price)
+            .await
+        {
             Ok(ClaimOutcome::Claimed(r)) => r.block,
             Ok(ClaimOutcome::LostRace) if prior_claim => {
                 return Err(HandBack("another prover reads as holding a job an earlier claim of ours may hold".into()).into());
@@ -7742,6 +7926,7 @@ async fn process_job_lifecycle(
                 // job's breadcrumb until it ages out. The job also stays a candidate behind a
                 // back-off, in case the claim never landed; a later claim is idempotent.
                 note_transient_preclaim_failure(job_id);
+                journal_update(journal, |j| j.note_claim_unconfirmed(job_id));
                 requeue_open_job(state, requeue_job.clone()).await;
                 return Err(HandBack(format!("claim outcome unconfirmed: {e:#}")).into());
             }
@@ -7902,13 +8087,10 @@ async fn process_job_lifecycle(
     // proof whose public values don't reproduce the committed journal reverts
     // JournalMismatch (before any payment) and risks a slash on timeout.
     if descriptor.expectedJournalHash != alloy_primitives::B256::ZERO {
-        let mut s = state.write().await;
-        s.add_log(
-            LogLevel::Warn,
-            format!(
-                "Job {} is a PREDICATE job — fulfill reverts JournalMismatch unless the proof journal matches the commitment (slash risk on timeout)",
-                short_id(job_id)
-            ),
+        tracing::info!(
+            "Job {} is journal-bound: its proof's journal is checked against the binding before the \
+             fulfil (a mismatch releases the lock instead of sending a fulfil that would revert)",
+            short_id(job_id)
         );
     }
 
@@ -7941,6 +8123,18 @@ async fn process_job_lifecycle(
                 // and re-driving it for the lock's whole life would hold a slot and the RPC budget.
                 Err(e) if note_preclaim_elf_failure(job_id) >= MAX_POSTLOCK_ELF_FAILURES => {
                     return Err(e.context("ELF unobtainable after repeated attempts"))
+                }
+                // Too little time left for a re-drive to start: recovery would only release it,
+                // after a pass's worth of delay that comes out of the release ladder's margin.
+                // Release it now.
+                Err(e)
+                    if deadline_proof_budget(lock_deadline).is_some_and(|b| {
+                        b < Duration::from_secs(
+                            MIN_ATTEMPT_BUDGET_SECS + DEADLINE_FULFILL_MARGIN_SECS,
+                        )
+                    }) =>
+                {
+                    return Err(e)
                 }
                 Err(e) => {
                     note_transient_preclaim_failure(job_id);
@@ -8030,9 +8224,7 @@ async fn process_job_lifecycle(
     // Scale the proving-watchdog deadline to the job so a wedged GPU is
     // caught in minutes, not the full (large) configured timeout. Committed-cycle
     // jobs get a timeout proportional to their size; uncommitted jobs (cycles == 0,
-    // can't estimate) fall back to the configured cap. Always <= proving_timeout,
-    // so the separate deadline/recovery planning (which uses proving_timeout) is
-    // unaffected. Uses a deliberately slow CPS floor + 4x margin so a legitimately
+    // can't estimate) fall back to the configured cap. Always <= proving_timeout. Uses a deliberately slow CPS floor + 4x margin so a legitimately
     // slow proof is never killed.
     let effective_timeout = {
         const CONSERVATIVE_CPS: u64 = 400_000;
@@ -8892,7 +9084,10 @@ async fn process_job_lifecycle(
             FulfilClass::Late => {
                 // Past D+G: never resend (a late fulfil only publishes the proof). A release would
                 // revert too — `release_and_clean` sees the passed cutoff and leaves it to the slash.
-                tracing::error!("LOCK-LATE: {} — {reason}", short_id(job_id));
+                tracing::error!(
+                    "PAGE: LOCK-LATE: {} — {reason}; the lock will be slashed",
+                    short_id(job_id)
+                );
                 clear_submitting("past the fulfil window").await;
                 return Err(anyhow::anyhow!("fulfil window passed for {}: {reason}", short_id(job_id)));
             }
@@ -9391,7 +9586,7 @@ async fn measure_cycles(
             }
         } else if !state.read().await.runtime_settings.claim_predicate_jobs {
             // FULL/FIELDS-bound and the operator does not claim bound jobs: do not size it. Recorded
-            // per jobId, not evicted — the operator can turn bound-job claiming on at runtime.
+            // per jobId, not evicted (the setting is read live, though only the config sets it today).
             mark_job_bound(job_id);
             return;
         }
@@ -10123,16 +10318,29 @@ impl std::fmt::Display for RegistryUnavailable {
 }
 impl std::error::Error for RegistryUnavailable {}
 
-/// Whether our lock on `job_id` is provably gone, given a read showing it not ours with
-/// `reopen_count`: the count has risen since we saw our lock, or a read pinned at or after the block
-/// where we saw it shows someone else (or no one). An unpinned read alone may come from a replica
-/// still behind our claim, showing the job's previous holder or none. `false` when neither is known.
-async fn lock_gone_confirmed(
+/// What a read pinned at or after the block where we last saw our lock says about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockOwnership {
+    /// Provably gone: the reopen count has risen since we saw it, or the pinned read shows someone
+    /// else (or no one).
+    Gone,
+    /// The pinned read shows it ours and Locked: a read saying otherwise lags.
+    Ours,
+    /// Nothing to pin to, or the pinned read failed.
+    Unknown,
+}
+
+/// Judge our lock on `job_id` given a read that shows it not ours with `reopen_count`. An unpinned
+/// read alone may come from a replica still behind our claim, showing the job's previous holder or
+/// none; the journal's `lock_reopens` (every way a lock ends bumps the count, but the prover's own
+/// pause release, which zkminer never sends) and `lock_block` settle it when they can.
+async fn lock_ownership(
     client: &ChainClient,
     journal: &SharedJournal,
     job_id: B256,
     reopen_count: u8,
-) -> bool {
+) -> LockOwnership {
+    const JOB_STATUS_LOCKED: u8 = 1;
     let (lock_block, lock_reopens) = {
         let j = journal.lock().unwrap_or_else(|p| p.into_inner());
         j.entries
@@ -10140,13 +10348,30 @@ async fn lock_gone_confirmed(
             .map_or((0, None), |e| (e.lock_block, e.lock_reopens))
     };
     if lock_reopens.is_some_and(|r| reopen_count > r) {
-        return true;
+        return LockOwnership::Gone;
     }
-    lock_block != 0
-        && matches!(
-            client.read_job_record(job_id, Some(lock_block)).await,
-            Ok((rec, _)) if rec.prover != client.address
-        )
+    if lock_block == 0 {
+        return LockOwnership::Unknown;
+    }
+    match client.read_job_record(job_id, Some(lock_block)).await {
+        // A record with no caller is a job this router doesn't know (the contracts never delete
+        // one): the config names another stack, not proof that our lock ended.
+        Ok((rec, _)) if rec.caller == alloy::primitives::Address::ZERO => LockOwnership::Unknown,
+        Ok((rec, _)) if rec.prover != client.address => LockOwnership::Gone,
+        Ok((rec, _)) if rec.status == JOB_STATUS_LOCKED => LockOwnership::Ours,
+        _ => LockOwnership::Unknown,
+    }
+}
+
+/// The journal's evidence of where we last saw our lock on `job_id` (see `release_job_with_nonce`).
+fn lock_seen(journal: &SharedJournal, job_id: B256) -> zkminer_chain::jobs::LockSeen {
+    let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+    j.entries
+        .get(&job_id)
+        .map_or_else(Default::default, |e| zkminer_chain::jobs::LockSeen {
+            block: (e.lock_block != 0).then_some(e.lock_block),
+            reopens: e.lock_reopens,
+        })
 }
 
 async fn release_and_clean(
@@ -10230,7 +10455,7 @@ async fn release_and_clean_with_nonce(
     // would land and burn the release penalty for nothing. Keep the lock: retain the breadcrumb (the
     // only record that collateral is locked), refresh its deadline to the credited one (every shutdown
     // decision keys off it), and leave the job to the recovery pass, which re-drives or releases it
-    // after the lift. An unreadable hold state falls through to the release.
+    // after the lift. (An unreadable hold state was handled above: kept, unless near the cutoff.)
     if matches!(hold, Ok(Some(GovernanceHold::Paused))) {
         tracing::warn!(
             "KEEP: {} not released — the router or Registry is paused (the deadline is credited); \
@@ -10335,8 +10560,21 @@ async fn release_and_clean_with_nonce(
         // — the latter catches the race where a fulfill we started actually landed just
         // as we gave up waiting (status now Fulfilled, but prover still == us).
         const JOB_STATUS_LOCKED: u8 = 1;
-        let not_ours = view.prover != client.address;
-        let not_locked = view.status != JOB_STATUS_LOCKED;
+        // A read showing the job not ours is checked against the journal's evidence: when a read
+        // pinned at our lock block shows the lock ours and Locked, this one lags, and the release
+        // must still go out.
+        let ownership = if view.prover != client.address {
+            Some(lock_ownership(client, journal, job_id, view.reopenCount).await)
+        } else {
+            // Ours: the count it reads now is the floor a later "gone" must rise above.
+            journal_update(journal, |j| {
+                j.note_lock_seen(job_id, None, view.reopenCount)
+            });
+            None
+        };
+        let pinned_ours = ownership == Some(LockOwnership::Ours);
+        let not_ours = view.prover != client.address && !pinned_ours;
+        let not_locked = view.status != JOB_STATUS_LOCKED && !pinned_ours;
         if not_ours || not_locked {
             // `prover == ZERO` (the job still reads OPEN) does NOT prove our claim never
             // landed: the claimJob(Batch) tx may still be pending, or this node may simply be
@@ -10371,14 +10609,11 @@ async fn release_and_clean_with_nonce(
             // Another prover on this unpinned read is no better evidence than ZERO: a replica
             // behind our claim still shows the job's previous holder. A risen reopen count, or a read
             // pinned at or after our lock block, settles it.
-            let foreign = not_ours && view.prover != alloy::primitives::Address::ZERO;
-            let gone = not_ours
-                && (unconfirmed_claim || deadline_live)
-                && lock_gone_confirmed(client, journal, job_id, view.reopenCount).await;
-            if foreign && !gone {
-                request_recovery();
-            }
+            let gone = ownership == Some(LockOwnership::Gone);
             if not_ours && !gone && (unconfirmed_claim || deadline_live) {
+                // Not provably gone: recovery reads it again soon, rather than at its periodic
+                // cadence — a live lock near its margin can't wait that long.
+                request_recovery();
                 tracing::warn!(
                     "Job {} reads prover {} but our lock is not provably gone — retaining \
                      breadcrumb (claim tx may still be pending, or this read is from a lagging \
@@ -10459,9 +10694,9 @@ async fn release_and_clean_with_nonce(
             });
         }
         if lock_deadline != 0 && now >= lock_deadline {
-            tracing::warn!(
-                "Job {} is past its deadline ({} >= {}) — releaseJob would revert; retaining \
-                 breadcrumb (collateral stranded until a keeper slash)",
+            tracing::error!(
+                "PAGE: LOCK-LATE: {} is past its deadline ({} >= {}) — releaseJob would revert; \
+                 retaining breadcrumb (collateral stranded until a keeper slash)",
                 short_id(job_id),
                 now,
                 lock_deadline,
@@ -10489,16 +10724,8 @@ async fn release_and_clean_with_nonce(
         }
     }
 
-    let lock_block = {
-        let j = journal.lock().unwrap_or_else(|p| p.into_inner());
-        j.entries
-            .get(&job_id)
-            .map(|e| e.lock_block)
-            .filter(|b| *b != 0)
-    };
-    let mut release = client
-        .release_job_with_nonce(job_id, pre_nonce, lock_block)
-        .await;
+    let seen = lock_seen(journal, job_id);
+    let mut release = client.release_job_with_nonce(job_id, pre_nonce, seen).await;
     // Inside the release margin there may be no time for a recovery pass: retry in place while the
     // window is open. A ladder can burn out in seconds on a burst of refused sends. A typed revert is
     // an answer from the chain (past the window, lock gone), so it stops.
@@ -10523,9 +10750,7 @@ async fn release_and_clean_with_nonce(
             short_id(job_id)
         );
         tokio::time::sleep(Duration::from_secs(5)).await;
-        release = client
-            .release_job_with_nonce(job_id, None, lock_block)
-            .await;
+        release = client.release_job_with_nonce(job_id, None, seen).await;
     }
     let release_ok = match release {
         Ok(()) => {
@@ -10614,9 +10839,6 @@ struct RecoveryPass {
     /// The pass was cut short (a rate-limit storm, a failed chain scan, a transient descriptor
     /// failure): retry SOONER than the periodic cadence.
     deferred: bool,
-    /// The latest moment the next pass must run by: a room-short lock this pass could not decide
-    /// reaches its release point then.
-    due_by: Option<std::time::Instant>,
     actions: Vec<(B256, RecoveryAction)>,
     /// The incremental locked-job scan state to hand to the next pass.
     scan: Option<RecoveryScan>,
@@ -10715,7 +10937,6 @@ async fn recover_claimed_jobs(
             tracing::debug!("recover: {discovered} on-chain claimed job(s) not in the journal");
         }
     }
-    let mut due_by: Option<std::time::Instant> = None;
     // Ids found settled / not ours this pass: dropped from `known` at the end.
     let mut settled: Vec<B256> = Vec::new();
     // A live lifecycle task owns these: it is the only writer of their breadcrumbs.
@@ -10728,10 +10949,6 @@ async fn recover_claimed_jobs(
     }
     // One pause read per pass (a failed read counts as not paused: the per-job paths re-check).
     let paused = matches!(client.protocol_paused().await, Ok(true));
-    // After a lift the job clock stays stopped for up to RESUME_GRACE (the base clock's after a router
-    // or Registry lift, the adapter key's after a re-enable), and the views below only carry the credit
-    // accrued so far. Read once per proof system per pass; an unreadable tail is UNKNOWN, not 0.
-    let mut grace_tails: std::collections::HashMap<B256, Option<u64>> = std::collections::HashMap::new();
 
     // Fetch EVERY candidate's view in ONE (chunked) batch and FILTER to jobs we
     // currently hold Locked, up front. Terminal/not-ours jobs are dropped from the journal here
@@ -10776,7 +10993,7 @@ async fn recover_claimed_jobs(
         if let Some(v) = views_map.get(jid) {
             if v.prover != client.address
                 && live_claim_intent.contains(jid)
-                && lock_gone_confirmed(client, journal, *jid, v.reopenCount).await
+                && lock_ownership(client, journal, *jid, v.reopenCount).await == LockOwnership::Gone
             {
                 lock_gone.insert(*jid);
             }
@@ -10935,7 +11152,8 @@ async fn recover_claimed_jobs(
             // — keep the breadcrumb while our claim could still be live; a later pass GCs it once it
             // ages out.
             if live_claim_intent.contains(&jid)
-                && !lock_gone_confirmed(client, journal, jid, view.reopenCount).await
+                && lock_ownership(client, journal, jid, view.reopenCount).await
+                    != LockOwnership::Gone
             {
                 tracing::warn!(
                     "recover: {} reads prover {} but our claim may still be pending or the read \
@@ -11002,44 +11220,10 @@ async fn recover_claimed_jobs(
         let drive_floor =
             DEADLINE_RELEASE_MARGIN_SECS + MIN_ATTEMPT_BUDGET_SECS + DEADLINE_FULFILL_MARGIN_SECS;
         let recovery_margin = drive_floor;
+        // Too little room for a re-drive to start: release now, with the whole ladder ahead. (A lock
+        // inside a resume grace has its job-local clock frozen, but the lifecycle's pre-prove fetches
+        // are budgeted on the view's room alone, so driving it would only release it there instead.)
         if lock_deadline > 0 && now + recovery_margin >= lock_deadline {
-            let ps = view.proofSystemId;
-            let tail = match grace_tails.get(&ps) {
-                Some(t) => *t,
-                None => {
-                    let t = client.resume_grace_tail_secs(ps).await.ok();
-                    grace_tails.insert(ps, t);
-                    t
-                }
-            };
-            // During a resume grace job-local time is FROZEN: `room` stays constant (it does not grow),
-            // and `room + tail` is the real time left. Decide now — waiting the tail out only delays a
-            // release into its own ladder margin. Enough real time to prove: Drive (the prove loop
-            // extends its watchdog by the tail). Otherwise: Release now, with the whole ladder ahead.
-            // An unreadable tail defers — unless the lock is inside the release margin, where a release
-            // is the only alternative left to a 100% slash — and the next pass is due by the release
-            // point.
-            let room = lock_deadline.saturating_sub(now);
-            let in_margin = now.saturating_add(DEADLINE_RELEASE_MARGIN_SECS) >= lock_deadline;
-            let drive_in_tail = match tail {
-                Some(t) => t > 0 && room >= drive_floor && room + t > recovery_margin,
-                None if !in_margin => {
-                    deferred = true;
-                    let release_point = room.saturating_sub(DEADLINE_RELEASE_MARGIN_SECS + 30);
-                    let at = std::time::Instant::now() + Duration::from_secs(release_point);
-                    due_by = Some(due_by.map_or(at, |d| d.min(at)));
-                    continue;
-                }
-                None => false,
-            };
-            if drive_in_tail {
-                tracing::info!(
-                    "recover: {} is short on view room ({room}s) but its clock is frozen for {}s more — \
-                     re-driving",
-                    jid,
-                    tail.unwrap_or(0)
-                );
-            } else {
             tracing::warn!(
                 "recover: {} past deadline room (now={} deadline={} margin={}s) — releasing",
                 jid,
@@ -11049,7 +11233,6 @@ async fn recover_claimed_jobs(
             );
             actions.push((jid, RecoveryAction::Release(jid)));
             continue;
-            }
         }
 
         // Reconstruct a TrackedJob from the view.
@@ -11159,7 +11342,6 @@ async fn recover_claimed_jobs(
     }
     RecoveryPass {
         deferred: deferred || scan_failed || open_intent,
-        due_by,
         actions,
         scan: next_scan,
     }
@@ -11300,7 +11482,7 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{Address, B256};
+    use alloy::primitives::B256;
 
     /// The terminal-vs-retryable classification is by TYPE, and guest text cannot forge it.
     ///

@@ -138,7 +138,7 @@ pub fn immutables_are(code: &[u8], offsets: &[usize], word: B256) -> bool {
 
 /// Whether the operator opted out of the audited-code checks (e.g. a governance upgrade landed
 /// before this zkminer shipped its pins). Never skips the chain-id, address or wiring checks.
-fn code_pins_skipped() -> bool {
+pub fn code_pins_skipped() -> bool {
     std::env::var("ZKMINER_SKIP_CODE_PINS").ok().as_deref() == Some("1")
 }
 
@@ -154,6 +154,25 @@ impl std::fmt::Display for ProofSystemRefused {
     }
 }
 impl std::error::Error for ProofSystemRefused {}
+
+/// The deployment was READ and is definitely not the audited, configured stack (other addresses,
+/// other wiring, other code) — as opposed to an RPC failure, which says nothing. Only this clears a
+/// previous "verified" verdict.
+#[derive(Debug, Clone)]
+pub struct DeploymentRefused(pub String);
+
+impl std::fmt::Display for DeploymentRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for DeploymentRefused {}
+
+macro_rules! refuse {
+    ($($arg:tt)*) => {
+        return Err(DeploymentRefused(format!($($arg)*)).into())
+    };
+}
 
 impl ChainClient {
     /// Verify the configured stack before the first transaction (handoff §13 test 1): the chain is a
@@ -191,10 +210,11 @@ impl ChainClient {
                             mismatches.join("; ")
                         );
                     } else {
-                        bail!(
+                        refuse!(
                             "the configured contracts are not {} — {}. Older stacks on this chain are \
-                             abandoned; regenerate the config with `zkminer init --network testnet` (or set \
-                             ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT=1 to target another deployment on purpose)",
+                             abandoned; fix [contracts] in the config (`zkminer init --network testnet \
+                             --force` rewrites the whole file), or set ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT=1 \
+                             to target another deployment on purpose",
                             k.name,
                             mismatches.join("; ")
                         );
@@ -226,7 +246,7 @@ impl ChainClient {
             ("Staking.hemiToken()", staking_token, self.hemi_token),
         ] {
             if got != want {
-                bail!("{what} is {got} but the config names {want} — refusing to start");
+                refuse!("{what} is {got} but the config names {want}");
             }
         }
         report.push("wiring: router.staking/registry/hemiToken and Staking.hemiToken match".into());
@@ -234,8 +254,8 @@ impl ChainClient {
         // 3. Audited code.
         if code_pins_skipped() {
             tracing::warn!(
-                "ZKMINER_SKIP_CODE_PINS=1: NOT verifying that the router, Staking, Registry and their \
-                 facets run the audited code"
+                "ZKMINER_SKIP_CODE_PINS=1: NOT verifying that the router, Staking, Registry, their \
+                 facets, and the proof systems' adapters and verifiers run the audited code"
             );
             report.push("code: SKIPPED (ZKMINER_SKIP_CODE_PINS=1)".into());
             return Ok(report);
@@ -251,7 +271,10 @@ impl ChainClient {
         for (name, proxy, impl_pin) in proxies {
             let code = self.provider.get_code_at(proxy).await.with_context(|| format!("{name} code"))?;
             if keccak256(&code) != pins::ERC1967_PROXY {
-                bail!("{name} {proxy} is not the audited ERC1967Proxy (runtime keccak {})", keccak256(&code));
+                refuse!(
+                    "{name} {proxy} is not the audited ERC1967Proxy (runtime keccak {})",
+                    keccak256(&code)
+                );
             }
             let slot = self
                 .provider
@@ -265,9 +288,9 @@ impl ChainClient {
                 .await
                 .with_context(|| format!("{name} implementation code"))?;
             if keccak_self_zeroed(&icode, implementation) != impl_pin {
-                bail!(
-                    "{name} implementation {implementation} is not the audited code (pin {impl_pin}) — \
-                     refusing to start (set ZKMINER_SKIP_CODE_PINS=1 only after verifying an upgrade)"
+                refuse!(
+                    "{name} implementation {implementation} is not the audited code (pin {impl_pin}) \
+                     (set ZKMINER_SKIP_CODE_PINS=1 only after verifying an upgrade)"
                 );
             }
         }
@@ -294,6 +317,9 @@ impl ChainClient {
             C::withdrawCall::SELECTOR,
         ];
         let facet_sig = alloy::primitives::keccak256("getFacet(bytes4)");
+        // Several selectors route to one facet: read and hash each facet's code once.
+        let mut audited_facets: std::collections::HashSet<Address> =
+            std::collections::HashSet::new();
         for sel in selectors {
             let mut data = facet_sig[..4].to_vec();
             let mut word = [0u8; 32];
@@ -304,16 +330,22 @@ impl ChainClient {
                 .input(data.into());
             let out = self.provider.call(tx).await.context("router.getFacet")?;
             if out.len() < 32 {
-                bail!("router.getFacet(0x{}) returned {} bytes", alloy::hex::encode(sel), out.len());
+                refuse!(
+                    "router.getFacet(0x{}) returned {} bytes",
+                    alloy::hex::encode(sel),
+                    out.len()
+                );
             }
             let facet = Address::from_slice(&out[12..32]);
-            if facet == Address::ZERO {
-                continue; // served by the pinned router implementation itself
+            if facet == Address::ZERO || audited_facets.contains(&facet) {
+                continue; // served by the pinned router implementation itself, or already checked
             }
             let fcode = self.provider.get_code_at(facet).await.context("facet code")?;
             let h = keccak256(&fcode);
-            if !pins::FACETS.iter().any(|(_, p)| *p == h) {
-                bail!(
+            if pins::FACETS.iter().any(|(_, p)| *p == h) {
+                audited_facets.insert(facet);
+            } else {
+                refuse!(
                     "router selector 0x{} routes to {facet}, which is not an audited facet (keccak {h})",
                     alloy::hex::encode(sel)
                 );
@@ -323,7 +355,11 @@ impl ChainClient {
             if self.hemi_token == k.token {
                 let tcode = self.provider.get_code_at(self.hemi_token).await.context("token code")?;
                 if keccak256(&tcode) != k.token_codehash {
-                    bail!("stake token {} has unexpected code (keccak {})", self.hemi_token, keccak256(&tcode));
+                    refuse!(
+                        "stake token {} has unexpected code (keccak {})",
+                        self.hemi_token,
+                        keccak256(&tcode)
+                    );
                 }
             }
         }

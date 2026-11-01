@@ -594,6 +594,27 @@ pub enum ClaimOutcome {
     LostRace,
 }
 
+/// `claim_job` found the job held by another prover on a read that already includes our claim's
+/// nonce: our claim cannot have locked it (an unpinned read showing another prover proves nothing
+/// of the kind — a replica behind our claim still shows the job's previous holder).
+#[derive(Debug, Clone)]
+pub struct ClaimLostRace(pub Address);
+
+impl std::fmt::Display for ClaimLostRace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "claimJob lost race — job taken by {}", self.0)
+    }
+}
+impl std::error::Error for ClaimLostRace {}
+
+/// What we know about where we last saw our own lock on a job (from the job journal): a block at
+/// which it read Locked by us, and its reopen count then. See `release_job_with_nonce`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LockSeen {
+    pub block: Option<u64>,
+    pub reopens: Option<u8>,
+}
+
 /// Parsed job data from chain (derived from JobStatusView + events).
 #[derive(Debug, Clone, Default)]
 pub struct JobInfo {
@@ -1092,20 +1113,6 @@ impl ChainClient {
         }
     }
 
-    /// `getJobSnapshots(jobId)`: the job's OWN economics, snapshotted at submit —
-    /// `(releasePenaltyBps, minCollateral, collateralBps)`. A submitter may set collateralBps up to
-    /// 50,000 (500%), so the collateral a claim locks must be sized from this, never a default.
-    pub async fn get_job_snapshots(&self, job_id: B256) -> Result<(u128, u128, u128)> {
-        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
-        let r = aux
-            .getJobSnapshots(job_id)
-            .call()
-            .await
-            .context("getJobSnapshots")?;
-        let clamp = |v: U256| v.min(U256::from(u128::MAX)).to::<u128>();
-        Ok((clamp(r.releasePenaltyBps), clamp(r.minCollateral), clamp(r.collateralBps)))
-    }
-
     /// `getPremiumCap(jobId)`: the most of the job's speed premium a fulfil can still earn (each
     /// release lowers it, a slash zeroes it).
     pub async fn get_premium_cap(&self, job_id: B256) -> Result<u128> {
@@ -1118,8 +1125,10 @@ impl ChainClient {
         Ok(cap.min(U256::from(u128::MAX)).to::<u128>())
     }
 
-    /// [`get_job_snapshots`](Self::get_job_snapshots) for many jobs: two Multicall3 requests per 25
-    /// jobs, both pinned at one fresh head. `getJobSnapshots` does not revert for a job the serving
+    /// `getJobSnapshots(jobId)` — a job's OWN economics, snapshotted at submit: `(releasePenaltyBps,
+    /// minCollateral, collateralBps)` — for many jobs: two Multicall3 requests per 25 jobs, both
+    /// pinned at one fresh head. A submitter may set collateralBps up to 50,000 (500%), so the
+    /// collateral a claim locks must be sized from this, never a default. `getJobSnapshots` does not revert for a job the serving
     /// node hasn't seen — it answers with the live defaults — so each job's `jobs()` record is read at
     /// the same block, and only a job that exists there gets `Some`. A replica behind that block
     /// fails the pinned call rather than answering for an older state. `None` = unknown for now.
@@ -1409,7 +1418,7 @@ impl ChainClient {
                                 }
                                 if rec.prover != Address::ZERO && rec.prover != self.address {
                                     self.commit_nonce(nonce);
-                                    bail!("claimJob lost race — job {} taken by {}", job_id, rec.prover);
+                                    return Err(ClaimLostRace(rec.prover).into());
                                 }
                             }
                         }
@@ -1457,7 +1466,7 @@ impl ChainClient {
                             })
                         }
                         Ok((rec, _)) if rec.prover != Address::ZERO => {
-                            bail!("claimJob lost race — job {} taken by {}", job_id, rec.prover)
+                            Err(ClaimLostRace(rec.prover).into())
                         }
                         Ok((_, at)) => Err(claim_failure_from_call(&e, true, Some(at))),
                         // Ownership unknown: keep the breadcrumb (ambiguous).
@@ -1575,9 +1584,19 @@ impl ChainClient {
                                     settled_price: None,
                                 });
                             }
+                            // Another prover is the answer only at a block that includes our claim's
+                            // nonce: before that, our claim may still mine (and lock it later).
                             if rec.prover != Address::ZERO && rec.prover != self.address {
-                                self.abort_nonce(nonce);
-                                bail!("claimJob lost race — job {} taken by {}", job_id, rec.prover);
+                                let included = self
+                                    .provider
+                                    .get_transaction_count(self.address)
+                                    .block_id(BlockId::number(at))
+                                    .await
+                                    .is_ok_and(|c| c > broadcast_nonce.unwrap_or(nonce));
+                                if included {
+                                    self.abort_nonce(nonce);
+                                    return Err(ClaimLostRace(rec.prover).into());
+                                }
                             }
                         }
                         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1586,8 +1605,13 @@ impl ChainClient {
             }
         }
 
-        // Final on-chain check before declaring failure.
-        if let Ok((rec, at)) = self.read_job_record(job_id, None).await {
+        // Final on-chain check before declaring failure — at a block that includes our last broadcast
+        // claim when there was one, so "another prover" there is the answer.
+        let read = match broadcast_nonce {
+            Some(bn) => self.read_job_record_after_nonce(job_id, bn).await,
+            None => self.read_job_record(job_id, None).await,
+        };
+        if let Ok((rec, at)) = read {
             if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED {
                 self.abort_nonce(nonce);
                 return Ok(ClaimReceipt {
@@ -1597,7 +1621,7 @@ impl ChainClient {
             }
             if rec.prover != Address::ZERO && rec.prover != self.address {
                 self.abort_nonce(nonce);
-                bail!("claimJob lost race — job {} taken by {}", job_id, rec.prover);
+                return Err(ClaimLostRace(rec.prover).into());
             }
         }
         self.abort_nonce(nonce);
@@ -1611,7 +1635,11 @@ impl ChainClient {
     /// - A typed [`ClaimFailure`] from the quote or the claim is returned as-is: `Wait` (incl. a live
     ///   price below our high-water mark), `Paused`, `StakeShort`, `Gone`, `Unknown`.
     /// - An ambiguous failure (no receipt) is reconciled by reading `jobs(jobId)`.
-    pub async fn claim_job_idempotent(&self, job_id: B256) -> Result<ClaimOutcome> {
+    pub async fn claim_job_idempotent(
+        &self,
+        job_id: B256,
+        min_price: u128,
+    ) -> Result<ClaimOutcome> {
         if let Ok((rec, at)) = self.read_job_record(job_id, None).await {
             if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED {
                 forget_claim_high_water(job_id);
@@ -1659,6 +1687,26 @@ impl ChainClient {
             }
         };
         let quote = ClaimQuote { price_floor, ..quote };
+        // Below the price the job was judged at: on a competitive job a bid settled and released in
+        // between resumes the ramp at the winning bid, and claiming there sells the proof below
+        // what was evaluated. (An ascending job's quote only rises.) Wait; the brain decides again.
+        if quote.price_floor < min_price {
+            return self
+                .reconcile_claim_refusal(
+                    job_id,
+                    ClaimFailure {
+                        class: ClaimClass::Wait,
+                        reason: format!(
+                            "quoted {} below the {} it was evaluated at",
+                            quote.price_floor, min_price
+                        ),
+                        definitely_not_locked: true,
+                        block: Some(quote.block),
+                    }
+                    .into(),
+                )
+                .await;
+        }
 
         match self.claim_job(job_id, &quote).await {
             Ok(r) => {
@@ -1671,7 +1719,12 @@ impl ChainClient {
                         return self.reconcile_claim_refusal(job_id, e).await;
                     }
                 }
-                // Ambiguous: the claim may have mined unseen. Reconcile on-chain.
+                if e.downcast_ref::<ClaimLostRace>().is_some() {
+                    return Ok(ClaimOutcome::LostRace);
+                }
+                // Ambiguous: the claim may have mined unseen. Our lock on a read is proof of it;
+                // another prover on this unpinned read proves nothing, so that stays ambiguous (the
+                // caller keeps the breadcrumb for recovery).
                 if let Ok((rec, at)) = self.read_job_record(job_id, None).await {
                     if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED {
                         forget_claim_high_water(job_id);
@@ -1679,9 +1732,6 @@ impl ChainClient {
                             block: at,
                             settled_price: None,
                         }));
-                    }
-                    if rec.prover != Address::ZERO && rec.prover != self.address {
-                        return Ok(ClaimOutcome::LostRace);
                     }
                 }
                 Err(e)
@@ -2233,6 +2283,49 @@ impl ChainClient {
         ))
     }
 
+    /// Whether `view` (a read showing the job not ours) proves our lock on `job_id` is gone. Only on
+    /// evidence: the reopen count risen past `seen.reopens`; a read pinned at or after `seen.block`
+    /// (a block where it was ours); or, once our release went out at nonce `sent`, a read at a block
+    /// where that nonce is included. An unpinned read alone may come from a replica behind our claim,
+    /// still showing the job's previous holder, or none — and acting on it drops the record of a live
+    /// lock (a 100% slash), or recycles the nonce of a release still pending.
+    async fn lock_gone_on_evidence(
+        &self,
+        job_id: B256,
+        view: &JobStatusView,
+        seen: LockSeen,
+        sent: Option<u64>,
+    ) -> bool {
+        if view.prover == self.address {
+            return false;
+        }
+        if seen.reopens.is_some_and(|r| view.reopenCount > r) {
+            return true;
+        }
+        let mut pin = seen.block;
+        if let Some(n) = sent {
+            if let Ok(head) = self.provider.get_block_number().await {
+                if let Ok(count) = self
+                    .provider
+                    .get_transaction_count(self.address)
+                    .block_id(BlockId::number(head))
+                    .await
+                {
+                    if count > n {
+                        pin = Some(head);
+                    }
+                }
+            }
+        }
+        match pin {
+            Some(b) => matches!(
+                self.read_job_record(job_id, Some(b)).await,
+                Ok((rec, _)) if rec.prover != self.address
+            ),
+            None => false,
+        }
+    }
+
     /// Poll `jobs()` every `every` until `poll_end` for this job Fulfilled by us.
     async fn poll_fulfilled_until(
         &self,
@@ -2281,7 +2374,8 @@ impl ChainClient {
     /// after a release the job reopens (prover cleared) or is reclaimed by another
     /// prover — in every case our collateral is no longer tied to a lock we hold.
     pub async fn release_job(&self, job_id: B256) -> Result<()> {
-        self.release_job_with_nonce(job_id, None, None).await
+        self.release_job_with_nonce(job_id, None, LockSeen::default())
+            .await
     }
 
     /// As [`Self::release_job`], but starts from a nonce the CALLER already reserved.
@@ -2296,7 +2390,7 @@ impl ChainClient {
         &self,
         job_id: B256,
         preassigned: Option<u64>,
-        lock_block: Option<u64>,
+        seen: LockSeen,
     ) -> Result<()> {
         const MAX_ATTEMPTS: u32 = MAX_TX_ATTEMPTS;
         let fulfill = IHemiProveFulfill::new(self.hemi_prove, &*self.provider);
@@ -2343,29 +2437,19 @@ impl ChainClient {
         // This path is the one that DELETES it: our `Ok(())` makes `release_and_clean` drop
         // the breadcrumb, which is the only record that collateral is locked — after which
         // the drain union, the abandon list and the EX_TEMPFAIL exit gate (all
-        // `active_jobs ∪ journal`) can never see the lock again. Before broadcasting, a DIFFERENT
-        // prover is accepted at once only when no block of our lock is known; given `lock_block`,
-        // only a read pinned at or after it decides (an unpinned replica behind our claim still
-        // shows the job's previous holder, or none).
+        // `active_jobs ∪ journal`) can never see the lock again. So "gone" needs evidence
+        // (`lock_gone_on_evidence`), before a broadcast and after; without it the release is sent,
+        // and its typed revert says what happened.
         let mut broadcast = false;
+        // The nonce our release last went out at (see `lock_gone_on_evidence`).
+        let mut sent: Option<u64> = None;
 
         for attempt in 1..=MAX_ATTEMPTS {
             // Already released? (a prior attempt landed on a node whose receipt we
             // never saw, or the job was reopened/slashed out from under us). Our lock
             // being gone means our collateral is free — treat as success.
             if let Ok(view) = self.get_job_status_view(job_id).await {
-                let gone = view.prover != self.address
-                    && (broadcast
-                        || match lock_block {
-                            None => view.prover != Address::ZERO,
-                            // Pinned at or after a block where the job was ours: anyone else, or
-                            // no one, holding it there means our lock is gone.
-                            Some(b) => matches!(
-                                self.read_job_record(job_id, Some(b)).await,
-                                Ok((rec, _)) if rec.prover != self.address
-                            ),
-                        });
-                if gone {
+                if self.lock_gone_on_evidence(job_id, &view, seen, sent).await {
                     // Our lock is gone (release landed, or the fulfill we were displacing
                     // actually mined) → success. Recycle the nonce; self-heals if consumed.
                     self.abort_nonce(nonce);
@@ -2466,6 +2550,7 @@ impl ChainClient {
             let pending = match send_result {
                 Ok(p) => {
                     broadcast = true; // a ZERO read may now legitimately be our release
+                    sent = Some(nonce);
                                       // The read above is HALF the mechanism; without this write it is
                                       // incomplete. With a floor present, `max()` pins every attempt to the
                                       // same bid, so a self-displacing re-broadcast after a receipt timeout is
@@ -2633,7 +2718,7 @@ impl ChainClient {
                     let deadline = std::time::Instant::now() + RELEASE_STATE_POLL;
                     while std::time::Instant::now() < deadline {
                         if let Ok(view) = self.get_job_status_view(job_id).await {
-                            if view.prover != self.address {
+                            if self.lock_gone_on_evidence(job_id, &view, seen, sent).await {
                                 // ABORT, not commit: "our lock is gone" is NOT uniquely our
                                 // doing — a keeper's slashAndReopen or another prover's
                                 // reclaim clears it too, in which case our releaseJob at
@@ -2684,7 +2769,7 @@ impl ChainClient {
         // attempt failed at `send` (persistent 429s) nothing was broadcast, so a ZERO read
         // here is UNKNOWN, not success.
         if let Ok(view) = self.get_job_status_view(job_id).await {
-            if view.prover != self.address && (broadcast || view.prover != Address::ZERO) {
+            if self.lock_gone_on_evidence(job_id, &view, seen, sent).await {
                 self.abort_nonce(nonce);
                 tracing::info!("Job {} released (confirmed on final check)", job_id);
                 return Ok(());

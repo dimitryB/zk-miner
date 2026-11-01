@@ -5,6 +5,31 @@ use tracing_subscriber::EnvFilter;
 mod commands;
 mod journal;
 
+/// Forwards each WARN/ERROR event whose message starts with `PAGE` to the dashboard's log (see
+/// `commands::run::note_page`).
+struct PageToDashboard;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PageToDashboard {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if *event.metadata().level() > tracing::Level::WARN {
+            return;
+        }
+        struct Message(Option<String>);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        let mut m = Message(None);
+        event.record(&mut m);
+        if let Some(msg) = m.0.filter(|s| s.starts_with("PAGE")) {
+            commands::run::note_page(msg);
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "zkminer",
@@ -135,11 +160,19 @@ async fn main() -> Result<()> {
             2 => "debug",
             _ => "trace",
         };
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new(filter))
-            .with_writer(non_blocking)
-            .with_target(false)
-            .with_ansi(false)
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::registry()
+            .with(EnvFilter::new(filter))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_target(false)
+                    .with_ansi(false),
+            )
+            // PAGE lines (claims stopped, a lock at risk) also reach the dashboard: in this mode the
+            // log file is all the operator would otherwise see of them.
+            .with(PageToDashboard)
             .init();
     } else {
         let filter = match cli.verbose {

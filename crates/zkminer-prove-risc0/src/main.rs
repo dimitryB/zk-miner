@@ -206,7 +206,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // adversarial-but-executable program). Without containment the worker dies on a CLAIMED
                 // job, the dispatcher charges a healthy slot, the retry loop re-dispatches the same job
                 // to every GPU crashing each, and the program is never classed bad — so it is cheaply
-                // repeatable and drives a release-penalty/slash. Treat a prove-time panic as InvalidInput.
+                // repeatable and drives a release-penalty/slash. Contain it here and answer with an
+                // error (typed by what panicked, below) instead of dying.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_proof(&elf, &input_data, po2, program_id)
                 }));
@@ -721,8 +722,10 @@ fn sys_rand_key_state() -> &'static ([u8; 32], bool) {
     })
 }
 
-/// What one keccak proof request is charged in a measurement (see `run_execute`): about a 2^20
-/// segment's proving time on the cards this runs on.
+/// What one keccak proof request at the default keccak po2 (17) is charged in a measurement (see
+/// `run_execute`): about a 2^20 segment's proving time on the cards this runs on. A larger keccak
+/// po2 (RISC0_KECCAK_PO2, up to 18) doubles it per step; a smaller one still pays for the lift and
+/// the join, so never less.
 const KECCAK_REQUEST_CYCLES: u64 = 1 << 20;
 
 /// The keccak proof requests a measured guest made, checked as the prover will check them.
@@ -730,6 +733,8 @@ const KECCAK_REQUEST_CYCLES: u64 = 1 << 20;
 struct KeccakAudit {
     /// Each request's claim, as the guest's keccak root commits to it.
     requests: Vec<risc0_zkvm::Assumption>,
+    /// What the requests are charged (see [`KECCAK_REQUEST_CYCLES`]).
+    cycles: u64,
 }
 
 impl risc0_zkvm::CoprocessorCallback for KeccakAudit {
@@ -751,6 +756,9 @@ impl risc0_zkvm::CoprocessorCallback for KeccakAudit {
             claim: request.claim_digest,
             control_root: KECCAK_CONTROL_ROOT,
         });
+        self.cycles = self
+            .cycles
+            .saturating_add(KECCAK_REQUEST_CYCLES << request.po2.saturating_sub(17).min(8));
         Ok(())
     }
 }
@@ -835,28 +843,35 @@ fn run_execute(
         }
     }
 
+    // A guest that halts with no output (a zero output digest: `sys_halt` skipped `env::finalize`)
+    // executes cleanly and proves, but its receipt never verifies — a claim without an output is not
+    // what `receipt.verify(image_id)` or the chain accept. An honest guest always has one, if empty.
+    let output = session
+        .receipt_claim
+        .as_ref()
+        .and_then(|c| c.output.as_value().ok())
+        .and_then(|o| o.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "execute: the guest halted without an output — no proof of this program+input can \
+                 verify"
+            )
+        })?;
     // Everything the proof would assume must be something it also proves: the guest's keccak root.
     // Anything else (an `env::verify_assumption2` of an arbitrary claim) executes cleanly here and
     // fails every proof ("no receipt available for unresolved assumption").
     let keccak = keccak.borrow();
     let root = keccak.root();
-    if let Some(output) = session
-        .receipt_claim
-        .as_ref()
-        .and_then(|c| c.output.as_value().ok())
-        .and_then(|o| o.as_ref())
-    {
-        let assumptions = output
-            .assumptions
-            .as_value()
-            .map_err(|_| anyhow::anyhow!("execute: the session's assumptions are pruned"))?;
-        for a in &assumptions.0 {
-            if a.as_value().ok() != root.as_ref() {
-                anyhow::bail!(
-                    "execute: the guest assumes a claim no proof here resolves — every proof of \
-                     this program+input would fail"
-                );
-            }
+    let assumptions = output
+        .assumptions
+        .as_value()
+        .map_err(|_| anyhow::anyhow!("execute: the session's assumptions are pruned"))?;
+    for a in &assumptions.0 {
+        if a.as_value().ok() != root.as_ref() {
+            anyhow::bail!(
+                "execute: the guest assumes a claim no proof here resolves — every proof of this \
+                 program+input would fail"
+            );
         }
     }
 
@@ -866,8 +881,7 @@ fn run_execute(
     // Measured at the default segment size: a smaller proving po2 repeats the paging in more
     // segments, a larger one pads the last segment further. Each keccak request is a further proof
     // of its own (a 2^17-row keccak STARK, its lift and a join), priced here as a 2^20 segment.
-    let cycles: u64 = session.segments.iter().map(|s| 1u64 << s.po2).sum::<u64>()
-        + keccak.requests.len() as u64 * KECCAK_REQUEST_CYCLES;
+    let cycles: u64 = session.segments.iter().map(|s| 1u64 << s.po2).sum::<u64>() + keccak.cycles;
     // The journal the guest committed here is byte-identical to the one the later proof
     // would carry (both are a deterministic function of (ELF, input) — `sys_rand` included, via the
     // shared seed, and the guest's cycle counter, which counts user cycles whatever the segment size —
@@ -981,7 +995,10 @@ fn run_proof(
                 // verification / receipt.verify), never wrapped as a guest panic.
                 let guest_fault = msg.contains("guest panicked")
                     || msg.contains("session limit")
-                    || msg.contains("non-zero exit code");
+                    || msg.contains("non-zero exit code")
+                    // A seal that VERIFIES but proves another claim than the host built (a guest that
+                    // halted with an output digest of its own): deterministic, not a GPU race.
+                    || msg.contains("claim digest does not match");
                 let recoverable = !guest_fault
                     && (msg.contains("verification indicates")
                         || msg.contains("verify segment")
@@ -1551,6 +1568,7 @@ mod keccak_audit_tests {
     fn the_root_is_the_guest_batchers_mountain_range() {
         let audit = |n: u8| KeccakAudit {
             requests: (1..=n).map(request).collect(),
+            cycles: 0,
         };
         assert_eq!(audit(0).root(), None, "no requests, nothing to assume");
         // A lone request stands for itself, under the keccak circuit's control root.
@@ -1568,6 +1586,7 @@ mod keccak_audit_tests {
         // A union is unordered, so the root doesn't depend on the order within a pair.
         let swapped = KeccakAudit {
             requests: vec![request(2), request(1)],
+            cycles: 0,
         };
         assert_eq!(swapped.root(), audit(2).root());
     }

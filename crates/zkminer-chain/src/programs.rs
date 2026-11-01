@@ -592,6 +592,12 @@ impl ElfCache {
     pub fn get(&self, program_id: &B256, expected_content_hash: Option<B256>) -> Option<Vec<u8>> {
         let path = self.cache_dir.join(format!("{}.elf", program_id));
         let bytes = std::fs::read(&path).ok()?;
+        // Nothing caches an empty ELF: an empty entry is a torn write (a crash before writes were
+        // atomic), and keeping it would fail every proof of the program, every session.
+        if bytes.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
         if let Some(expected) = expected_content_hash {
             let actual_hash = alloy::primitives::keccak256(&bytes);
             if actual_hash != expected {
@@ -611,11 +617,31 @@ impl ElfCache {
         self.cache_dir.join(format!("{}.elf", program_id)).is_file()
     }
 
-    /// Store an ELF in the cache.
+    /// Store an ELF in the cache: written in full to a temporary file, synced, then renamed into
+    /// place, so a crash or a concurrent reader never sees a partial entry (a read without an
+    /// expected hash — a recovered lock's, a measurement's — takes the bytes as they are).
     pub fn put(&self, program_id: &B256, elf: &[u8]) -> Result<()> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
         std::fs::create_dir_all(&self.cache_dir).context("Failed to create ELF cache directory")?;
         let path = self.cache_dir.join(format!("{}.elf", program_id));
-        std::fs::write(&path, elf).context("Failed to write ELF to cache")?;
+        static TMP: AtomicU64 = AtomicU64::new(0);
+        let tmp = self.cache_dir.join(format!(
+            ".{}.{}.{}.tmp",
+            program_id,
+            std::process::id(),
+            TMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written = std::fs::File::create(&tmp)
+            .and_then(|mut f| {
+                f.write_all(elf)?;
+                f.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).context("Failed to write ELF to cache");
+        }
         tracing::info!("Cached ELF for {} ({} bytes)", program_id, elf.len());
         // Bound total on-disk cache size. Without this, a submitter who registers many distinct
         // programs (each served from a URI near the 256 MiB cap) could fill the operator's disk —
@@ -969,6 +995,33 @@ mod security_tests {
     // expected hash must be dropped and reported as a miss (forcing a hash-enforced re-download), while
     // a matching entry is returned. keccak256 over the genuine bytes is deterministic from the program,
     // so this never purges a correct entry.
+    #[test]
+    fn a_cached_elf_is_written_whole_and_an_empty_one_is_a_miss() {
+        let dir = std::env::temp_dir().join(format!(
+            "zkminer-elf-atomic-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = ElfCache {
+            cache_dir: dir.clone(),
+        };
+        let id = B256::repeat_byte(0x5a);
+        cache.put(&id, b"elf-bytes").unwrap();
+        assert_eq!(cache.get(&id, None).as_deref(), Some(&b"elf-bytes"[..]));
+        // Only the entry is left: no temporary file.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(format!("{id}.elf"))]);
+        // A torn (empty) entry is a miss, and goes.
+        std::fs::write(dir.join(format!("{id}.elf")), b"").unwrap();
+        assert_eq!(cache.get(&id, None), None);
+        assert!(!cache.contains(&id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn cache_get_purges_on_hash_mismatch_and_returns_on_match() {
         let dir = std::env::temp_dir().join(format!(

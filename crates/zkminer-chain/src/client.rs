@@ -403,8 +403,10 @@ impl ChainClient {
             .parse()
             .context("Invalid hemi_token address")?;
 
+        // Unset: the known deployment's for this chain (programs' ELF sources come only from it, and
+        // the deployment check requires the live one), else none.
         let program_registry: Option<Address> = if config.contracts.program_registry.is_empty() {
-            None
+            crate::deployment::known_deployment(config.chain.chain_id).map(|k| k.program_registry)
         } else {
             Some(
                 config
