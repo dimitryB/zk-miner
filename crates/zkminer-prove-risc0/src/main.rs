@@ -56,6 +56,36 @@ fn main() {
         return;
     }
 
+    // `--export-guest <name> <path>`: write one of the embedded guests to `path` and print its image
+    // id, which is the `programId` of a job for it. For harnesses that submit jobs this worker can
+    // serve (crates/zkminer-cli/tests/localnet.rs). Speaks no IPC.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--export-guest") {
+        let (Some(name), Some(path)) = (args.get(i + 1), args.get(i + 2)) else {
+            eprintln!("usage: --export-guest fibonacci <path>");
+            std::process::exit(2);
+        };
+        let elf = match name.as_str() {
+            "fibonacci" => FIBONACCI_ELF,
+            other => {
+                eprintln!("unknown guest {other:?} (known: fibonacci)");
+                std::process::exit(2);
+            }
+        };
+        let image_id = risc0_zkvm::compute_image_id(elf).expect("compute_image_id");
+        if let Err(e) = std::fs::write(path, elf) {
+            eprintln!("write {path}: {e}");
+            std::process::exit(1);
+        }
+        let hex: String = image_id
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        println!("0x{hex}");
+        return;
+    }
+
     // CRITICAL: save the real stdout FD for IPC, then redirect FD 1 to stderr so NOTHING
     // the guest (via risc0's POSIX `sys_write`/`sys_log` to fd 1, which `PosixIo::default()` wires to
     // this process's stdout) — nor any native/CUDA library — can inject bytes into the length-prefixed

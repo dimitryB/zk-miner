@@ -210,6 +210,36 @@ than skipping, so a half-installed box can't look green. Set `ZKVM_ALLOW_SKIP=1`
 instead. Run it single-threaded to avoid GPU contention, and log to a file rather than
 piping to `tail`, which buffers and can hide a hang.
 
+### Localnet end-to-end test
+
+`crates/zkminer-cli/tests/localnet.rs` runs the real `zkminer` binary against a local anvil
+fork of Hemi testnet 743111. The fork carries the live HemiProve v2 contracts. On the fork,
+the test:
+
+- mints tHEMI and stakes a prover;
+- registers the fibonacci guest, with a storage URI it serves itself;
+- submits six jobs, one per binding case: three the miner must claim and three it must refuse.
+
+Half the jobs are submitted before the miner starts and half after, so both the startup
+backfill and the live monitor are covered. Nothing touches the real chain, and no key is
+involved.
+
+```bash
+cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda
+cargo test -p zkminer-cli --test localnet -- --ignored --nocapture --test-threads=1
+```
+
+- **`watch_only_reports_every_job`** (CPU only, about 90 s) runs `zkminer run --watch-only`. It
+  checks every job's verdict, checks that exactly the claimable jobs would be claimed, and checks
+  that nothing was sent.
+- **`mines_the_claimable_jobs`** (`ZKMINER_LOCALNET_MINE=1`, needs a GPU) runs the miner for real.
+  It requires the claimable jobs to be fulfilled on the fork and the others never claimed.
+
+The tests need Foundry's `anvil`. The first run at a fork block also needs the testnet RPC;
+anvil caches what it fetches, so repeat runs are quick. Settings (fork URL and block, worker
+path, echoing the log) are in the file's header. Move its `FORK_BLOCK` forward whenever
+`zkminer-chain/src/deployment.rs` changes.
+
 ## Examples
 
 `examples/` holds job submitters for testing against a live market. They read their
