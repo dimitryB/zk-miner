@@ -62,6 +62,8 @@ pub struct ChainClient {
     /// `chain.fee_ceiling_gwei`). The per-nonce ratchet cap for those two paths is the larger of
     /// this and `8 x` the nonce's seed.
     pub fee_ceiling: u128,
+    /// A watch-only client (see [`Self::new_watch_only`]): its transport refuses every send.
+    watch_only: bool,
     /// Unix seconds of the last send the node refused for insufficient ETH (0 = none). Read by the
     /// brain's claim gate: a key that cannot fund a fulfil must not take on new locks.
     funds_short_at: Arc<AtomicU64>,
@@ -285,6 +287,30 @@ impl ChainClient {
     /// Create a new ChainClient from config + signer.
     pub async fn new(config: &ZkMinerConfig, signer: PrivateKeySigner) -> Result<Self> {
         let address = signer.address();
+        Self::connect(config, signer, address, false).await
+    }
+
+    /// A client that reads the chain as `address` and can send nothing.
+    ///
+    /// It holds no key of the operator's: it signs with a throwaway key, and its transport refuses
+    /// every request that would broadcast a transaction or have the node sign one (see
+    /// [`crate::send_guard`]). Calls that depend on the sender (the claim quote) name `address`
+    /// explicitly, so they answer as they would for that prover.
+    pub async fn new_watch_only(config: &ZkMinerConfig, address: Address) -> Result<Self> {
+        Self::connect(config, PrivateKeySigner::random(), address, true).await
+    }
+
+    /// Whether this client was built by [`Self::new_watch_only`].
+    pub fn is_watch_only(&self) -> bool {
+        self.watch_only
+    }
+
+    async fn connect(
+        config: &ZkMinerConfig,
+        signer: PrivateKeySigner,
+        address: Address,
+        watch_only: bool,
+    ) -> Result<Self> {
         let wallet = EthereumWallet::from(signer.clone());
 
         let rpc_url = config.chain.rpc_url.parse().context("Invalid RPC URL")?;
@@ -323,7 +349,9 @@ impl ChainClient {
         //    heartbeat). The interval still governs any future/one-off get_receipt()
         //    caller (e.g. the sp1_demo command). Do NOT reintroduce get_receipt() in the
         //    miner paths believing this interval makes it cheap — use await_receipt.
+        // The send guard goes OUTERMOST, so a refused send is neither paced nor counted.
         let rpc_client = alloy::rpc::client::ClientBuilder::default()
+            .layer(crate::send_guard::SendGuardLayer::new(watch_only))
             .layer(crate::rpc_meter::ThrottleLayer::new(4))
             .layer(crate::rpc_meter::MeterLayer::new(rpc_meter.clone()))
             .transport(http, false)
@@ -416,6 +444,7 @@ impl ChainClient {
             fulfill_gas_limit,
             scan_from_block,
             fee_ceiling,
+            watch_only,
             funds_short_at: Arc::new(AtomicU64::new(0)),
             last_max_fee: Arc::new(AtomicU64::new(0)),
             last_base_fee: Arc::new(AtomicU64::new(0)),

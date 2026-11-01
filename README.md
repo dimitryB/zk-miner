@@ -146,7 +146,19 @@ zkminer benchmark             # measure real per-GPU proving throughput
 zkminer benchmark --calibrate # also measure segment size (po2); saves benchmarks.json
 zkminer run                   # interactive TUI
 zkminer -v run --headless     # headless; -v shows per-job claim/skip reasoning
+zkminer run --watch-only      # watch the market; claim, sign and send nothing
 ```
+
+`run --watch-only` runs every check up to the claim against the live market and logs each
+job's verdict instead of claiming it: `WATCH <job>: WOULD CLAIM at …` for a job this miner
+would take, and for every open job, what its descriptor, measurement, journal binding and
+claim quote show, whatever this host's GPUs or stake. It signs with a throwaway key, and its
+transport refuses every send. It also skips lock recovery and the nonce watchdog, and never
+writes the job journal, so it cannot touch the locks or nonces of a miner running on the same
+key. It does execute guests, though, so don't run it on a host whose RAM a live miner needs.
+It is always headless. It watches as the configured key's address unless you pass `--address 0x…`, which
+needs no key at all. It measures guests on the CPU, so it runs on a host without a GPU if
+`[prover.worker_binaries]` names a risc0 worker.
 
 Verbosity is `-v`/`-vv` **before** the subcommand (`RUST_LOG` is ignored). Logs go to
 stderr, so `zkminer benchmark --json` on stdout stays machine-readable.

@@ -62,6 +62,14 @@ enum Commands {
         /// Run in mock mode (simulated marketplace, no chain/wallet needed)
         #[arg(long)]
         mock: bool,
+        /// Watch the live market without taking part: run every check up to the claim, log what
+        /// would be claimed, and sign and send nothing. Implies --headless.
+        #[arg(long, conflicts_with = "mock")]
+        watch_only: bool,
+        /// The prover address to watch as (default: the configured key's address; the key itself
+        /// is never used)
+        #[arg(long, requires = "watch_only")]
+        address: Option<alloy::primitives::Address>,
     },
     /// Register fibonacci-sp1-guest and submit a test job (SP1 demo)
     #[cfg(feature = "sp1-demo")]
@@ -91,7 +99,7 @@ async fn main() -> Result<()> {
     // Only setup stderr tracing for headless/CLI modes.
     // In TUI mode, any stderr output (from any thread) corrupts the alternate screen.
     let is_tui = matches!(&cli.command,
-        Commands::Run { headless, .. } if !headless
+        Commands::Run { headless, watch_only, .. } if !headless && !watch_only
     );
     // Hold the log guard until main() returns so the non-blocking writer flushes on shutdown.
     let mut _log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
@@ -163,8 +171,16 @@ async fn main() -> Result<()> {
         Commands::Benchmark { json, calibrate } => {
             commands::benchmark::run(config_path, json, calibrate).await
         }
-        Commands::Run { headless, mock } if mock => commands::mock::run(headless).await,
-        Commands::Run { headless, .. } => commands::run::run(config_path, headless).await,
+        Commands::Run { headless, mock, .. } if mock => commands::mock::run(headless).await,
+        Commands::Run {
+            headless,
+            watch_only,
+            address,
+            ..
+        } => {
+            let watch = watch_only.then_some(commands::run::WatchOnly { address });
+            commands::run::run(config_path, headless || watch_only, watch).await
+        }
         #[cfg(feature = "sp1-demo")]
         Commands::Sp1Demo { input } => commands::sp1_demo::run(config_path, input).await,
         Commands::Init {
@@ -172,5 +188,34 @@ async fn main() -> Result<()> {
             network,
             generate_key,
         } => commands::init::run(config_path, force, &network, generate_key),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_only_flags_parse_and_conflict_as_documented() {
+        let addr = "0x00000000000000000000000000000000000000a1";
+        let cli =
+            Cli::try_parse_from(["zkminer", "run", "--watch-only", "--address", addr]).unwrap();
+        match cli.command {
+            Commands::Run {
+                watch_only,
+                address,
+                ..
+            } => {
+                assert!(watch_only);
+                assert_eq!(address, Some(addr.parse().unwrap()));
+            }
+            _ => panic!("not a run command"),
+        }
+        // An address alone would read as "run normally as this address": refused.
+        assert!(Cli::try_parse_from(["zkminer", "run", "--address", addr]).is_err());
+        assert!(Cli::try_parse_from(["zkminer", "run", "--watch-only", "--mock"]).is_err());
+        assert!(
+            Cli::try_parse_from(["zkminer", "run", "--watch-only", "--address", "0x12"]).is_err()
+        );
     }
 }

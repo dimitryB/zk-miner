@@ -10,5 +10,6 @@ pub mod monitor;
 pub mod nonce;
 pub mod programs;
 pub mod rpc_meter;
+pub mod send_guard;
 pub mod staking;
 pub mod tx;

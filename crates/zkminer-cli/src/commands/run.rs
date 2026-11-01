@@ -232,6 +232,22 @@ const CLAIM_INTENT_MAX_AGE_SECS: u64 = 900;
 /// path that still releases a job whose earlier release failed on RPC.
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `zkminer run --watch-only`: every check up to the claim runs against the live market, and the
+/// claim itself is replaced by a read-only preview that is logged. Nothing is signed or sent, no
+/// lock is driven or released, and the job journal is never written. Set once, before the brain
+/// starts.
+static WATCH_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn watch_only() -> bool {
+    WATCH_ONLY.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The options of `zkminer run --watch-only`.
+pub struct WatchOnly {
+    /// The prover address to watch as; the configured key's address when `None`.
+    pub address: Option<alloy::primitives::Address>,
+}
+
 /// A lifecycle error on a lock we HOLD that must NOT be released: a pause or a Disabled adapter
 /// (handoff §9 "never release because of a pause, a disable or a blacklist"), or an RPC failure that
 /// left the lock's state unreadable ("never release on an RPC error without revert data"). The
@@ -582,6 +598,7 @@ async fn admit_backfilled_jobs(
                 s.open_jobs.iter().map(|j| j.info.job_id).collect();
             for j in chunk {
                 if open.contains(&j.info.job_id) && !present.contains(&j.info.job_id) {
+                    watch_enqueue(j);
                     s.open_jobs.push(j.clone());
                     admitted += 1;
                 }
@@ -1891,12 +1908,32 @@ pub(crate) fn collateral_warning(
     )
 }
 
-pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
+pub async fn run(
+    config_path: Option<&Path>,
+    headless: bool,
+    watch: Option<WatchOnly>,
+) -> Result<()> {
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
     let queue_horizon_secs = config.prover.queue_horizon_secs;
-    let signer = load_signer(&config.wallet)?;
-    let client = ChainClient::new(&config, signer).await?;
+    let client = match watch {
+        Some(w) => {
+            WATCH_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
+            // The configured key only names the address to watch as: it is dropped here, and the
+            // client signs with a throwaway key behind a transport that refuses every send.
+            let address = match w.address {
+                Some(a) => a,
+                None => load_signer(&config.wallet)?.address(),
+            };
+            tracing::warn!(
+                "WATCH-ONLY as {address}: every check up to the claim runs, and each job is reported \
+                 instead of claimed. Nothing is signed or sent; locks this address holds are left to \
+                 the miner that took them."
+            );
+            ChainClient::new_watch_only(&config, address).await?
+        }
+        None => ChainClient::new(&config, load_signer(&config.wallet)?).await?,
+    };
 
     // Before ANY transaction (handoff §13 tests 1-2): the configured stack must be the live
     // deployment for this chain, wired to itself (router.staking/registry/hemiToken), and running the
@@ -1976,8 +2013,11 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
     }
     init_worker_pool(pool);
     // SP1's one-time setup, in the background: SP1 jobs are not claimed until it is done (see the
-    // pre-claim gate), and everything else proceeds meanwhile.
-    spawn_sp1_warmup();
+    // pre-claim gate), and everything else proceeds meanwhile. Not when watching: it proves on the
+    // GPU, and a watch-only run proves nothing.
+    if !watch_only() {
+        spawn_sp1_warmup();
+    }
 
     // Hardware probe — runs on a blocking thread to avoid freezing the system.
     // NVML init + device queries + sysfs reads can take seconds on idle GPUs.
@@ -2279,6 +2319,7 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
                             fulfillment_timeout,
                         ),
                     );
+                    watch_enqueue(&tracked);
                     s.open_jobs.push(tracked);
                     // Bound the Open-candidate set. A submitter can post unboundedly
                     // many jobs and leave them Open; every brain tick reads them all via Multicall3
@@ -2496,7 +2537,13 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
     // Miner brain: evaluates open jobs, claims, proves, and fulfills.
     let brain_client = client.clone();
     let brain_state = state.clone();
-    let journal: SharedJournal = Arc::new(Mutex::new(JobJournal::load()));
+    // A watch-only run holds nothing, and the journal on disk belongs to the miner that may be
+    // running beside it: start empty and never save (see `save_journal_or_warn`).
+    let journal: SharedJournal = Arc::new(Mutex::new(if watch_only() {
+        JobJournal::default()
+    } else {
+        JobJournal::load()
+    }));
     let brain_journal = journal.clone();
     let proving_timeout = Duration::from_secs(config.prover.proving_timeout_secs.max(60));
     let cost_params = CostParams {
@@ -3688,15 +3735,27 @@ async fn miner_brain(
     // sooner-retry floor for a STARTUP-time deferral too — otherwise a miner that restarts
     // mid-storm holding a deadline-imminent, None-view lock would wait the full ~5-min
     // periodic cadence and could be slashed.
-    let startup_pass = recover_claimed_jobs(
-        &client,
-        &journal,
-        proving_timeout,
-        recovery_lookback,
-        &std::collections::HashSet::new(),
-        None,
-    )
-    .await;
+    let startup_pass = if watch_only() {
+        // Locks this address holds belong to the miner that took them: a watch-only run neither
+        // drives nor releases them, and has no signer nonces to heal.
+        tracing::info!("watch-only: lock recovery and the nonce watchdog are off");
+        RecoveryPass {
+            deferred: false,
+            due_by: None,
+            actions: Vec::new(),
+            scan: None,
+        }
+    } else {
+        recover_claimed_jobs(
+            &client,
+            &journal,
+            proving_timeout,
+            recovery_lookback,
+            &std::collections::HashSet::new(),
+            None,
+        )
+        .await
+    };
     let mut recovery_deferred = startup_pass.deferred;
     let startup_due_by = startup_pass.due_by;
     let mut recovery_scan = startup_pass.scan;
@@ -3885,6 +3944,22 @@ async fn miner_brain(
     // flood of such jobs cannot re-consume the per-tick measure budget (see `AssignedElsewhere`).
     let assigned_elsewhere: AssignedElsewhere =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    if watch_only() {
+        tokio::spawn(watch_inspector(
+            client.clone(),
+            state.clone(),
+            WatchCaches {
+                measured: measured_cycles.clone(),
+                desc_input: desc_input_hash.clone(),
+                measuring: measuring.clone(),
+                measuring_inputs: measuring_inputs.clone(),
+                measure_strikes: measure_strikes.clone(),
+                measured_journal: measured_journal.clone(),
+                desc_payload: desc_payload.clone(),
+                assigned_elsewhere: assigned_elsewhere.clone(),
+            },
+        ));
+    }
     let mut queue_model = zkminer_strategy::queue::QueueModel::new();
     let mut queue_last_tick = std::time::Instant::now();
     if !initial_queue_horizon.is_zero() {
@@ -3965,6 +4040,7 @@ async fn miner_brain(
         // its own guarded heal, so skipping here loses nothing.
         if last_wedge_probe_at.elapsed() >= WEDGE_PROBE_EVERY
             && !SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+            && !watch_only()
         {
             last_wedge_probe_at = std::time::Instant::now();
             // Persist on ELAPSED TIME, not on two sightings.
@@ -4083,7 +4159,7 @@ async fn miner_brain(
                 || recovery_due_by.is_some_and(|t| std::time::Instant::now() >= t));
         let due_requested = RECOVERY_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
             && since >= RECOVERY_REQUEST_FLOOR;
-        if due_periodic || due_deferred || due_requested {
+        if !watch_only() && (due_periodic || due_deferred || due_requested) {
             // Gate on ON-CHAIN LOCKED COLLATERAL, not the journal — but read its FRESHNESS
             // too. A 429 storm FREEZES stake_info: the refresh circuit-breaker
             // skips, and a forced ceiling attempt that itself 429s updates nothing — so a
@@ -6135,6 +6211,437 @@ impl JobStatusSnapshot {
     }
 }
 
+/// Bound on the watch-only per-job maps; past it they are cleared (reporting a job again is harmless).
+const WATCH_MAP_CAP: usize = 4096;
+
+/// Jobs a watch-only run reported it would claim.
+static WATCH_WOULD_CLAIM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Jobs as they enter the Open set, for the watch-only inspector. Queued at ingestion rather than
+/// read from `open_jobs`, because the brain can evict a job (a failing binding, say) before the
+/// inspector's next pass. Bounded: past the cap the oldest are dropped.
+static WATCH_QUEUE: Mutex<std::collections::VecDeque<TrackedJob>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Queue a newly ingested job for the watch-only inspector (a no-op unless watching).
+fn watch_enqueue(job: &TrackedJob) {
+    if !watch_only() {
+        return;
+    }
+    let mut q = WATCH_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+    if q.len() >= WATCH_MAP_CAP {
+        q.pop_front();
+    }
+    q.push_back(job.clone());
+}
+
+/// Log a watch-only verdict for `job_id`, unless it is the verdict last logged for it (a job retried
+/// after a back-off with the same outcome). Returns whether it was logged.
+fn watch_report(job_id: B256, verdict: String) -> bool {
+    static LAST: Mutex<Option<HashMap<B256, String>>> = Mutex::new(None);
+    let mut g = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    let last = g.get_or_insert_with(HashMap::new);
+    if last.get(&job_id) == Some(&verdict) {
+        return false;
+    }
+    if last.len() >= WATCH_MAP_CAP {
+        last.clear();
+    }
+    tracing::info!("WATCH {}: {verdict}", short_id(job_id));
+    last.insert(job_id, verdict);
+    true
+}
+
+/// The job's journal binding as the router reads it: NONE, FULL or FIELDS, plus a slot-0 marker.
+fn describe_binding(d: &zkminer_contracts::bindings::JobDescriptor) -> String {
+    use zkminer_chain::binding::{marker, JOURNAL_PREFIX_MARKER};
+    let mut fields = d.journalFields;
+    let m = marker(fields);
+    if m.is_some() {
+        fields.0[..4].fill(0);
+    }
+    let kind = if d.expectedJournalHash == B256::ZERO {
+        "NONE"
+    } else if fields == B256::ZERO {
+        "FULL"
+    } else {
+        "FIELDS"
+    };
+    match m {
+        Some(JOURNAL_PREFIX_MARKER) => format!("{kind} + journal-prefix"),
+        Some(_) => format!("{kind} + SP1 proof-nonce"),
+        None => kind.to_string(),
+    }
+}
+
+/// Watch-only stand-in for the claim: what `claim_job_idempotent` would meet for this job now, read
+/// with the same pre-checks and quote and logged as the job's verdict. A job that would be claimed
+/// leaves the Open set, as a claimed one does; a temporary refusal keeps it a candidate behind the
+/// back-off a real refusal gets.
+async fn watch_claim_preview(
+    client: &ChainClient,
+    state: &zkminer_tui::state::SharedState,
+    job: &TrackedJob,
+    snapshot: &JobStatusSnapshot,
+) {
+    use zkminer_chain::jobs::ClaimPreview;
+    use zkminer_chain::revert::{ClaimClass, ClaimFailure};
+    let job_id = job.info.job_id;
+    let measured = snapshot.measured_cycles.map_or_else(
+        || "unmeasured".to_string(),
+        |c| format!("{c} cycles measured"),
+    );
+    let (verdict, would_claim, keep) = match client.preview_claim(job_id).await {
+        Ok(ClaimPreview::Claimable(q)) => (
+            format!(
+                "WOULD CLAIM at {} HEMI (premium cap {} HEMI, quoted at block {}); {measured}",
+                fmt_hemi(q.price_floor),
+                fmt_hemi(q.premium_floor),
+                q.block
+            ),
+            true,
+            false,
+        ),
+        Ok(ClaimPreview::Held(p)) => (
+            format!("would not claim: already held by {p}"),
+            false,
+            false,
+        ),
+        Err(e) => match e.downcast_ref::<ClaimFailure>() {
+            Some(f) => {
+                let keep = matches!(
+                    f.class,
+                    ClaimClass::Wait | ClaimClass::Paused | ClaimClass::StakeShort
+                );
+                if keep {
+                    note_claim_retry_after(job_id, f.class);
+                }
+                (
+                    format!(
+                        "would not claim: the claim would be refused ({:?}): {}",
+                        f.class, f.reason
+                    ),
+                    false,
+                    keep,
+                )
+            }
+            None => {
+                note_transient_preclaim_failure(job_id);
+                (
+                    format!(
+                        "no verdict yet: the claim quote is unreadable ({})",
+                        zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+                    ),
+                    false,
+                    true,
+                )
+            }
+        },
+    };
+    if watch_report(job_id, verdict) && would_claim {
+        WATCH_WOULD_CLAIM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if keep {
+        requeue_open_job(state, job.clone()).await;
+    } else {
+        state
+            .write()
+            .await
+            .open_jobs
+            .retain(|j| j.info.job_id != job_id);
+    }
+}
+
+/// The brain's measurement caches, shared with the watch-only inspector so the two never execute the
+/// same guest twice and each sees the other's results.
+struct WatchCaches {
+    measured: MeasuredCache,
+    desc_input: DescInputCache,
+    measuring: Arc<Mutex<HashMap<B256, u8>>>,
+    measuring_inputs: Arc<Mutex<std::collections::HashSet<(u8, B256, B256)>>>,
+    measure_strikes: MeasureStrikes,
+    measured_journal: JournalLenCache,
+    desc_payload: DescPayloadCache,
+    assigned_elsewhere: AssignedElsewhere,
+}
+
+/// What the watch-only inspector concluded about one job.
+enum Inspected {
+    /// A final verdict, under a category for the periodic summary.
+    Done(&'static str, String),
+    /// Nothing conclusive yet (an RPC failure, a busy measure pool): try again on a later pass.
+    Retry(String),
+}
+
+/// Watch-only: take every job that enters the Open set (`WATCH_QUEUE`) through the checks a claim
+/// depends on, and report each once.
+///
+/// The brain measures only a job it would claim on this host, given its GPUs, benchmarks and stake,
+/// so on a host that cannot prove, or as an address with no stake, it would check nothing. This
+/// runs the same steps regardless: the job's view, its hash-verified descriptor, its journal binding,
+/// a measurement (served backends only) with the binding checked against the measured journal, and
+/// the claim quote for the watched address. What the brain itself would claim is reported at the
+/// claim step (`watch_claim_preview`).
+async fn watch_inspector(
+    client: ChainClient,
+    state: zkminer_tui::state::SharedState,
+    caches: WatchCaches,
+) {
+    const PASS_EVERY: Duration = Duration::from_secs(5);
+    const SUMMARY_EVERY: Duration = Duration::from_secs(600);
+    // Passes a job may come back inconclusive before it is reported as such.
+    const MAX_TRIES: u32 = 4;
+    let started = std::time::Instant::now();
+    let mut last_summary = started;
+    let mut done: std::collections::HashSet<B256> = std::collections::HashSet::new();
+    // Jobs taken off `WATCH_QUEUE` with no verdict yet, and the passes each came back inconclusive.
+    let mut pending: Vec<(TrackedJob, u32)> = Vec::new();
+    let mut tally: std::collections::BTreeMap<&'static str, u64> =
+        std::collections::BTreeMap::new();
+    loop {
+        tokio::time::sleep(PASS_EVERY).await;
+        {
+            let mut q = WATCH_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+            for job in q.drain(..) {
+                let id = job.info.job_id;
+                if !done.contains(&id) && !pending.iter().any(|(j, _)| j.info.job_id == id) {
+                    pending.push((job, 0));
+                }
+            }
+        }
+        if pending.len() > WATCH_MAP_CAP {
+            pending.drain(..pending.len() - WATCH_MAP_CAP);
+        }
+        let mut still_pending = Vec::new();
+        for (job, tries) in std::mem::take(&mut pending) {
+            if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let job_id = job.info.job_id;
+            let (category, verdict) = match watch_inspect(&client, &state, &job, &caches).await {
+                Inspected::Done(category, verdict) => (category, verdict),
+                Inspected::Retry(why) if tries + 1 < MAX_TRIES => {
+                    tracing::debug!("WATCH {}: no verdict yet ({why})", short_id(job_id));
+                    still_pending.push((job, tries + 1));
+                    continue;
+                }
+                Inspected::Retry(why) => (
+                    "inconclusive",
+                    format!("no verdict after {MAX_TRIES} tries: {why}"),
+                ),
+            };
+            if done.len() >= WATCH_MAP_CAP {
+                done.clear();
+            }
+            done.insert(job_id);
+            *tally.entry(category).or_insert(0) += 1;
+            watch_report(job_id, verdict);
+        }
+        pending = still_pending;
+        if last_summary.elapsed() >= SUMMARY_EVERY {
+            last_summary = std::time::Instant::now();
+            let parts: Vec<String> = tally.iter().map(|(c, n)| format!("{c} {n}")).collect();
+            tracing::info!(
+                "WATCH summary after {} min: {} jobs inspected ({}); {} would be claimed by this host",
+                started.elapsed().as_secs() / 60,
+                tally.values().sum::<u64>(),
+                parts.join(", "),
+                WATCH_WOULD_CLAIM.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+    }
+}
+
+/// One job through the watch-only inspection (see [`watch_inspector`]).
+async fn watch_inspect(
+    client: &ChainClient,
+    state: &zkminer_tui::state::SharedState,
+    job: &TrackedJob,
+    c: &WatchCaches,
+) -> Inspected {
+    use zkminer_chain::jobs::ClaimPreview;
+    use zkminer_chain::programs::sanitize_log;
+    let job_id = job.info.job_id;
+    let program_id = job.info.program_id;
+    let view = match client.get_job_status_view(job_id).await {
+        Ok(v) => v,
+        Err(e) => return Inspected::Retry(format!("status view unreadable: {e:#}")),
+    };
+    if view.status != 0 || view.prover != alloy::primitives::Address::ZERO {
+        return Inspected::Done(
+            "no longer open",
+            format!(
+                "no longer open (status {}, prover {})",
+                view.status, view.prover
+            ),
+        );
+    }
+    let system = zkminer_chain::auction::ProofSystem::from_id(view.proofSystemId).map_or_else(
+        || format!("unknown proof system {}", view.proofSystemId),
+        |p| p.label().to_string(),
+    );
+    let d = match tokio::time::timeout(
+        MEASURE_FETCH_BUDGET,
+        fetch_job_descriptor_checked(client, job_id, view.descriptorHash),
+    )
+    .await
+    {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => {
+            let why = sanitize_log(&format!("{e:#}"));
+            return if e
+                .downcast_ref::<zkminer_chain::descriptor::UndecodableDescriptor>()
+                .is_some()
+            {
+                Inspected::Done(
+                    "descriptor undecodable",
+                    format!("{system}: its descriptor is undecodable ({why})"),
+                )
+            } else {
+                Inspected::Retry(format!("descriptor fetch failed: {why}"))
+            };
+        }
+        Err(_) => return Inspected::Retry("descriptor fetch timed out".into()),
+    };
+    let head = format!(
+        "{system}, {} binding, {} B input",
+        describe_binding(&d),
+        d.inputData.len()
+    );
+    let Some(backend) = resolve_backend(view.proofSystemId) else {
+        return Inspected::Done("not served", format!("{head}: not served by this build"));
+    };
+    if zkminer_chain::binding::marker(d.journalFields).is_some() {
+        return Inspected::Done(
+            "binding unsupported",
+            format!("{head}: its binding marker is not supported by this build"),
+        );
+    }
+    if d.expectedJournalHash == B256::ZERO && d.assignedProver != client.address {
+        return Inspected::Done(
+            "reserved elsewhere",
+            format!("{head}: reserved for prover {}", d.assignedProver),
+        );
+    }
+    let dh = view.descriptorHash;
+    let resolve =
+        || resolve_measured_with_hash(&c.measured, &c.desc_input, backend, program_id, dh);
+    if resolve().is_none() {
+        if zkminer_prover::engine::worker_pool()
+            .and_then(|p| p.measure_worker_count(backend))
+            .is_none()
+        {
+            return Inspected::Done(
+                "not measurable here",
+                format!("{head}: this host has no {backend} measure worker"),
+            );
+        }
+        // Take the descriptor in the brain's in-flight set, so neither side executes it twice.
+        let fresh = c
+            .measuring
+            .lock()
+            .map(|mut m| match m.entry(dh) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(backend_tag(backend));
+                    true
+                }
+                std::collections::hash_map::Entry::Occupied(_) => false,
+            })
+            .unwrap_or(false);
+        if !fresh {
+            return Inspected::Retry("being measured".into());
+        }
+        measure_cycles(
+            client,
+            state,
+            backend,
+            job_id,
+            dh,
+            program_id,
+            &c.measured,
+            &c.desc_input,
+            &c.measuring_inputs,
+            &c.measure_strikes,
+            &c.measured_journal,
+            &c.desc_payload,
+            &c.assigned_elsewhere,
+        )
+        .await;
+        if let Ok(mut m) = c.measuring.lock() {
+            m.remove(&dh);
+        }
+    }
+    let Some((cycles, _, journal)) = resolve() else {
+        return if job_is_undecodable(job_id) {
+            Inspected::Done(
+                "dropped at measure",
+                format!("{head}: dropped while measuring (see the log above)"),
+            )
+        } else {
+            Inspected::Retry("no measurement (see the log above)".into())
+        };
+    };
+    if cycles >= UNMEASURABLE_CYCLES {
+        return Inspected::Done(
+            "too heavy",
+            format!("{head}: the guest exceeds the execute cap"),
+        );
+    }
+    let measured = format!(
+        "{cycles} cycles, {}",
+        journal.as_ref().map_or_else(
+            || "journal not reported".to_string(),
+            |(_, j)| format!("{} B journal", j.len())
+        )
+    );
+    let bound = if d.expectedJournalHash == B256::ZERO {
+        "no journal binding"
+    } else {
+        match measured_binding_verdict(&d, &journal, job_id, client.address) {
+            Some(Ok(())) => "binding satisfied",
+            Some(Err(why)) => {
+                return Inspected::Done(
+                    "binding fails",
+                    format!("{head}: {measured}; the measured journal FAILS its binding ({why})"),
+                )
+            }
+            None => {
+                return Inspected::Done(
+                    "no journal to check",
+                    format!("{head}: {measured}; no whole journal to check the binding against"),
+                )
+            }
+        }
+    };
+    match client.preview_claim(job_id).await {
+        Ok(ClaimPreview::Claimable(q)) => Inspected::Done(
+            "claim quote ok",
+            format!(
+                "{head}: {measured}, {bound}; claim quote {} HEMI (premium cap {} HEMI)",
+                fmt_hemi(q.price_floor),
+                fmt_hemi(q.premium_floor)
+            ),
+        ),
+        Ok(ClaimPreview::Held(p)) => Inspected::Done(
+            "no longer open",
+            format!("{head}: {measured}, {bound}; now held by {p}"),
+        ),
+        Err(e) => match e.downcast_ref::<zkminer_chain::revert::ClaimFailure>() {
+            Some(f) => Inspected::Done(
+                "claim refused",
+                format!(
+                    "{head}: {measured}, {bound}; the claim would be refused ({:?}): {}",
+                    f.class, f.reason
+                ),
+            ),
+            None => Inspected::Retry(format!(
+                "claim quote unreadable: {}",
+                sanitize_log(&format!("{e:#}"))
+            )),
+        },
+    }
+}
+
 /// Spawn the per-job lifecycle task (prove → fulfill; claims first UNLESS
 /// `already_locked`). The caller inserts the job into `in_flight` before calling this
 /// so the SlotGuard/done_rx slot accounting lives in one place; the guard frees the
@@ -6514,6 +7021,13 @@ async fn process_job_lifecycle(
         );
         let mut s = state.write().await;
         s.open_jobs.retain(|j| j.info.job_id != job_id);
+        return Ok(());
+    }
+
+    // Watch-only: every check above ran as it would before a real claim. Report what the claim would
+    // meet instead of sending it; no breadcrumb is written.
+    if watch_only() {
+        watch_claim_preview(client, state, &requeue_job, &snapshot).await;
         return Ok(());
     }
 
@@ -9433,6 +9947,10 @@ async fn release_and_clean_with_nonce(
 /// go through this helper so that disk-full / permission errors are visible
 /// rather than silently swallowed.
 fn save_journal_or_warn(journal: &JobJournal) {
+    // Never from a watch-only run: the file is the running miner's record of its locks.
+    if watch_only() {
+        return;
+    }
     if let Err(e) = journal.save() {
         tracing::warn!("journal.save() failed: {e:#} — recovery on next restart may be stale");
     }
@@ -11701,6 +12219,50 @@ mod r2_sizing_tests {
         let d = bound_descriptor(keccak256(b"out"), fields, input);
         drop_if_measured_binding_fails(&d, &measured, good, me);
         assert!(!job_is_undecodable(good));
+    }
+
+    #[test]
+    fn watch_only_names_each_binding_as_the_router_reads_it() {
+        let hash = B256::repeat_byte(0xEE);
+        let with_marker = |m: u32, rest: u8| {
+            let mut f = B256::ZERO;
+            f.0[..4].copy_from_slice(&m.to_be_bytes());
+            f.0[4] = rest;
+            f
+        };
+        assert_eq!(
+            describe_binding(&bound_descriptor(B256::ZERO, B256::ZERO, b"")),
+            "NONE"
+        );
+        assert_eq!(
+            describe_binding(&bound_descriptor(hash, B256::ZERO, b"")),
+            "FULL"
+        );
+        assert_eq!(
+            describe_binding(&bound_descriptor(hash, with_marker(3, 0), b"")),
+            "FIELDS"
+        );
+        // A marker is cleared before the mode is chosen: with nothing else it is FULL.
+        assert_eq!(
+            describe_binding(&bound_descriptor(hash, with_marker(0xffff_ffff, 0), b"")),
+            "FULL + journal-prefix"
+        );
+        assert_eq!(
+            describe_binding(&bound_descriptor(hash, with_marker(0xffff_fffe, 7), b"")),
+            "FIELDS + SP1 proof-nonce"
+        );
+    }
+
+    #[test]
+    fn watch_only_logs_a_job_again_only_when_its_verdict_changes() {
+        let job = B256::repeat_byte(0x41);
+        assert!(watch_report(job, "refused (StakeShort)".into()));
+        assert!(!watch_report(job, "refused (StakeShort)".into()));
+        assert!(watch_report(job, "WOULD CLAIM".into()));
+        assert!(watch_report(
+            B256::repeat_byte(0x42),
+            "refused (StakeShort)".into()
+        ));
     }
 
     // UNMEASURABLE TTL: a wall-clock-timeout verdict is dropped and re-measured after its TTL; every

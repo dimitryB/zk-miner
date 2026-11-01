@@ -194,6 +194,15 @@ pub struct ClaimQuote {
     pub premium_floor: u128,
 }
 
+/// [`ChainClient::preview_claim`]'s answer when the quote didn't revert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimPreview {
+    /// A claim sent now would go out at these floors.
+    Claimable(ClaimQuote),
+    /// Some prover (possibly us) already holds the job.
+    Held(Address),
+}
+
 /// A lock confirmed on-chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimReceipt {
@@ -1179,6 +1188,29 @@ impl ChainClient {
             price_floor: price,
             premium_floor,
         })
+    }
+
+    /// What [`Self::claim_job_idempotent`] would meet for `job_id` right now, read without sending
+    /// anything (watch-only runs): the same ownership and reopen pre-checks, then the same quote.
+    /// A refused quote is returned as the typed [`ClaimFailure`] the claim would have hit.
+    pub async fn preview_claim(&self, job_id: B256) -> Result<ClaimPreview> {
+        let (rec, at) = self.read_job_record(job_id, None).await?;
+        if rec.prover != Address::ZERO {
+            return Ok(ClaimPreview::Held(rec.prover));
+        }
+        if rec.reopen_count >= MAX_REOPEN_COUNT {
+            return Err(ClaimFailure {
+                class: ClaimClass::Gone,
+                reason: format!(
+                    "job at {} reopens (MaxReopenCountReached)",
+                    rec.reopen_count
+                ),
+                definitely_not_locked: true,
+                block: Some(at),
+            }
+            .into());
+        }
+        Ok(ClaimPreview::Claimable(self.quote_claim(job_id).await?))
     }
 
     /// Claim an open job at exactly `quote`'s floors. Sent ALONE (never pipelined with a fulfil);
