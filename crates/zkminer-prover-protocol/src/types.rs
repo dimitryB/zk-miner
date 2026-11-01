@@ -10,7 +10,13 @@ use serde::{Deserialize, Serialize};
 /// so `#[serde(default)]` does NOT give cross-version back-compat on the wire — it only lets a
 /// SAME-version co-built binary that happens not to set the field decode as 0. The bump makes the
 /// handshake reject a mismatched (old) worker at spawn rather than fail cryptically at first Execute.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// 7: `ExecuteResult` gained `journal`, the bytes the host checks a job's journal binding against
+/// before claiming it.
+pub const PROTOCOL_VERSION: u32 = 7;
+
+/// The longest journal an `ExecuteResult` carries. The router refuses a longer one on every fulfil
+/// path (`MAX_JOURNAL_BYTES`, `JournalTooLarge`), so a longer journal is reported by its length alone.
+pub const EXECUTE_JOURNAL_MAX_BYTES: usize = 32 * 1024;
 
 /// Maximum frame size: 256 MB (accommodates large risc0 composite receipts).
 pub const MAX_FRAME_SIZE: u32 = 256 * 1024 * 1024;
@@ -155,6 +161,13 @@ pub enum WorkerResponse {
         /// bump to 6 rejects a mismatched worker at the handshake instead.
         #[serde(default)]
         peak_host_bytes: u64,
+        /// The journal itself (the same bytes as `journal_len` counts), so the host can check the
+        /// job's `expectedJournalHash` / `journalFields` binding before claiming. `None` when the
+        /// journal is longer than [`EXECUTE_JOURNAL_MAX_BYTES`] (no fulfil could carry it) or the
+        /// worker cannot vouch that a proof would commit the same bytes; the host then claims no
+        /// journal-bound job on this measurement. `Some(vec![])` is a guest that committed nothing.
+        #[serde(default)]
+        journal: Option<Vec<u8>>,
     },
     /// Progress update during proving.
     Progress {

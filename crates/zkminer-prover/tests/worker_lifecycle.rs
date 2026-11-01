@@ -397,10 +397,10 @@ fn cycle_measurement_skips_a_recycled_slot() {
             pool.has_idle_worker("mock"),
             "the other worker is idle and live"
         );
-        let (cycles, _journal_len, _peak) = pool
+        let m = pool
             .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None)
             .expect("measurement must move on to the live worker");
-        assert_eq!(cycles, 1000);
+        assert_eq!(m.cycles, 1000);
         // Bring it back for the next round.
         pool.prove(gone, &[], &[], None, Some(Duration::from_secs(10)), None)
             .expect("respawn");
@@ -569,10 +569,12 @@ fn a_normal_measurement_leaves_no_inflight_registration() {
     pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
         .expect("failed to spawn mock worker");
 
-    let (cycles, _journal, _peak) = pool
+    let m = pool
         .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None)
         .expect("measurement should succeed");
-    assert_eq!(cycles, 1000);
+    assert_eq!(m.cycles, 1000);
+    // The mock commits nothing: an empty journal, reported whole.
+    assert_eq!(m.journal.as_deref(), Some(&[][..]));
     assert_eq!(
         pool.test_inflight_measure_count(),
         0,

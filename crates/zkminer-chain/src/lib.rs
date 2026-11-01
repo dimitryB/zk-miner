@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod auction;
+pub mod binding;
 pub mod client;
 pub mod deployment;
 pub mod descriptor;

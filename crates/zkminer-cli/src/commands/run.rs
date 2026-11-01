@@ -342,7 +342,7 @@ const UNMEASURABLE_CYCLES: u64 = 1_000_000_000_000_000_000; // 1e18
 /// fields are evicted together. For the READ to be equally atomic the claim gate must take both in a
 /// SINGLE lock hold — see [`resolve_measured_full`] — rather than pairing two separate `resolve_*`
 /// calls, between which a concurrent eviction could still drop the entry and desync the peak to 0.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Measured {
     /// Measured guest cycles, or [`UNMEASURABLE_CYCLES`] for an infeasible/unmeasurable verdict.
     cycles: u64,
@@ -357,7 +357,9 @@ struct Measured {
     /// over-cap payload, guest panic/trap, ELF-fetch failure/timeout), which stays permanent because a
     /// retry TTL on a submitter-craftable failure reopens a perpetual re-measurement DoS. This is the
     /// UNMEASURABLE TTL (finding: UNMEASURABLE had no TTL), scoped down after review to the one
-    /// non-submitter-controllable case.
+    /// non-submitter-controllable case. A real measurement whose worker reported no journal expires
+    /// too (`MEASURED_NO_JOURNAL_TTL`), so its journal-bound jobs are re-measured rather than wait on
+    /// it forever.
     retry_after: Option<std::time::Instant>,
     /// keccak256 of the risc0 ELF whose image-id the measure worker verified equals this program's
     /// `programId` (a successful risc0 execute proves the sized bytes ARE the registered program; the
@@ -375,7 +377,34 @@ struct Measured {
     /// cache) let the hash be dropped while the measurement survived, re-opening the window — hence the
     /// move into the measurement entry.
     verified_elf_hash: Option<alloy::primitives::B256>,
+    /// The journal this execution committed, which a journal-bound job's binding is checked against
+    /// before it is claimed (`zkminer_chain::binding`). In THIS entry for the same reason as
+    /// `verified_elf_hash`: a claim that resolves a measurement gets that measurement's journal in the
+    /// same lock hold, or none. `Some` only for a real measurement whose worker reported the whole
+    /// journal; `None` for every infeasible verdict.
+    journal: Option<std::sync::Arc<[u8]>>,
 }
+
+/// A resolved measurement's journal, with the keccak of the input it was executed on.
+type MeasuredJournal = Option<(alloy::primitives::B256, std::sync::Arc<[u8]>)>;
+
+/// Bound on the journal bytes the measured cache holds. A cached journal is at most
+/// `MAX_JOURNAL_BYTES` (longer ones are infeasible verdicts), so the entry cap alone would allow
+/// ~3 GiB of them; past this bound other entries are evicted, and an evicted pair is re-measured.
+const MEASURED_JOURNAL_BYTES_CAP: usize = 64 * 1024 * 1024;
+
+/// How long a real measurement that came back without its journal (a worker that could not vouch
+/// for it, such as one seeding `sys_rand` with a key for its process alone) sizes jobs before the
+/// pair is re-measured. It never makes a journal-bound job claimable; this only bounds how long those
+/// jobs wait for a measurement that does. Not submitter-reachable: an over-cap journal is a permanent
+/// infeasible verdict instead.
+const MEASURED_NO_JOURNAL_TTL: Duration = Duration::from_secs(10 * 60);
+
+// A worker reports every journal a fulfil could carry, so every claimable job has one to check.
+const _: () = assert!(
+    zkminer_prover_protocol::types::EXECUTE_JOURNAL_MAX_BYTES
+        >= zkminer_chain::jobs::MAX_JOURNAL_BYTES
+);
 
 /// Measured results keyed by (backend tag, programId, keccak256(inputData)). The backend tag is
 /// load-bearing: `programId`, `inputData` AND `proofSystemId` are all submitter-chosen, so without it
@@ -581,12 +610,32 @@ fn insert_measured_value(
     value: Measured,
 ) {
     if let Ok(mut m) = cache.lock() {
-        bounded_insert(
-            &mut m,
-            (backend_tag(backend), program_id, input_hash),
-            value,
-            MEASURED_CYCLES_CAP,
-        );
+        let key = (backend_tag(backend), program_id, input_hash);
+        bounded_insert(&mut m, key, value, MEASURED_CYCLES_CAP);
+        let journal_bytes = |v: &Measured| v.journal.as_ref().map_or(0, |j| j.len());
+        let excess = m
+            .values()
+            .map(journal_bytes)
+            .sum::<usize>()
+            .saturating_sub(MEASURED_JOURNAL_BYTES_CAP);
+        if excess > 0 {
+            // Largest journals first: a flood of near-cap journals evicts itself before the small
+            // ones honest programs commit, and an entry that frees nothing is never a victim.
+            let mut candidates: Vec<_> = m
+                .iter()
+                .filter(|(k, v)| **k != key && journal_bytes(v) > 0)
+                .map(|(k, v)| (journal_bytes(v), *k))
+                .collect();
+            candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            let mut freed = 0;
+            for (bytes, k) in candidates {
+                if freed >= excess {
+                    break;
+                }
+                m.remove(&k);
+                freed += bytes;
+            }
+        }
     }
 }
 
@@ -611,14 +660,17 @@ fn insert_measured(
             peak_host_bytes: 0,
             retry_after: None,
             verified_elf_hash: None,
+            journal: None,
         },
     );
 }
 
 /// Insert a real measurement: its cycle count, the execute's peak host footprint, and — for risc0 —
-/// the keccak of the image-id-verified ELF, stored in ONE value so they co-evict (finding C-8 and the
-/// independent-eviction residual). Never expires. `verified_elf_hash` is `Some` only for a real risc0
-/// measurement; pass `None` for SP1 and for callers without a verified hash.
+/// the keccak of the image-id-verified ELF, and the journal, stored in ONE value so they co-evict
+/// (finding C-8 and the independent-eviction residual). Expires only without a journal
+/// (`MEASURED_NO_JOURNAL_TTL`). `verified_elf_hash` is `Some` only for a real risc0 measurement; pass
+/// `None` for SP1 and for callers without a verified hash.
+#[allow(clippy::too_many_arguments)]
 fn insert_measurement(
     cache: &MeasuredCache,
     backend: &str,
@@ -627,6 +679,7 @@ fn insert_measurement(
     cycles: u64,
     peak_host_bytes: u64,
     verified_elf_hash: Option<alloy::primitives::B256>,
+    journal: Option<std::sync::Arc<[u8]>>,
 ) {
     insert_measured_value(
         cache,
@@ -636,8 +689,11 @@ fn insert_measurement(
         Measured {
             cycles,
             peak_host_bytes,
-            retry_after: None,
+            retry_after: journal
+                .is_none()
+                .then(|| std::time::Instant::now() + MEASURED_NO_JOURNAL_TTL),
             verified_elf_hash,
+            journal,
         },
     );
 }
@@ -664,6 +720,7 @@ fn insert_unmeasurable(
             peak_host_bytes: 0,
             retry_after: Some(std::time::Instant::now() + UNMEASURABLE_RETRY_TTL),
             verified_elf_hash: None,
+            journal: None,
         },
     );
 }
@@ -726,9 +783,10 @@ fn undecodable_jobs() -> &'static std::sync::Mutex<std::collections::HashSet<all
 /// Record a job this miner can PERMANENTLY never claim, so the candidate loop evicts it and the measure
 /// path skips it instead of re-running the (up to `DEFAULT_DESCRIPTOR_LOOKBACK_BLOCKS`) descriptor scan
 /// every tick over its whole open lifetime: its submit tx is undecodable, its descriptor carries a
-/// binding marker this build cannot satisfy, or it is a NONE job reserved for another prover. Every one
-/// of these is a property of the job's immutable descriptor, and the key is the unique jobId (never a
-/// descriptorHash an honest twin could share). See [`UNDECODABLE_JOBS`].
+/// binding marker this build cannot satisfy, it is a NONE job reserved for another prover, or the
+/// journal its (program, input) measured does not satisfy its binding. Every one of these is a property
+/// of the job's immutable descriptor (and its deterministic journal), and the key is the unique jobId
+/// (never a descriptorHash an honest twin could share). See [`UNDECODABLE_JOBS`].
 fn mark_job_undecodable(job_id: alloy::primitives::B256) {
     if let Ok(mut s) = undecodable_jobs().lock() {
         if s.len() >= MEASURED_CYCLES_CAP && !s.contains(&job_id) {
@@ -1068,11 +1126,12 @@ fn note_claim_retry_after(job_id: alloy::primitives::B256, class: zkminer_chain:
 }
 /// Post-claim FAILURE breaker. A claimed job whose (program, input) measured clean and then failed
 /// after the lock — ANY terminal prove failure (a guest fault, a watchdog kill, a health failure, a
-/// budget run-out) or an over-cap journal — pays the release penalty. risc0 answers the guest's
-/// `sys_rand` with fresh host entropy on every execution, so a hostile guest can measure clean and
-/// fail at prove on purpose, and a submitter can assign NONE jobs to us without our consent. Worker
-/// error text can carry guest-chosen strings, so this is deliberately class-agnostic: it cannot be
-/// evaded by choosing how to fail.
+/// budget run-out) or an over-cap journal — pays the release penalty, and a submitter can assign NONE
+/// jobs to us without our consent. The risc0 worker seeds the guest's `sys_rand` per (ELF, input), so
+/// a guest's randomness no longer splits its measurement from its proof; but proving still runs paths
+/// a measurement doesn't (the GPU, another segment size, more memory). Worker error text can carry
+/// guest-chosen strings, so this is deliberately class-agnostic: it cannot be evaded by choosing how
+/// to fail.
 ///
 /// Each failure marks the program (under its backend) and the submitter on an escalating TTL (1 h
 /// doubling to 24 h): self-healing, because the same signal also fires for a sick GPU, and never
@@ -1080,8 +1139,6 @@ fn note_claim_retry_after(job_id: alloy::primitives::B256, class: zkminer_chain:
 /// failing within `DIVERGENCE_WINDOW` (a Sybil spreading failures over fresh programs and addresses,
 /// or our own hardware failing) page and hold new claims for programs not already PROVEN by a
 /// successful fulfil in this process — so the hold cannot be used to stop honest, established work.
-/// The root-cause fix — deterministic `sys_rand` seeded per (ELF, input) in the pinned risc0 fork —
-/// is tracked separately.
 const DIVERGENCE_WINDOW: Duration = Duration::from_secs(3600);
 const DIVERGENCE_HOLD_COUNT: usize = 3;
 const DIVERGENCE_MARK_MAX: Duration = Duration::from_secs(24 * 3600);
@@ -1432,6 +1489,47 @@ fn descriptor_carries_revert_lever(d: &zkminer_contracts::bindings::JobDescripto
         || !d.callbackExtraData.is_empty()
 }
 
+/// The pre-claim verdict on a job's journal binding: does the journal its (program, input) measured
+/// satisfy it, for `prover`? `None` when no whole journal measured on exactly this descriptor's input
+/// is in hand — never a reason to claim. The journal is a deterministic function of (ELF, input) (the
+/// risc0 worker seeds `sys_rand` per (ELF, input)), so a mismatch here is the `JournalMismatch` the
+/// fulfil would revert after the lock.
+fn measured_binding_verdict(
+    d: &zkminer_contracts::bindings::JobDescriptor,
+    measured: &MeasuredJournal,
+    job_id: alloy::primitives::B256,
+    prover: alloy::primitives::Address,
+) -> Option<Result<(), zkminer_chain::binding::BindingMismatch>> {
+    let (input_hash, journal) = measured.as_ref()?;
+    if *input_hash != alloy::primitives::keccak256(&d.inputData) {
+        return None;
+    }
+    Some(zkminer_chain::binding::check_journal_binding(
+        d, journal, job_id, prover,
+    ))
+}
+
+/// On the measure path: a journal-bound job whose measured journal does not satisfy its binding can
+/// never be fulfilled by us (its descriptor is immutable and its journal deterministic), so it is
+/// dropped for good, keyed by its unique jobId like the other permanent verdicts.
+fn drop_if_measured_binding_fails(
+    d: &zkminer_contracts::bindings::JobDescriptor,
+    measured: &MeasuredJournal,
+    job_id: alloy::primitives::B256,
+    prover: alloy::primitives::Address,
+) {
+    if d.expectedJournalHash == alloy::primitives::B256::ZERO {
+        return;
+    }
+    if let Some(Err(why)) = measured_binding_verdict(d, measured, job_id, prover) {
+        tracing::info!(
+            "job {}: its measured journal does not satisfy its binding ({why}) — never claiming it",
+            short_id(job_id)
+        );
+        mark_job_undecodable(job_id);
+    }
+}
+
 // The verified risc0 ELF keccak is stored IN the measured-cycles cache entry (see
 // `Measured::verified_elf_hash` and [`resolve_measured_with_hash`]) so it co-evicts with the
 // measurement a claim rides on — never in a separate, independently-evicting map.
@@ -1575,7 +1673,7 @@ fn resolve_measured(
     let input_hash = desc_input.lock().ok()?.get(&descriptor_hash)?.input_hash;
     let key = (backend_tag(backend), program_id, input_hash);
     let mut m = measured.lock().ok()?;
-    let entry = *m.get(&key)?;
+    let entry = m.get(&key)?.clone();
     // An EXPIRED non-deterministic UNMEASURABLE verdict (the UNMEASURABLE TTL): drop it and report
     // "not yet sized" so a later tick re-measures the pair, rather than treating a possibly-transient
     // timeout as a permanent blacklist. A real measurement and a deterministic infeasible verdict have
@@ -1615,25 +1713,29 @@ fn resolve_measured_peak(
 /// so a concurrent cache eviction cannot drop the entry between a cycles read and a peak read and
 /// desync the peak to 0 (which would silently un-gate the H1 claim check). Applies the UNMEASURABLE
 /// TTL exactly as [`resolve_measured`]: an expired entry is removed and `None` returned so the pair is
-/// re-measured. Returns `(cycles, peak_host_bytes)`.
+/// re-measured. Returns `(cycles, peak_host_bytes, journal)`.
 fn resolve_measured_full(
     measured: &MeasuredCache,
     desc_input: &DescInputCache,
     backend: &str,
     program_id: alloy::primitives::B256,
     descriptor_hash: alloy::primitives::B256,
-) -> Option<(u64, u64)> {
+) -> Option<(u64, u64, MeasuredJournal)> {
     let input_hash = desc_input.lock().ok()?.get(&descriptor_hash)?.input_hash;
     let key = (backend_tag(backend), program_id, input_hash);
     let mut m = measured.lock().ok()?;
-    let entry = *m.get(&key)?;
+    let entry = m.get(&key)?.clone();
     if let Some(until) = entry.retry_after {
         if std::time::Instant::now() >= until {
             m.remove(&key);
             return None;
         }
     }
-    Some((entry.cycles, entry.peak_host_bytes))
+    Some((
+        entry.cycles,
+        entry.peak_host_bytes,
+        entry.journal.map(|j| (input_hash, j)),
+    ))
 }
 
 /// Resolve the cycle count AND the verified risc0 ELF keccak for a sighting under ONE lock hold, so
@@ -1641,25 +1743,29 @@ fn resolve_measured_full(
 /// measurement the claim rides. Because the hash lives in the SAME merged entry as `cycles`, a claim
 /// that resolves a measurement here ALWAYS gets that measurement's verified hash (or `None` for a
 /// risc0 program never measured as a real binding, or SP1). Applies the UNMEASURABLE TTL exactly as
-/// [`resolve_measured`]. Returns `(cycles, verified_elf_hash)`.
+/// [`resolve_measured`]. Returns `(cycles, verified_elf_hash, journal)`.
 fn resolve_measured_with_hash(
     measured: &MeasuredCache,
     desc_input: &DescInputCache,
     backend: &str,
     program_id: alloy::primitives::B256,
     descriptor_hash: alloy::primitives::B256,
-) -> Option<(u64, Option<alloy::primitives::B256>)> {
+) -> Option<(u64, Option<alloy::primitives::B256>, MeasuredJournal)> {
     let input_hash = desc_input.lock().ok()?.get(&descriptor_hash)?.input_hash;
     let key = (backend_tag(backend), program_id, input_hash);
     let mut m = measured.lock().ok()?;
-    let entry = *m.get(&key)?;
+    let entry = m.get(&key)?.clone();
     if let Some(until) = entry.retry_after {
         if std::time::Instant::now() >= until {
             m.remove(&key);
             return None;
         }
     }
-    Some((entry.cycles, entry.verified_elf_hash))
+    Some((
+        entry.cycles,
+        entry.verified_elf_hash,
+        entry.journal.map(|j| (input_hash, j)),
+    ))
 }
 
 /// Bound on a single cycle measurement. Execution is far cheaper than proving, but a hostile
@@ -1945,8 +2051,9 @@ pub async fn run(config_path: Option<&Path>, headless: bool) -> Result<()> {
         s.runtime_settings.system_power_watts = config.prover.system_power_watts;
         s.runtime_settings.token_price_usd = config.prover.token_price_usd;
         s.runtime_settings.gas_cost_usd = config.prover.gas_cost_usd;
-        // Default TRUE: claim predicate jobs (so they can be tested on testnet).
-        s.runtime_settings.claim_predicate_jobs = config.chain.claim_predicate_jobs.unwrap_or(false);
+        // Default TRUE: every open-market job is journal-bound, and each is claimed only when the
+        // journal its (program, input) measured satisfies its binding.
+        s.runtime_settings.claim_predicate_jobs = config.chain.claim_predicate_jobs.unwrap_or(true);
 
         s.address = format!("{}", client.address);
         s.connected = true;
@@ -5117,7 +5224,10 @@ async fn miner_brain(
                     job.info.program_id,
                     snapshot.descriptor_hash,
                 ) {
-                    Some((cycles, peak)) => (Some(cycles), Some(peak)),
+                    Some((cycles, peak, journal)) => {
+                        snapshot.measured_journal = journal;
+                        (Some(cycles), Some(peak))
+                    }
                     None => (None, None),
                 }
             } else {
@@ -5133,8 +5243,11 @@ async fn miner_brain(
                     job.info.program_id,
                     snapshot.descriptor_hash,
                 ) {
-                    Some((cycles, hash)) => {
+                    Some((cycles, hash, journal)) => {
                         snapshot.verified_elf_hash = hash;
+                        // The journal the lifecycle checks a bound job's binding against before the
+                        // claim, from the same entry as the cycles.
+                        snapshot.measured_journal = journal;
                         (Some(cycles), None)
                     }
                     None => (None, None),
@@ -5985,6 +6098,10 @@ struct JobStatusSnapshot {
     /// swap is rejected at the re-fetch rather than reaching prove as a penalized release + permanent
     /// blacklist. `None` for SP1 (bound by `elf_hash`), recovery, and risc0 with no measured binding.
     verified_elf_hash: Option<alloy::primitives::B256>,
+    /// The journal this (program, input) measured, with the keccak of that input, resolved from the
+    /// same cache entry as `measured_cycles`. The lifecycle checks a journal-bound job's binding
+    /// against it before claiming. `None` on recovery and wherever no whole journal was measured.
+    measured_journal: MeasuredJournal,
 }
 
 impl JobStatusSnapshot {
@@ -6013,6 +6130,7 @@ impl JobStatusSnapshot {
             measured_peak: None,
             preferred_device: None,
             verified_elf_hash: None,
+            measured_journal: None,
         }
     }
 }
@@ -6257,7 +6375,7 @@ async fn process_job_lifecycle(
             }
         } else {
             if !claim_predicate {
-                // FULL/FIELDS job and the operator opted out (no local binding check in this build).
+                // FULL/FIELDS job and the operator opted out of journal-bound jobs.
                 skip("journal-bound (claim_predicate_jobs=false)".into(), true).await;
                 return Ok(());
             }
@@ -6270,6 +6388,32 @@ async fn process_job_lifecycle(
                 )
                 .await;
                 return Ok(());
+            }
+            // The local binding check: the router's own check, on the journal this (program, input)
+            // measured, against the hash-verified descriptor the fulfil will carry. Only a journal
+            // that satisfies it is worth locking collateral for.
+            match measured_binding_verdict(&d, &snapshot.measured_journal, job_id, client.address) {
+                Some(Ok(())) => {}
+                Some(Err(why)) => {
+                    mark_job_undecodable(job_id);
+                    skip(
+                        format!("its measured journal does not satisfy its binding ({why})"),
+                        true,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                None => {
+                    // No whole journal measured on exactly this input: not provably satisfiable.
+                    note_transient_preclaim_failure(job_id);
+                    requeue_open_job(state, requeue_job.clone()).await;
+                    skip(
+                        "no measured journal to check its binding against yet".into(),
+                        false,
+                    )
+                    .await;
+                    return Ok(());
+                }
             }
         }
         descriptor_in_hand = Some(d);
@@ -7496,6 +7640,31 @@ async fn process_job_lifecycle(
         ));
     }
 
+    // The router checks the journal binding before the verifier; check it here first, so a proof whose
+    // journal cannot settle this job is released without publishing its seal or paying for the revert.
+    // A claim is made only on a measured journal that satisfies the binding, so a mismatch here means
+    // the proof's journal diverged from the measurement.
+    if let Err(why) = zkminer_chain::binding::check_journal_binding(
+        &descriptor,
+        &proof.journal,
+        job_id,
+        client.address,
+    ) {
+        if rode_measurement {
+            note_post_claim_divergence(program_id, backend, submitter, "journal fails the binding");
+        }
+        // What the fulfil's `JournalMismatch` would have recorded (a prefix mismatch is about this
+        // job and prover, not the binding its siblings share).
+        if matches!(why, zkminer_chain::binding::BindingMismatch::Journal { .. }) {
+            mark_predicate_unsatisfiable(predicate_key(&descriptor));
+        }
+        return Err(anyhow::anyhow!(
+            "the journal of {}'s proof does not satisfy the job's binding ({why}) — the fulfil would \
+             revert; releasing instead of publishing the proof",
+            short_id(job_id)
+        ));
+    }
+
     // Fields the failure classes act on, captured before the loop (the descriptor is cloned per try).
     let fulfill_key = predicate_key(&descriptor);
     let fulfill_is_bound = descriptor.expectedJournalHash != alloy_primitives::B256::ZERO;
@@ -8258,6 +8427,15 @@ async fn measure_cycles(
                 mark_desc_unfulfillable(desc_input, descriptor_hash);
             }
         }
+        // The journal is shared by every descriptor for this pair, but the binding is THIS
+        // descriptor's: check it against the cached journal so an unsatisfiable sibling is dropped
+        // here rather than dispatched.
+        let cached_journal: MeasuredJournal = measured
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).and_then(|e| e.journal.clone()))
+            .map(|j| (input_hash, j));
+        drop_if_measured_binding_fails(&descriptor, &cached_journal, job_id, client.address);
         tracing::debug!(
             "measure {}: (backend, program, input) already measured — resolver updated, no execution",
             short_id(program_id)
@@ -8458,7 +8636,13 @@ async fn measure_cycles(
     })
     .await;
     match res {
-        Ok((Ok((cycles, journal_len, peak_host_bytes)), elf_keccak)) => {
+        Ok((Ok(measurement), elf_keccak)) => {
+            let zkminer_prover::dispatcher::ExecuteMeasurement {
+                cycles,
+                journal_len,
+                journal,
+                peak_host_bytes,
+            } = measurement;
             clear_preclaim_strikes(job_id);
             // The guest committed `journal_len` bytes. fulfillJob re-encodes the journal
             // AND the input (plus the rest of the descriptor) into its calldata under a fixed gas
@@ -8521,6 +8705,8 @@ async fn measure_cycles(
                 // catching a post-measure ELF swap as a clean pre-claim skip rather than a prove-time
                 // penalized release + permanent blacklist. `elf_keccak` is `Some` only for a real
                 // risc0 measurement; SP1 and the infeasible branches pass `None`.
+                let measured_journal: MeasuredJournal =
+                    journal.map(|j| (input_hash, std::sync::Arc::from(j)));
                 insert_measurement(
                     measured,
                     backend,
@@ -8529,8 +8715,15 @@ async fn measure_cycles(
                     cycles,
                     peak_host_bytes,
                     elf_keccak,
+                    measured_journal.as_ref().map(|(_, j)| j.clone()),
                 );
                 clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
+                drop_if_measured_binding_fails(
+                    &descriptor,
+                    &measured_journal,
+                    job_id,
+                    client.address,
+                );
                 // journal + input fit, but the full fulfill payload also carries THIS descriptor's
                 // callbackExtraData + extraVerifierData + the proof seal — fields outside the (program,
                 // input) key, so their contribution cannot be folded into the input-keyed negative-cache
@@ -11145,7 +11338,7 @@ mod r2_sizing_tests {
 
         // A real measurement stores cycles AND peak in one value.
         const PEAK: u64 = 9 * 1024 * 1024 * 1024;
-        insert_measurement(&measured, "sp1", prog, ih, 5_000, PEAK, None);
+        insert_measurement(&measured, "sp1", prog, ih, 5_000, PEAK, None, None);
         assert_eq!(
             resolve_measured(&measured, &desc_input, "sp1", prog, desc),
             Some(5_000)
@@ -11180,12 +11373,21 @@ mod r2_sizing_tests {
         insert_desc_input(&desc_input, desc, ih);
 
         let elf_keccak = keccak256(b"the-verified-risc0-elf-bytes");
-        insert_measurement(&measured, "risc0", prog, ih, 42_000, 0, Some(elf_keccak));
+        insert_measurement(
+            &measured,
+            "risc0",
+            prog,
+            ih,
+            42_000,
+            0,
+            Some(elf_keccak),
+            None,
+        );
 
         // The hash rides out of the SAME resolve that makes the job claimable.
         assert_eq!(
             resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc),
-            Some((42_000, Some(elf_keccak))),
+            Some((42_000, Some(elf_keccak), None)),
             "a claim resolving this measurement must receive its verified ELF hash"
         );
         // And the plain cycle resolve is unchanged.
@@ -11204,10 +11406,10 @@ mod r2_sizing_tests {
         insert_desc_input(&desc_input, desc, ih);
 
         // SP1 carries no co-stored hash (it is bound by the registry elf_hash instead).
-        insert_measurement(&measured, "sp1", prog, ih, 5_000, 7, None);
+        insert_measurement(&measured, "sp1", prog, ih, 5_000, 7, None, None);
         assert_eq!(
             resolve_measured_with_hash(&measured, &desc_input, "sp1", prog, desc),
-            Some((5_000, None))
+            Some((5_000, None, None))
         );
 
         // A deterministic infeasible verdict (and the cycle-only insert path) carries no hash.
@@ -11217,7 +11419,7 @@ mod r2_sizing_tests {
         insert_measured(&measured, "risc0", prog, ih2, UNMEASURABLE_CYCLES);
         assert_eq!(
             resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc2),
-            Some((UNMEASURABLE_CYCLES, None))
+            Some((UNMEASURABLE_CYCLES, None, None))
         );
     }
 
@@ -11231,14 +11433,274 @@ mod r2_sizing_tests {
         let ih = keccak256(b"rewrite-input");
         insert_desc_input(&desc_input, desc, ih);
 
-        insert_measurement(&measured, "risc0", prog, ih, 10_000, 0, Some(keccak256(b"old")));
+        insert_measurement(
+            &measured,
+            "risc0",
+            prog,
+            ih,
+            10_000,
+            0,
+            Some(keccak256(b"old")),
+            None,
+        );
         // A subsequent cycle-only write (e.g. an UNMEASURABLE verdict) replaces the merged entry.
         insert_measured(&measured, "risc0", prog, ih, UNMEASURABLE_CYCLES);
         assert_eq!(
             resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc),
-            Some((UNMEASURABLE_CYCLES, None)),
+            Some((UNMEASURABLE_CYCLES, None, None)),
             "the hash must follow the entry, not be stranded"
         );
+    }
+
+    // The journal a bound job's binding is checked against resolves with the cycle count it was
+    // measured with, keyed to the input it was executed on.
+    #[test]
+    fn the_measured_journal_resolves_with_its_cycles_and_input() {
+        let (measured, desc_input) = fresh();
+        let prog = B256::repeat_byte(0xF1);
+        let desc = B256::repeat_byte(0xF2);
+        let ih = keccak256(b"journal-input");
+        insert_desc_input(&desc_input, desc, ih);
+        let journal: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"the journal"[..]);
+        insert_measurement(
+            &measured,
+            "risc0",
+            prog,
+            ih,
+            9_000,
+            0,
+            None,
+            Some(journal.clone()),
+        );
+        assert_eq!(
+            resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc),
+            Some((9_000, None, Some((ih, journal.clone()))))
+        );
+        insert_measurement(
+            &measured,
+            "sp1",
+            prog,
+            ih,
+            8_000,
+            5,
+            None,
+            Some(journal.clone()),
+        );
+        assert_eq!(
+            resolve_measured_full(&measured, &desc_input, "sp1", prog, desc),
+            Some((8_000, 5, Some((ih, journal))))
+        );
+        // An infeasible verdict replaces the entry, journal and all.
+        insert_measured(&measured, "risc0", prog, ih, UNMEASURABLE_CYCLES);
+        assert_eq!(
+            resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc),
+            Some((UNMEASURABLE_CYCLES, None, None))
+        );
+    }
+
+    // Journals of up to 32 KiB in 100k entries would hold ~3 GiB: the cache evicts other entries past
+    // its byte bound, largest journals first, never the one just inserted, and never an entry that
+    // frees nothing (an empty journal or an infeasible verdict).
+    #[test]
+    fn the_measured_cache_bounds_its_journal_bytes() {
+        let (measured, _) = fresh();
+        let prog = B256::repeat_byte(0xF3);
+        let small: std::sync::Arc<[u8]> = std::sync::Arc::from(&[1u8; 8][..]);
+        let empty: std::sync::Arc<[u8]> = std::sync::Arc::from(&[][..]);
+        let kept: Vec<B256> = (0..30u8).map(|i| keccak256([0xAA, i])).collect();
+        for (i, ih) in kept.iter().enumerate() {
+            match i % 3 {
+                0 => insert_measurement(
+                    &measured,
+                    "risc0",
+                    prog,
+                    *ih,
+                    1,
+                    0,
+                    None,
+                    Some(small.clone()),
+                ),
+                1 => insert_measurement(
+                    &measured,
+                    "risc0",
+                    prog,
+                    *ih,
+                    1,
+                    0,
+                    None,
+                    Some(empty.clone()),
+                ),
+                _ => insert_measured(&measured, "risc0", prog, *ih, UNMEASURABLE_CYCLES),
+            }
+        }
+        let journal: std::sync::Arc<[u8]> = vec![7u8; 32 * 1024].into();
+        let n = MEASURED_JOURNAL_BYTES_CAP / journal.len() + 50;
+        let mut last = B256::ZERO;
+        for i in 0..n {
+            last = keccak256((i as u64).to_be_bytes());
+            insert_measurement(
+                &measured,
+                "risc0",
+                prog,
+                last,
+                1,
+                0,
+                None,
+                Some(journal.clone()),
+            );
+        }
+        let m = measured.lock().unwrap();
+        let total: usize = m
+            .values()
+            .filter_map(|v| v.journal.as_ref())
+            .map(|j| j.len())
+            .sum();
+        assert!(total <= MEASURED_JOURNAL_BYTES_CAP, "{total} bytes held");
+        assert!(m.len() < n, "entries past the bound were evicted");
+        assert!(
+            m.contains_key(&(backend_tag("risc0"), prog, last)),
+            "the newest entry stays"
+        );
+        for ih in &kept {
+            assert!(
+                m.contains_key(&(backend_tag("risc0"), prog, *ih)),
+                "the flood evicts its own large journals, not small, empty or infeasible entries"
+            );
+        }
+    }
+
+    // A real measurement that came back without its journal sizes jobs for a while, then expires so
+    // its journal-bound jobs are re-measured instead of waiting on it forever.
+    #[test]
+    fn a_measurement_without_a_journal_expires() {
+        let (measured, desc_input) = fresh();
+        let prog = B256::repeat_byte(0xF4);
+        let desc = B256::repeat_byte(0xF5);
+        let ih = keccak256(b"no-journal");
+        insert_desc_input(&desc_input, desc, ih);
+        insert_measurement(&measured, "risc0", prog, ih, 4_000, 0, None, None);
+        let key = (backend_tag("risc0"), prog, ih);
+        let until = measured.lock().unwrap()[&key]
+            .retry_after
+            .expect("journal-less entries expire");
+        assert!(until > std::time::Instant::now());
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "risc0", prog, desc),
+            Some(4_000)
+        );
+        measured.lock().unwrap().get_mut(&key).unwrap().retry_after =
+            Some(std::time::Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "risc0", prog, desc),
+            None
+        );
+        assert!(
+            !measured.lock().unwrap().contains_key(&key),
+            "dropped, so the pair is re-measured"
+        );
+
+        // With its journal it never expires.
+        insert_measurement(
+            &measured,
+            "risc0",
+            prog,
+            ih,
+            4_000,
+            0,
+            None,
+            Some(std::sync::Arc::from(&b"j"[..])),
+        );
+        assert!(measured.lock().unwrap()[&key].retry_after.is_none());
+    }
+
+    fn bound_descriptor(
+        expected: B256,
+        fields: B256,
+        input: &[u8],
+    ) -> zkminer_contracts::bindings::JobDescriptor {
+        zkminer_contracts::bindings::JobDescriptor {
+            programId: B256::repeat_byte(0xA1),
+            proofSystemId: zkminer_chain::auction::risc_zero_groth16_v1_id(),
+            callbackContract: alloy::primitives::Address::ZERO,
+            assignedProver: alloy::primitives::Address::ZERO,
+            tag: B256::ZERO,
+            inputData: input.to_vec().into(),
+            callbackExtraData: Default::default(),
+            extraVerifierData: Default::default(),
+            expectedJournalHash: expected,
+            journalFields: fields,
+        }
+    }
+
+    #[test]
+    fn the_preclaim_verdict_needs_a_journal_measured_on_this_input() {
+        use zkminer_chain::binding::{full_hash, BindingMismatch};
+        let job = B256::repeat_byte(0x10);
+        let me = alloy::primitives::Address::repeat_byte(0x20);
+        let input = b"the input";
+        let journal: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"the output"[..]);
+        let expected = full_hash(
+            zkminer_chain::auction::risc_zero_groth16_v1_id(),
+            B256::repeat_byte(0xA1),
+            &journal,
+        );
+        let d = bound_descriptor(expected, B256::ZERO, input);
+        let measured: MeasuredJournal = Some((keccak256(input), journal.clone()));
+        assert_eq!(
+            measured_binding_verdict(&d, &measured, job, me),
+            Some(Ok(()))
+        );
+
+        // Another expected hash: the fulfil would revert, so the verdict is a mismatch.
+        let other = bound_descriptor(B256::repeat_byte(0xEE), B256::ZERO, input);
+        assert!(matches!(
+            measured_binding_verdict(&other, &measured, job, me),
+            Some(Err(BindingMismatch::Journal { .. }))
+        ));
+        // A journal measured on another input, or none at all, decides nothing.
+        let elsewhere: MeasuredJournal = Some((keccak256(b"another input"), journal));
+        assert_eq!(measured_binding_verdict(&d, &elsewhere, job, me), None);
+        assert_eq!(measured_binding_verdict(&d, &None, job, me), None);
+    }
+
+    #[test]
+    fn a_failing_measured_binding_drops_the_job_and_only_then() {
+        let me = alloy::primitives::Address::repeat_byte(0x21);
+        let input = b"in";
+        let measured: MeasuredJournal = Some((keccak256(input), std::sync::Arc::from(&b"out"[..])));
+
+        let bad = B256::repeat_byte(0x31);
+        drop_if_measured_binding_fails(
+            &bound_descriptor(B256::repeat_byte(0xEE), B256::ZERO, input),
+            &measured,
+            bad,
+            me,
+        );
+        assert!(job_is_undecodable(bad));
+
+        // A NONE job (nothing to check), an unknown verdict, and a satisfied binding stay claimable.
+        let none = B256::repeat_byte(0x32);
+        drop_if_measured_binding_fails(
+            &bound_descriptor(B256::ZERO, B256::ZERO, input),
+            &measured,
+            none,
+            me,
+        );
+        assert!(!job_is_undecodable(none));
+        let unknown = B256::repeat_byte(0x33);
+        drop_if_measured_binding_fails(
+            &bound_descriptor(B256::repeat_byte(0xEE), B256::ZERO, input),
+            &None,
+            unknown,
+            me,
+        );
+        assert!(!job_is_undecodable(unknown));
+        let good = B256::repeat_byte(0x34);
+        let mut fields = B256::ZERO;
+        fields.0[..4].copy_from_slice(&3u32.to_be_bytes()); // FIELDS slot 0: offset 0, length 3, "out"
+        let d = bound_descriptor(keccak256(b"out"), fields, input);
+        drop_if_measured_binding_fails(&d, &measured, good, me);
+        assert!(!job_is_undecodable(good));
     }
 
     // UNMEASURABLE TTL: a wall-clock-timeout verdict is dropped and re-measured after its TTL; every
@@ -11260,6 +11722,7 @@ mod r2_sizing_tests {
                 peak_host_bytes: 0,
                 retry_after: Some(std::time::Instant::now() - Duration::from_secs(1)),
                 verified_elf_hash: None,
+                journal: None,
             },
         );
         assert_eq!(

@@ -11,7 +11,8 @@ use zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV;
 use zkminer_prover_protocol::{
     is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
     WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, PROTOCOL_VERSION,
+    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
+    PROTOCOL_VERSION,
 };
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
@@ -280,15 +281,22 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     run_execute(&elf, &input_data, program_id)
                 }));
                 match outcome {
-                    Ok(Ok((cycles, journal_len, duration_secs))) => {
+                    Ok(Ok((cycles, journal, duration_secs))) => {
                         tracing::info!(
                             "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
                         );
+                        let journal_len = journal.len() as u64;
                         let resp = WorkerResponse::ExecuteResult {
                             request_id,
                             cycles,
                             duration_secs,
                             journal_len,
+                            // The host checks the job's journal binding against these bytes. One no
+                            // fulfil could carry is reported by its length alone, and so is one a
+                            // proof on another worker may not reproduce (a process-only seed key).
+                            journal: (journal.len() <= EXECUTE_JOURNAL_MAX_BYTES
+                                && sys_rand_key_is_shared())
+                            .then_some(journal),
                             // risc0 is bounded by its own in-process RSS self-guard + the ledger charge
                             // (finding H4), not by the SP1-only prove-stacking claim gate (H1), so it
                             // reports no peak: 0 = "unknown", which leaves `sp1_execute_provable_beside_
@@ -623,24 +631,38 @@ fn sys_rand_seed(key: &[u8; 32], elf: &[u8], input_data: &[u8]) -> [u8; 32] {
 /// created there on first use), so every risc0 worker on the host derives the same seeds.
 ///
 /// If the file can't be used, the worker keys its seeds for this process alone: its measurements
-/// and proofs still agree with each other, but a job measured by another worker can diverge again.
+/// and proofs still agree with each other, but a job measured by another worker can diverge again,
+/// so its measurements then report no journal (see [`sys_rand_key_is_shared`]).
 fn sys_rand_key() -> [u8; 32] {
-    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    *KEY.get_or_init(|| {
+    sys_rand_key_state().0
+}
+
+/// Whether the seed key is the host's shared key file rather than one for this process alone.
+fn sys_rand_key_is_shared() -> bool {
+    sys_rand_key_state().1
+}
+
+fn sys_rand_key_state() -> &'static ([u8; 32], bool) {
+    static KEY: std::sync::OnceLock<([u8; 32], bool)> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
         let path = dirs::home_dir().map(|home| home.join(".zkminer").join("risc0-sys-rand.key"));
         let loaded = match &path {
             Some(path) => load_or_create_key(path),
             None => Err(anyhow::anyhow!("no home directory")),
         };
-        loaded.unwrap_or_else(|e| {
-            tracing::warn!(
-                "sys_rand key unavailable ({e:#}): seeding with a key for this process only, so a \
-                 job measured by another worker can diverge at prove"
-            );
-            let mut key = [0u8; 32];
-            getrandom::fill(&mut key).expect("no OS randomness for the sys_rand key");
-            key
-        })
+        match loaded {
+            Ok(key) => (key, true),
+            Err(e) => {
+                tracing::warn!(
+                    "sys_rand key unavailable ({e:#}): seeding with a key for this process only, so \
+                     a job measured here may be proved by another worker with other randomness; \
+                     measurements report no journal, and no journal-bound job is claimed on them"
+                );
+                let mut key = [0u8; 32];
+                getrandom::fill(&mut key).expect("no OS randomness for the sys_rand key");
+                (key, false)
+            }
+        }
     })
 }
 
@@ -689,7 +711,7 @@ fn run_execute(
     elf: &[u8],
     input_data: &[u8],
     program_id: Option<[u8; 32]>,
-) -> anyhow::Result<(u64, u64, f64)> {
+) -> anyhow::Result<(u64, Vec<u8>, f64)> {
     use std::time::Instant;
     // Bind the ELF to the job's programId before spending any execution on it (the pre-claim
     // measurement path runs UNCLAIMED, submitter-controlled ELFs).
@@ -734,11 +756,15 @@ fn run_execute(
     let cycles = session.cycles();
     // The journal the guest committed here is byte-identical to the one the later proof
     // would carry (both are a deterministic function of (ELF, input) — `sys_rand` included, via the
-    // shared seed — and the image-id check makes measure-ELF == prove-ELF), so its length lets the
-    // host pre-screen a program whose journal alone would blow the fulfillJob payload cap — before
+    // shared seed, and the guest's cycle counter, which counts user cycles whatever the segment size —
+    // and the image-id check makes measure-ELF == prove-ELF). The host checks the job's journal
+    // binding against it, and screens a journal that would blow the fulfillJob payload cap, before
     // committing collateral and a full proof to it.
-    let journal_len = session.journal.bytes.len() as u64;
-    Ok((cycles, journal_len, started.elapsed().as_secs_f64()))
+    Ok((
+        cycles,
+        session.journal.bytes,
+        started.elapsed().as_secs_f64(),
+    ))
 }
 
 /// Cards with less VRAM than this release the Groth16 SRS cache after every proof.

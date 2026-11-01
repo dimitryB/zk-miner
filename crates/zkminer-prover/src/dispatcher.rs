@@ -64,6 +64,28 @@ pub struct BenchmarkProgressEvent {
     pub total_programs: u32,
 }
 
+/// What a pre-claim `Execute` measured (see [`WorkerPool::execute_cycles`]).
+#[derive(Debug, Clone)]
+pub struct ExecuteMeasurement {
+    /// Total cycles, as proving reports them.
+    pub cycles: u64,
+    /// Length of the journal the guest committed.
+    pub journal_len: u64,
+    /// The journal itself, when the worker reported all `journal_len` bytes of it.
+    pub journal: Option<Vec<u8>>,
+    /// Peak host RSS of the execute (0 = unknown).
+    pub peak_host_bytes: u64,
+}
+
+/// The journal an `ExecuteResult` reported, if it is the whole journal `journal_len` describes. The
+/// caller claims no journal-bound job on a measurement without one.
+fn whole_journal(journal: Option<Vec<u8>>, journal_len: u64) -> Option<Vec<u8>> {
+    journal.filter(|j| {
+        j.len() as u64 == journal_len
+            && j.len() <= zkminer_prover_protocol::types::EXECUTE_JOURNAL_MAX_BYTES
+    })
+}
+
 use anyhow::{bail, Result};
 use zkminer_prover_protocol::{BenchmarkEntry, ErrorKind, WorkerCommand, WorkerResponse};
 
@@ -3541,7 +3563,7 @@ impl WorkerPool {
         // image id does not match, so the zero-cost pre-claim measurement path cannot be driven with
         // an ELF unrelated to the registered program.
         program_id: Option<[u8; 32]>,
-    ) -> anyhow::Result<(u64, u64, u64)> {
+    ) -> anyhow::Result<ExecuteMeasurement> {
         // Measure on the DEDICATED measure worker when one exists for this backend (SP1), NEVER on a
         // prove worker — so a measure wall-clock-watchdog SIGKILL (which group-kills the chosen
         // worker, dispatcher.rs watchdog) can only hit this server-less process, never a prove
@@ -3917,6 +3939,7 @@ impl WorkerPool {
                 duration_secs,
                 journal_len,
                 peak_host_bytes,
+                journal,
                 ..
             } => {
                 tracing::debug!(
@@ -3941,7 +3964,12 @@ impl WorkerPool {
                     // invalidate a measurement that already finished.
                     Self::mark_slot_dead(&mut slot, entry);
                 }
-                Ok((cycles, journal_len, peak_host_bytes))
+                Ok(ExecuteMeasurement {
+                    cycles,
+                    journal_len,
+                    journal: whole_journal(journal, journal_len),
+                    peak_host_bytes,
+                })
             }
             WorkerResponse::Error { message, .. } => {
                 anyhow::bail!("cycle measurement failed: {message}")
@@ -7313,6 +7341,20 @@ impl WorkerPool {
 
 #[cfg(test)]
 mod tests {
+    // A journal counts only when it is all `journal_len` bytes and within the cap.
+    #[test]
+    fn only_a_whole_reported_journal_counts() {
+        use super::whole_journal;
+        use zkminer_prover_protocol::types::EXECUTE_JOURNAL_MAX_BYTES as CAP;
+        assert_eq!(whole_journal(Some(vec![1, 2, 3]), 3), Some(vec![1, 2, 3]));
+        assert_eq!(whole_journal(Some(vec![]), 0), Some(vec![]));
+        assert_eq!(whole_journal(None, 0), None);
+        assert_eq!(whole_journal(None, 3), None);
+        assert_eq!(whole_journal(Some(vec![]), 3), None);
+        assert_eq!(whole_journal(Some(vec![1, 2]), 3), None);
+        assert_eq!(whole_journal(Some(vec![0; CAP + 1]), CAP as u64 + 1), None);
+    }
+
     // Finding RH1 / Mode B: the `/dev/shm` ledger admits only as many concurrent SP1 native stagings
     // as the tmpfs can physically back, and releases on drop.
     #[test]

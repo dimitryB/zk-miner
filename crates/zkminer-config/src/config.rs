@@ -69,14 +69,12 @@ pub struct ChainConfig {
     /// chain (743111: 7095745), else no floor.
     #[serde(default)]
     pub scan_from_block: Option<u64>,
-    /// Whether to claim jobs that carry a non-zero `expectedJournalHash`
-    /// (Phase-2 "journal predicate"). Fulfilling such a job with a proof whose
-    /// public values don't satisfy the predicate reverts `JournalMismatch`
-    /// AFTER the lock — risking a collateral slash on timeout — because zkminer
-    /// does not yet simulate the predicate before claiming. A submitter can set
-    /// an unsatisfiable predicate deliberately to bait a slash, so None = built-in
-    /// default (FALSE: skip them). Set `true` only on a deployment
-    /// where you accept the risk (e.g. testnet testing of the predicate feature).
+    /// Whether to claim journal-bound jobs: a non-zero `expectedJournalHash` (FULL or FIELDS
+    /// binding), which is every open-market job. A fulfil whose journal does not satisfy the binding
+    /// reverts `JournalMismatch` after the lock, so such a job is claimed only when the journal its
+    /// (program, input) measured satisfies the binding, and the proof's journal is checked again
+    /// before the fulfil. None = built-in default (TRUE). `false` claims only NONE jobs assigned to
+    /// this prover.
     #[serde(default)]
     pub claim_predicate_jobs: Option<bool>,
 }

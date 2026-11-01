@@ -136,7 +136,8 @@ use zkminer_prover_protocol::types::{
 use zkminer_prover_protocol::{
     is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
     WorkerResponse, BACKEND_SP1, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, PROTOCOL_VERSION,
+    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
+    PROTOCOL_VERSION,
 };
 
 mod bundled_server;
@@ -1551,7 +1552,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     run_execute_sp1(cpu, &elf, &input_data)
                 }));
                 match outcome {
-                    Ok(Ok((cycles, journal_len, duration_secs, peak_host_bytes))) => {
+                    Ok(Ok((cycles, journal, duration_secs, peak_host_bytes))) => {
                         tracing::info!(
                             "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s, peak \
                              host {} MiB",
@@ -1561,8 +1562,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             request_id,
                             cycles,
                             duration_secs,
-                            journal_len,
+                            journal_len: journal.len() as u64,
                             peak_host_bytes,
+                            // One no fulfil could carry is reported by its length alone.
+                            journal: (journal.len() <= EXECUTE_JOURNAL_MAX_BYTES).then_some(journal),
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -1844,7 +1847,7 @@ fn run_execute_sp1(
     cpu: &sp1_sdk::blocking::CpuProver,
     elf: &[u8],
     input_data: &[u8],
-) -> anyhow::Result<(u64, u64, f64, u64)> {
+) -> anyhow::Result<(u64, Vec<u8>, f64, u64)> {
     use sp1_sdk::blocking::{Elf, Prover, SP1Stdin};
 
     let started = Instant::now();
@@ -1868,13 +1871,13 @@ fn run_execute_sp1(
         run_result.map_err(|e| canonicalize_sp1_execute_error(&e.to_string()))?;
     // The public values the guest commits here are byte-identical to the journal the
     // later Groth16 proof carries (both are a deterministic function of (ELF, input), and the host's
-    // elf_hash gate makes measure-ELF == prove-ELF). Report their length so the host can refuse to
-    // CLAIM a program whose journal alone would OOG-revert fulfillJob, instead of learning it only
-    // after a full proof is wasted. `.to_vec()` matches how `run_proof` extracts the journal.
-    let journal_len = public_values.to_vec().len() as u64;
+    // elf_hash gate makes measure-ELF == prove-ELF). The host checks the job's journal binding
+    // against them, and refuses to CLAIM a program whose journal alone would OOG-revert fulfillJob,
+    // instead of learning either only after a full proof is wasted. `.to_vec()` matches how
+    // `run_proof` extracts the journal.
     Ok((
         report.total_instruction_count(),
-        journal_len,
+        public_values.to_vec(),
         started.elapsed().as_secs_f64(),
         peak_host_bytes,
     ))

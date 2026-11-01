@@ -117,6 +117,7 @@ fn main() {
                     duration_secs: 0.01,
                     journal_len: 0,
                     peak_host_bytes: 0,
+                    journal: Some(Vec::new()),
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }
