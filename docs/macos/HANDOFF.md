@@ -7,6 +7,37 @@ outputs pass the unchanged pinned verifier. The controlled Fibonacci comparison 
 performance and fault/memory coverage remain open. No production-readiness claim.
 No push, privileged installation, wallet access, job claim or transaction.
 
+## Fork publication and future push destinations
+
+On 2026-11-01 the owner explicitly authorized pushing all pending session work
+to their forks, superseding the earlier local-only/no-push instruction. Publish
+only the `codex/hemi-macos-metal` feature branch in each repository:
+
+* Miner: [dimitryB/zk-miner](https://github.com/dimitryB/zk-miner/tree/codex/hemi-macos-metal).
+  The branch includes all nine implementation/validation commits through
+  `42c40dfb28b0f40b450d3cd94ed65ba551b65372`, plus this handoff update.
+* Pinned engine: [dimitryB/risc0](https://github.com/dimitryB/risc0/tree/codex/hemi-macos-metal)
+  at `0d5b41e8e44876c1e8b5a8a671aabc154e33106c`, containing all four task commits
+  above pin `f8dcbdf8124a3f1528146bb01d539c55545cbb3d`.
+
+Both implementation repositories use remote `dimitryB` with the corresponding
+HTTPS clone URL, `remote.pushDefault=dimitryB`, and this branch's
+`pushRemote=dimitryB`. The existing `origin` remotes remain source references;
+do not push to them. The standalone upstream `risc0/risc0` reference checkout
+remains read-only. No default branch, dependency URL/revision, or proof artifact
+was changed for publication, and no force push or pull request is requested.
+The GitHub fork default branches are independent of this pinned task branch;
+do not merge a newer engine default branch merely to publish this work.
+
+Earlier CPU branch names point at their original baselines; their complete task
+work is already included in the Metal branch histories. There were no stashes
+or other uncommitted task files to publish. Tracked implementation, scripts,
+reports, JSON/CSV evidence and lockfiles are included. Ignored local build caches,
+VM/toolchain binaries and raw `target/macos` run artifacts remain local; committed
+evidence binds their identities and reproducing them requires the documented
+local build/acceptance steps. Earlier “no push” statements describe the local
+milestones before this explicit authorization.
+
 ## Current completed controlled benchmark
 
 Campaign `f57fcc0ff71d4d6391605cb761c0a1a6` completed on 2026-11-01 in
