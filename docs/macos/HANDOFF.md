@@ -1,6 +1,6 @@
 # macOS proving handoff
 
-Updated 2026-10-31. CPU Gates 1/2 and the bounded native hybrid worker milestone
+Updated 2026-11-01. CPU Gates 1/2 and the bounded native hybrid worker milestone
 passed. Expanded workloads and twenty consecutive supervised-worker requests
 also passed. Segment Poseidon2 Merkle folds run on Metal; complete Groth16
 outputs pass the unchanged pinned verifier. Full Gate 3 remains open for
@@ -8,6 +8,19 @@ controlled performance measurements and additional fault/memory coverage.
 No push, privileged installation, wallet access, job claim or transaction.
 
 ## Current controlled-benchmark continuation (incomplete)
+
+Readiness recheck on 2026-11-01: policy-estimated available memory was
+29.324 GiB with the dedicated VM stopped and 27.596 GiB after restarting it
+with the same 6 CPU/32 GiB configuration. This clears the unchanged 22 GiB
+startup floor but is below the previous campaign's 32.955 GiB pre-proof level.
+That warmup ended at 21.212 GiB (11.743 GiB less; this includes all host and
+background activity, not an isolated helper allocation measurement).
+A conservative retry target is 36–38 GiB available **with the VM running**,
+roughly 8–10 GiB more than this recheck. This is guidance, not a new admission
+rule or allocation guarantee. No new proof was launched. `vm_stat`, the existing
+Darwin policy formula, `colima list --json`, and the same documented VM start/stop
+commands were used. The dedicated VM was stopped again; default remains running.
+No code, pins, CPU binaries or resource guards changed; no push or installation.
 
 Instrumentation/runner/thermal helper are locally committed at `461965e` on
 `codex/hemi-macos-metal`; the following collector/evidence/documentation commit
