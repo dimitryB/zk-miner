@@ -11913,6 +11913,7 @@ dependencies = [
  "hmac",
  "libc",
  "risc0-build",
+ "risc0-circuit-keccak",
  "risc0-groth16",
  "risc0-zkvm",
  "serde",

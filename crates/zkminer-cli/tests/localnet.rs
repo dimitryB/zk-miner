@@ -6,23 +6,29 @@
 //! - the prover's stake;
 //! - programs in the ProgramRegistry, with storage URIs this test serves over HTTP (an id someone
 //!   already registered on 743111 is first cleared, as the registry's owner);
-//! - jobs covering the binding cases (see [`Case`]): three the miner must claim, the rest it must
-//!   refuse. Some are submitted before the miner starts and some after.
+//! - jobs covering the binding, assignment and collateral cases (see [`Case`]): four the miner must
+//!   claim (one of them assigned to another prover with no exclusivity window), the rest it must
+//!   refuse (among them one inside another prover's exclusivity window, and one whose collateral
+//!   exceeds the prover's whole stake). Some are submitted before the miner starts and some after;
+//!   the miner's backfill starts at the first one's block, so a backfill that starts a block late
+//!   loses it.
 //!
 //! and runs the `zkminer` binary against the fork. anvil impersonates every sender, so setting up
 //! needs no key. Each miner runs with its own HOME and a cleaned environment.
 //!
 //! The tests:
 //! - `watch_only_reports_every_job`: `zkminer run --watch-only`, on the fibonacci guest, as the
-//!   staked prover and then as an address with no stake. Checks each job's verdict, that exactly
-//!   the claimable jobs would be claimed, and that nothing was sent. CPU only.
+//!   staked prover and then as an address with no stake, with `RISC0_EXECUTOR` set to a value
+//!   risc0 does not know (the worker must ignore it). Checks each job's verdict, that exactly the
+//!   claimable jobs would be claimed, that every measured cycle count is a power of two (the guests
+//!   run in one segment), and that nothing was sent. CPU only.
 //! - `fulfils_with_a_replayed_receipt`: `zkminer run` with the prover's key on the contract suite's
 //!   RISC Zero receipt fixture, which the deployed verifier accepts. The mock worker replays that
 //!   receipt instead of proving, so the miner claims and fulfils for real on the fork: every
 //!   on-chain step of mining, on a CPU. Checks exactly the claimable jobs are fulfilled, each
 //!   dispatched and claimed in an earlier transaction than its fulfil, nothing else is claimed or
-//!   released (the prover sends just a claim and a fulfil per job), and no collateral is left
-//!   locked.
+//!   released (the prover sends just a claim and a fulfil per job), the exclusive and
+//!   over-collateralised jobs are never even dispatched, and no collateral is left locked.
 //! - `holds_its_lock_through_a_pause`: a lock held while the router pauses is kept, not released:
 //!   its fulfil is held with nothing sent for longer than the nonce-gap watchdog takes to act, and
 //!   sent after the lift.
@@ -105,9 +111,24 @@ const FIXTURE_SEAL_HEX: &str = concat!(
     "58475101f64277d40fb8f805de9db44c9ac2e6095f5422599ceb8bf8df9edbb766ab19bb89f2b2a824d17896c55a0487f4172c96",
     "1aba47cd3e0422037fc1bf524fdb01e21dc4f8300bc0f922f535135f8a0a36942ceae7c81d12e0b255cda9eda5d161715ad74d46",
 );
-/// Every job is fixed-price at this.
+/// Every job but [`Case::HighCollateral`]'s is fixed-price at this.
 const JOB_PRICE: u128 = 5 * HEMI;
 const PROVER_STAKE: u128 = 1_000 * HEMI;
+/// [`Case::HighCollateral`]'s price, and its collateral rate: `MAX_COLLATERAL_BPS` (500%), the most a
+/// submitter may ask (zkmarket c8333aa, `src/libraries/Constants.sol`).
+const HIGH_COLLATERAL_PRICE: u128 = 250 * HEMI;
+const MAX_COLLATERAL_BPS: u64 = 50_000;
+// Its claim would lock 1,250 HEMI, more than the whole stake; sized at the 150% default (the miner's
+// old sizing), it would fit.
+const _: () = assert!(
+    HIGH_COLLATERAL_PRICE * MAX_COLLATERAL_BPS as u128 / 10_000 > PROVER_STAKE
+        && HIGH_COLLATERAL_PRICE * 15_000 / 10_000 < PROVER_STAKE
+);
+/// [`Case::FullExclusiveForAnother`]'s exclusivity window, which outlasts any run (the router takes 0
+/// or 60 s to 24 h).
+const EXCLUSIVITY: Duration = Duration::from_secs(3_600);
+/// The prover the `…ForAnother` jobs are assigned to.
+const ANOTHER_PROVER: Address = Address::repeat_byte(0x42);
 /// How long the watch test waits for every verdict.
 const WATCH_TIMEOUT: Duration = Duration::from_secs(420);
 /// How long the replay tests wait for their fulfils.
@@ -142,6 +163,15 @@ enum Case {
     NoneForUs,
     /// NONE, assigned to another prover: reserved for it.
     NoneForAnother,
+    /// FULL as [`Case::Full`], assigned to another prover with no exclusivity window: the router
+    /// holds a FULL job's assignment only within its window, so anyone may claim it.
+    FullForAnother,
+    /// FULL as [`Case::Full`], assigned to another prover for an [`EXCLUSIVITY`] window that outlasts
+    /// the run: only that prover may claim it meanwhile.
+    FullExclusiveForAnother,
+    /// FULL as [`Case::Full`], at [`HIGH_COLLATERAL_PRICE`] and 500% collateral: its lock would
+    /// exceed the prover's whole stake, so the brain's per-job collateral gate must hold it.
+    HighCollateral,
     /// FULL with the journal-prefix marker, which this build does not support.
     PrefixMarker,
     /// FULL, for a program whose registry URI serves another program's ELF (this run's): its image
@@ -154,31 +184,47 @@ enum Case {
 
 impl Case {
     /// Every case, for a run with a real worker.
-    const ALL: [Case; 9] = [
+    const ALL: [Case; 12] = [
         Case::Full,
         Case::Fields,
         Case::FullWrongJournal,
         Case::FieldsWrongJournal,
         Case::NoneForUs,
         Case::NoneForAnother,
+        Case::FullForAnother,
+        Case::FullExclusiveForAnother,
+        Case::HighCollateral,
         Case::PrefixMarker,
         Case::DecoyElf,
         Case::ElfUnreachable,
     ];
     /// Every case the mock worker can serve.
-    const REPLAYABLE: [Case; 8] = [
+    const REPLAYABLE: [Case; 11] = [
         Case::Full,
         Case::Fields,
         Case::FullWrongJournal,
         Case::FieldsWrongJournal,
         Case::NoneForUs,
         Case::NoneForAnother,
+        Case::FullForAnother,
+        Case::FullExclusiveForAnother,
+        Case::HighCollateral,
         Case::PrefixMarker,
         Case::ElfUnreachable,
     ];
 
     fn claimable(self) -> bool {
-        matches!(self, Case::Full | Case::Fields | Case::NoneForUs)
+        matches!(
+            self,
+            Case::Full | Case::Fields | Case::NoneForUs | Case::FullForAnother
+        )
+    }
+
+    /// Refused by the brain before it dispatches a claim, on a check a claim would also fail at its
+    /// quote, before any transaction (the exclusivity window, the job's own collateral). So only the
+    /// missing `CLAIM <job> (` line ([`dispatched`]) shows that the brain's check held.
+    fn held_before_dispatch(self) -> bool {
+        matches!(self, Case::FullExclusiveForAnother | Case::HighCollateral)
     }
 
     /// Submitted before the miner starts, so it finds the job in its startup backfill; the others
@@ -187,26 +233,68 @@ impl Case {
     fn before_start(self) -> bool {
         matches!(
             self,
-            Case::Full | Case::FullWrongJournal | Case::NoneForAnother | Case::DecoyElf
+            Case::Full
+                | Case::FullWrongJournal
+                | Case::NoneForAnother
+                | Case::FullExclusiveForAnother
+                | Case::DecoyElf
         )
+    }
+
+    /// The price this case's job is fixed at.
+    fn price(self) -> u128 {
+        match self {
+            Case::HighCollateral => HIGH_COLLATERAL_PRICE,
+            _ => JOB_PRICE,
+        }
+    }
+
+    /// This case's auction: fixed-price, with its exclusivity window and collateral rate.
+    fn auction(self) -> AuctionConfig {
+        let mut a = fixed_price(self.price());
+        match self {
+            Case::FullExclusiveForAnother => {
+                a.exclusivityDuration = U40::from(EXCLUSIVITY.as_secs());
+            }
+            Case::HighCollateral => a.lockCollateralBps = U96::from(MAX_COLLATERAL_BPS),
+            _ => {}
+        }
+        a
+    }
+
+    /// What submitting this case's job takes from the submitter: its maximum price and its speed
+    /// premium.
+    fn deposit(self) -> u128 {
+        let a = self.auction();
+        a.maxPrice.to::<u128>() + a.speedPremium.to::<u128>()
     }
 
     /// What the watch-only inspector's verdict for this job must contain, watching as the staked
     /// prover or as an address with no stake.
     fn inspector_verdict(self, staked: bool) -> String {
         let quote = if staked {
-            format!("claim quote {} HEMI", hemi(JOB_PRICE))
+            format!("claim quote {} HEMI", hemi(self.price()))
         } else {
             "the claim would be refused (StakeShort)".to_string()
         };
         match self {
-            Case::Full | Case::Fields => format!("binding satisfied; {quote}"),
+            Case::Full | Case::Fields | Case::FullForAnother => {
+                format!("binding satisfied; {quote}")
+            }
             Case::NoneForUs if staked => format!("no journal binding; {quote}"),
             Case::NoneForUs => "reserved for prover".into(),
             Case::FullWrongJournal | Case::FieldsWrongJournal => {
                 "the measured journal FAILS its binding".into()
             }
             Case::NoneForAnother => "reserved for prover".into(),
+            Case::FullExclusiveForAnother => {
+                format!("assigned to prover {ANOTHER_PROVER}, and its exclusivity has not lapsed")
+            }
+            // Staked or not, the quote's simulated claim reverts: the lock overruns the free stake
+            // (the staking contract's assert, Panic(0x01)) or there is no stake at all.
+            Case::HighCollateral => {
+                "binding satisfied; the claim would be refused (StakeShort)".into()
+            }
             Case::PrefixMarker => "its binding marker is not supported".into(),
             Case::DecoyElf | Case::ElfUnreachable => "it cannot be measured".into(),
         }
@@ -542,6 +630,8 @@ macro_rules! mined {
 struct Job {
     case: Case,
     id: B256,
+    /// The block its submit was mined in.
+    block: u64,
 }
 
 /// A router event of one job, where it was mined.
@@ -558,13 +648,13 @@ struct World {
     provider: DynProvider,
     prover: PrivateKeySigner,
     submitter: Address,
-    another_prover: Address,
     program: Program,
     /// The cases this run submits.
     cases: Vec<Case>,
     /// The jobs submitted so far.
     jobs: Vec<Job>,
-    /// The first block after setup started: every log query starts here.
+    /// The first block after setup started: every log query of the harness's starts here (the
+    /// miner's backfill starts later, at [`World::scan_from_block`]).
     from_block: u64,
     /// Requests the ELF server answered.
     elf_hits: Arc<AtomicUsize>,
@@ -628,7 +718,6 @@ impl World {
         let (elf_url, elf_hits) = serve_file(program.elf.clone());
 
         let submitter = Address::from_word(keccak256(b"zkminer localnet submitter"));
-        let another_prover = Address::repeat_byte(0x42);
         let prover = PrivateKeySigner::random();
         // tHEMI is minted by its owner, which anvil impersonates.
         let token_owner = owner_of(&provider, DEPLOYMENT.token).await;
@@ -636,11 +725,25 @@ impl World {
             set_balance(&provider, a, 100 * HEMI).await;
         }
 
+        // The submitter pays the registry's fee (as set on the fork) for each program it registers,
+        // and each job's deposit.
+        let registrations = 1 + cases
+            .iter()
+            .filter(|c| matches!(c, Case::DecoyElf | Case::ElfUnreachable))
+            .count();
+        let registration_fees = IProgramRegistryFee::new(DEPLOYMENT.program_registry, &provider)
+            .registrationFee()
+            .call()
+            .await
+            .expect("read the registry's registrationFee()")
+            * U256::from(registrations);
+        let deposits = U256::from(cases.iter().map(|c| c.deposit()).sum::<u128>());
+
         let token = ITestnetToken::new(DEPLOYMENT.token, &provider);
         let erc20 = IERC20::new(DEPLOYMENT.token, &provider);
         mined!(
             token
-                .mint(submitter, U256::from(1_000 * HEMI))
+                .mint(submitter, registration_fees + deposits)
                 .from(token_owner),
             "mint tHEMI to the submitter"
         );
@@ -664,12 +767,12 @@ impl World {
             "stake"
         );
 
-        // Registration is permissionless; the allowance covers a registration fee, if any.
+        // Registration is permissionless, for the fee.
         mined!(
             erc20
-                .approve(DEPLOYMENT.program_registry, U256::from(100 * HEMI))
+                .approve(DEPLOYMENT.program_registry, registration_fees)
                 .from(submitter),
-            "approve the registration fee"
+            "approve the registration fees"
         );
         let elf_hash = keccak256(&program.elf);
         register_program(
@@ -709,9 +812,7 @@ impl World {
         }
 
         mined!(
-            erc20
-                .approve(DEPLOYMENT.router, U256::from(1_000 * HEMI))
-                .from(submitter),
+            erc20.approve(DEPLOYMENT.router, deposits).from(submitter),
             "approve the job deposits"
         );
         let mut world = World {
@@ -720,15 +821,30 @@ impl World {
             provider,
             prover,
             submitter,
-            another_prover,
             program,
             cases: cases.to_vec(),
             jobs: Vec::new(),
             from_block,
             elf_hits,
         };
-        for case in world.cases.clone().into_iter().filter(|c| c.before_start()) {
+        // Case::Full first: the miner's backfill starts at its block ([`World::scan_from_block`]), so
+        // every other job submitted before the miner starts must land in a later one. Each submit
+        // waits for its receipt, so the next is mined in a later block.
+        let mut before: Vec<Case> = cases.iter().copied().filter(|c| c.before_start()).collect();
+        before.sort_by_key(|&c| c != Case::Full);
+        for case in before {
             world.submit(case).await;
+        }
+        if let Some(full) = world.jobs.iter().find(|j| j.case == Case::Full) {
+            for job in world.jobs.iter().filter(|j| j.case != Case::Full) {
+                assert!(
+                    job.block > full.block,
+                    "the {:?} job was mined in block {}, not after the Full job's block {}",
+                    job.case,
+                    job.block,
+                    full.block
+                );
+            }
         }
         let skew = world.clock_skew().await;
         assert!(
@@ -854,13 +970,8 @@ impl World {
         let core = IHemiProveCore::new(DEPLOYMENT.router, &self.provider);
         let receipt = mined!(
             core.submitJob(
-                descriptor(
-                    case,
-                    &self.program,
-                    self.prover.address(),
-                    self.another_prover
-                ),
-                fixed_price(),
+                descriptor(case, &self.program, self.prover.address()),
+                case.auction(),
                 no_cycles(),
                 no_bidding(),
             )
@@ -874,7 +985,20 @@ impl World {
             .find_map(|l| l.log_decode::<IHemiProveCore::JobSubmitted>().ok())
             .map(|l| l.inner.data.jobId)
             .expect("JobSubmitted in the submit receipt");
-        self.jobs.push(Job { case, id });
+        let block = receipt
+            .block_number
+            .expect("the submit receipt has a block");
+        self.jobs.push(Job { case, id, block });
+    }
+
+    /// Where the miner's backfill starts: the block of the Case::Full job's submit, the first job
+    /// submitted (see [`World::new`]). A backfill that started a block late would lose that job.
+    fn scan_from_block(&self) -> u64 {
+        self.jobs
+            .iter()
+            .find(|j| j.case == Case::Full)
+            .map(|j| j.block)
+            .expect("every run submits a Case::Full job before the miner starts")
     }
 
     /// Submit the jobs held back for the live monitor, once the miner's monitor runs.
@@ -925,7 +1049,7 @@ impl World {
         let mut c = ZkMinerConfig::default();
         c.chain.rpc_url = self.rpc_url.clone();
         c.chain.chain_id = DEPLOYMENT.chain_id;
-        c.chain.scan_from_block = Some(self.from_block);
+        c.chain.scan_from_block = Some(self.scan_from_block());
         c.chain.monitor_poll_secs = Some(2);
         // A local node has no rate limit to stay under.
         c.chain.max_requests_per_sec = Some(50);
@@ -993,6 +1117,13 @@ alloy::sol! {
     interface IProgramRegistryGovernance {
         function revokeProgram(bytes32 programId, string calldata reason) external;
         function clearRevokedProgram(bytes32 programId) external;
+    }
+
+    /// The ProgramRegistry's fee for a registration, in tHEMI wei, which zkminer's bindings leave
+    /// out (same source; at most `MAX_REGISTRATION_FEE`, 100 HEMI).
+    #[sol(rpc)]
+    interface IProgramRegistryFee {
+        function registrationFee() external view returns (uint256);
     }
 }
 
@@ -1066,7 +1197,7 @@ async fn register_program(
     );
 }
 
-fn descriptor(case: Case, program: &Program, prover: Address, another: Address) -> JobDescriptor {
+fn descriptor(case: Case, program: &Program, prover: Address) -> JobDescriptor {
     let psid = risc_zero_groth16_v1_id();
     let (program_id, journal) = (case.program_id(program), &program.journal);
     let slot0 = |word: u32| {
@@ -1077,7 +1208,8 @@ fn descriptor(case: Case, program: &Program, prover: Address, another: Address) 
     // One FIELDS range: offset 0, length 8.
     let first_8 = slot0(8);
     let (assigned, expected, fields) = match case {
-        Case::Full => (
+        // HighCollateral differs only in its auction (`Case::auction`).
+        Case::Full | Case::HighCollateral => (
             Address::ZERO,
             full_hash(psid, program_id, journal),
             B256::ZERO,
@@ -1094,7 +1226,15 @@ fn descriptor(case: Case, program: &Program, prover: Address, another: Address) 
             first_8,
         ),
         Case::NoneForUs => (prover, B256::ZERO, B256::ZERO),
-        Case::NoneForAnother => (another, B256::ZERO, B256::ZERO),
+        Case::NoneForAnother => (ANOTHER_PROVER, B256::ZERO, B256::ZERO),
+        // The FULL hash covers (domain, psId, programId, journal), not the assignment: bound as
+        // Case::Full is, with only the descriptor (and its hash) different. Their auctions differ
+        // too (`Case::auction`).
+        Case::FullForAnother | Case::FullExclusiveForAnother => (
+            ANOTHER_PROVER,
+            full_hash(psid, program_id, journal),
+            B256::ZERO,
+        ),
         Case::PrefixMarker => (
             Address::ZERO,
             full_hash(psid, program_id, journal),
@@ -1121,10 +1261,12 @@ fn descriptor(case: Case, program: &Program, prover: Address, another: Address) 
     }
 }
 
-fn fixed_price() -> AuctionConfig {
+/// A fixed-price auction at `price`: no ramp, no premium, no exclusivity window, and the default
+/// collateral rate.
+fn fixed_price(price: u128) -> AuctionConfig {
     AuctionConfig {
-        minPrice: U96::from(JOB_PRICE),
-        maxPrice: U96::from(JOB_PRICE),
+        minPrice: U96::from(price),
+        maxPrice: U96::from(price),
         rampUpPeriod: U40::ZERO,
         curveType: 0,
         fulfillmentTimeout: U40::from(3_600u64),
@@ -1202,7 +1344,7 @@ impl Miner {
     /// Start `zkminer` from a link in `dir` (its own directory is searched for workers, so it finds
     /// only the ones the config names), with `dir` as its HOME and a cleaned environment: none of
     /// this shell's `ZKMINER_*`, `MOCK_*`, `BONSAI_*`, `RISC0_DEV_MODE`, `RISC0_PROVER` or
-    /// `RISC0_EXECUTOR` settings, only `env`.
+    /// `RISC0_EXECUTOR` settings, only `env` (set after they are removed, so it may set one).
     fn start(
         dir: &Path,
         config: &Path,
@@ -1379,6 +1521,27 @@ fn watch_lines(lines: &[String], id: B256) -> Vec<String> {
         .collect()
 }
 
+/// The cycle counts a verdict reports: the digits of each match of `(\d+) cycles(,| measured)` (the
+/// inspector's `N cycles, …` and the would-claim verdict's `N cycles measured`).
+fn reported_cycles(verdict: &str) -> Vec<&str> {
+    const UNIT: &str = " cycles";
+    let mut counts = Vec::new();
+    let mut from = 0;
+    while let Some(at) = verdict[from..].find(UNIT).map(|i| from + i) {
+        let digits = verdict[..at]
+            .bytes()
+            .rev()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        let after = &verdict[at + UNIT.len()..];
+        if digits > 0 && (after.starts_with(',') || after.starts_with(" measured")) {
+            counts.push(&verdict[at - digits..at]);
+        }
+        from = at + UNIT.len();
+    }
+    counts
+}
+
 /// Whether the brain dispatched a claim of `id` (its `CLAIM <job> (price …` line): the job got past
 /// every gate the brain applies.
 fn dispatched(lines: &[String], id: B256) -> bool {
@@ -1495,6 +1658,10 @@ async fn watch_only_reports_every_job() {
     let mut world = World::new(&dir.0, program, &Case::ALL, Clock::Wall).await;
     let config = world.write_config(&dir.0, &worker, false);
     let nonce_before = world.prover_nonce().await;
+    // risc0's default executor hits `unimplemented!` on an executor it does not know; the worker
+    // must not use it (its measurements run locally, whatever this says), so every verdict that
+    // needs a measurement shows it held.
+    let env = [("RISC0_EXECUTOR", "bogus".to_string())];
 
     // As the staked prover.
     let mut miner = Miner::start(
@@ -1506,7 +1673,7 @@ async fn watch_only_reports_every_job() {
             "--address",
             &world.prover.address().to_string(),
         ],
-        &[],
+        &env,
     );
     world.submit_after_start(&mut miner).await;
     let (mut failures, mut lines) = watch_and_check(&world, &mut miner, true).await;
@@ -1535,7 +1702,7 @@ async fn watch_only_reports_every_job() {
             "--address",
             &Address::repeat_byte(0x77).to_string(),
         ],
-        &[],
+        &env,
     );
     let (unstaked_failures, unstaked_lines) = watch_and_check(&world, &mut unstaked, false).await;
     failures.extend(
@@ -1544,13 +1711,45 @@ async fn watch_only_reports_every_job() {
             .map(|f| format!("unstaked: {f}")),
     );
 
+    // The guests run in one segment, so each total cycle count the verdicts report is a power of
+    // two (a count of user cycles would almost never be). Some must be reported, or this proves
+    // nothing.
+    let mut counts = 0;
+    for job in &world.jobs {
+        let verdicts = [
+            watch_lines(&lines, job.id),
+            watch_lines(&unstaked_lines, job.id),
+        ]
+        .concat();
+        for v in &verdicts {
+            for n in reported_cycles(v) {
+                counts += 1;
+                if !n.parse::<u64>().is_ok_and(u64::is_power_of_two) {
+                    failures.push(format!(
+                        "{:?}: {n} cycles is not a power of two ({v})",
+                        job.case
+                    ));
+                }
+            }
+        }
+    }
+    if counts == 0 {
+        failures.push("no verdict reported a measured cycle count".into());
+    }
+
     // Watch-only sends nothing. Setup sends with eth_sendTransaction (anvil signs), so any
     // eth_sendRawTransaction the node saw came from a miner (its send guard must stop even its
-    // throwaway key's). The prover's nonce and the claims are checked too, for completeness.
-    let raw_sends = std::fs::read_to_string(dir.0.join("anvil.log"))
-        .unwrap_or_default()
-        .matches("eth_sendRawTransaction")
-        .count();
+    // throwaway key's); setup's own sends show that anvil.log records them. The prover's nonce
+    // and the claims are checked too, for completeness.
+    let anvil_log = std::fs::read_to_string(dir.0.join("anvil.log")).unwrap_or_default();
+    if !anvil_log.contains("eth_sendTransaction") {
+        failures.push(
+            "anvil.log has no eth_sendTransaction, though setup sent with it: it cannot show a \
+             raw send either"
+                .into(),
+        );
+    }
+    let raw_sends = anvil_log.matches("eth_sendRawTransaction").count();
     if raw_sends > 0 {
         failures.push(format!("the node received {raw_sends} raw transaction(s)"));
     }
@@ -1869,7 +2068,8 @@ async fn wait_fulfilled(world: &World, miner: &mut Miner, timeout: Duration) -> 
 /// After a mining run: exactly the claimable jobs fulfilled, each by us, with the program's journal
 /// and claimed in an earlier transaction (the seal is never broadcast before the lock), and each
 /// dispatched by the brain (the positive control for [`dispatched`], which the no-claim checks rely
-/// on); none of the others claimed and every one of them still Open; the prover's nonce moved from
+/// on); none of the others claimed, every one of them still Open, and those the brain must hold
+/// ([`Case::held_before_dispatch`]) never even dispatched; the prover's nonce moved from
 /// `nonce_before` by exactly a claim and a fulfil per claimable job; no collateral left locked; the
 /// stake whole; a clean exit (0, within [`DRAIN_GRACE`] of SIGINT).
 async fn check_settlement(
@@ -1942,6 +2142,13 @@ async fn check_settlement(
         } else {
             if claim.is_some() {
                 failures.push(format!("{:?}: claimed, but must never be", job.case));
+            }
+            if job.case.held_before_dispatch() && dispatched(lines, job.id) {
+                failures.push(format!(
+                    "{:?}: dispatched (`CLAIM {} (`), but the brain must hold it",
+                    job.case,
+                    short_id(job.id)
+                ));
             }
             if status != zkminer_chain::jobs::JOB_STATUS_OPEN || prover != Address::ZERO {
                 failures.push(format!(

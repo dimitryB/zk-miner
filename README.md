@@ -172,13 +172,23 @@ behind the market.
 Verbosity is `-v`/`-vv` **before** the subcommand (`RUST_LOG` is ignored). Logs go to
 stderr, so `zkminer benchmark --json` on stdout stays machine-readable.
 
-Two things worth knowing:
+Worth knowing:
 
 - **Don't run `benchmark` while the miner is running.** Both spawn a worker per GPU and
   the GPU lock is per-process, so they will double-book VRAM.
 - **If the miner sits idle with jobs available, suspect collateral.** Available
   collateral is `staked − locked`, and a claimed job that passes its deadline locks
   collateral permanently. This surfaces as a throttled warning at default verbosity.
+- **Stopping costs locks.** Ctrl-C (SIGINT) stops claiming and lets the jobs in flight
+  finish, for up to 50 minutes; a second signal stops waiting, and every lock still held is
+  then released. SIGTERM (a supervisor's stop, `systemctl stop`) releases every held lock at
+  once. Each release costs 5% of that lock's collateral. A miner that dies without releasing
+  picks its locks up again when it restarts, and drives each one with enough time left.
+- **One miner per home directory.** `run` holds `~/.zkminer/miner.lock`, and a second one
+  refuses to start (two would drive the same locks), including while the first is still
+  draining. `--watch-only` takes no lock.
+- **Rebuild every worker with the miner.** A worker built for another protocol version is
+  refused at start.
 
 `benchmark --calibrate` measures proving time at each segment size and only overrides the
 SDK's own choice when one size wins by a decisive margin — differences inside measurement
@@ -227,13 +237,17 @@ each test:
 
 - mints tHEMI and stakes a prover;
 - registers its programs, with storage URIs the test serves itself;
-- submits jobs covering the binding cases: three the miner must claim, and the rest (wrong
-  FULL or FIELDS journals, jobs reserved for another prover, the journal-prefix marker, a
-  decoy ELF whose image id is not the job's program, an unreachable ELF) it must refuse.
+- submits jobs covering the binding, assignment and collateral cases: four the miner must claim
+  (one of them assigned to another prover with no exclusivity window, which anyone may claim),
+  and the rest (wrong FULL or FIELDS journals, jobs reserved for another prover, a job inside
+  another prover's exclusivity window, a job whose 500% collateral exceeds the prover's whole
+  stake, the journal-prefix marker, a decoy ELF whose image id is not the job's program, an
+  unreachable ELF) it must refuse.
 
 Some jobs are submitted before the miner starts and some after, so both the startup backfill
-and the live monitor are covered. Nothing touches the real chain, and no key of yours is
-involved; each miner runs with its own HOME and a cleaned environment.
+and the live monitor are covered; the backfill starts at the first job's block, so one that
+starts a block late loses it. Nothing touches the real chain, and no key of yours is involved;
+each miner runs with its own HOME and a cleaned environment.
 
 ```bash
 cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda
@@ -242,12 +256,14 @@ cargo test -p zkminer-cli --test localnet -- --ignored --nocapture --test-thread
 ```
 
 - **`watch_only_reports_every_job`** (CPU only) runs `zkminer run --watch-only`, as the staked
-  prover and then as an unstaked address. It checks every job's verdict, that exactly the
-  claimable jobs would be claimed, and that nothing was sent.
+  prover and then as an unstaked address, with an unknown `RISC0_EXECUTOR` that the worker must
+  ignore. It checks every job's verdict, that exactly the claimable jobs would be claimed, that
+  every measured cycle count is a power of two, and that nothing was sent.
 - **`fulfils_with_a_replayed_receipt`** (CPU only) mines for real on the contract suite's RISC
   Zero receipt fixture, which the deployed verifier accepts: the mock worker replays the receipt
   instead of proving. It requires exactly the claimable jobs to be claimed and then fulfilled in a
-  later transaction, nothing released, and no collateral left locked.
+  later transaction, the exclusive and over-collateralised jobs never even dispatched, nothing
+  released, and no collateral left locked.
 - **`holds_its_lock_through_a_pause`**: a lock held while the router pauses is kept, then
   fulfilled after the lift.
 - **`holds_off_while_the_router_is_paused`**, **`refuses_to_claim_while_its_adapter_is_disabled`**,

@@ -31,6 +31,8 @@ getrandom = "0.3"
 hmac = "0.12"
 sha2 = "0.10"
 risc0-zkvm = { version = "3.0", default-features = false, features = ["prove"] }
+# Directly, to check a measured guest's keccak proof requests as the prover will (`KeccakAudit`).
+risc0-circuit-keccak = { version = "4.0", features = ["prove"] }
 # Directly, for `prove::release_srs`: the Groth16 SRS cache on the GPU has to be freed after each proof
 # on a card too small to hold it beside the next STARK. See `release_groth16_cache_if_tight`.
 risc0-groth16 = { version = "3.0" }

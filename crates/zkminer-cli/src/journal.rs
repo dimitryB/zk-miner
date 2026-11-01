@@ -43,6 +43,14 @@ pub struct JournalEntry {
     /// always re-read from chain before acting.
     pub lock_deadline: u64,
     pub state: JournalState,
+    /// A block at which the job was read Locked by us (0 = not seen yet). A read pinned at or after
+    /// it that shows another prover proves our lock is gone; an unpinned one may come from a replica
+    /// still showing the job's previous holder.
+    pub lock_block: u64,
+    /// The job's `reopenCount` when it read Locked by us. Every way a lock leaves its prover except a
+    /// pause's grace release (which only the prover sends) bumps it, so a higher count on ANY read,
+    /// pinned or not, proves our lock is gone.
+    pub lock_reopens: Option<u8>,
 }
 
 impl Default for JournalEntry {
@@ -54,6 +62,8 @@ impl Default for JournalEntry {
             submit_tx: None,
             lock_deadline: 0,
             state: JournalState::Claiming,
+            lock_block: 0,
+            lock_reopens: None,
         }
     }
 }
@@ -119,14 +129,33 @@ impl JobJournal {
     /// earlier claim tx of ours that is still pending (or mined unseen), and its age is what decides
     /// when that intent is given up.
     pub fn record_claim_intent(&mut self, job_id: B256, lock_deadline: u64, submit_tx: Option<B256>) {
-        self.entries.entry(job_id).or_insert(JournalEntry {
+        let now = chrono::Utc::now().timestamp();
+        let e = self.entries.entry(job_id).or_insert(JournalEntry {
             job_id,
-            claimed_at: chrono::Utc::now().timestamp(),
+            claimed_at: now,
             claim_tx: None,
             submit_tx,
             lock_deadline,
             state: JournalState::Claiming,
+            lock_block: 0,
+            lock_reopens: None,
         });
+        // A claim sent again (an earlier one stayed ambiguous): its age, which bounds how long an
+        // OPEN read is taken as "may still be pending", runs from this send.
+        if e.state == JournalState::Claiming {
+            e.claimed_at = now;
+        }
+    }
+
+    /// Record a block at which the job read Locked by us, if known, and its `reopenCount` there (see
+    /// [`JournalEntry::lock_block`], [`JournalEntry::lock_reopens`]).
+    pub fn note_lock_seen(&mut self, job_id: B256, block: Option<u64>, reopens: u8) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            if let Some(b) = block {
+                e.lock_block = e.lock_block.max(b);
+            }
+            e.lock_reopens = Some(e.lock_reopens.map_or(reopens, |r| r.max(reopens)));
+        }
     }
 
     pub fn mark_claimed(&mut self, job_id: B256, claim_tx: Option<B256>, lock_deadline: u64) {
@@ -137,6 +166,8 @@ impl JobJournal {
             submit_tx: None,
             lock_deadline,
             state: JournalState::Claimed,
+            lock_block: 0,
+            lock_reopens: None,
         });
         if claim_tx.is_some() {
             e.claim_tx = claim_tx;
@@ -209,20 +240,53 @@ mod tests {
     }
 
     #[test]
+    fn where_we_saw_our_lock_only_moves_forward() {
+        let mut j = JobJournal::default();
+        let jid = B256::repeat_byte(0x05);
+        j.note_lock_seen(jid, Some(10), 1);
+        assert!(!j.entries.contains_key(&jid), "no entry, nothing to note");
+        j.record_claim_intent(jid, 100, None);
+        assert_eq!(
+            (j.entries[&jid].lock_block, j.entries[&jid].lock_reopens),
+            (0, None)
+        );
+        j.note_lock_seen(jid, Some(10), 1);
+        j.note_lock_seen(jid, None, 0);
+        j.note_lock_seen(jid, Some(5), 0);
+        assert_eq!(
+            (j.entries[&jid].lock_block, j.entries[&jid].lock_reopens),
+            (10, Some(1))
+        );
+        j.note_lock_seen(jid, Some(20), 2);
+        assert_eq!(
+            (j.entries[&jid].lock_block, j.entries[&jid].lock_reopens),
+            (20, Some(2))
+        );
+        // An entry written before these fields existed loads with them unknown.
+        let old: JournalEntry = serde_json::from_str(r#"{"job_id":"0x0505050505050505050505050505050505050505050505050505050505050505","claimed_at":1,"lock_deadline":9,"state":"Claimed"}"#).unwrap();
+        assert_eq!((old.lock_block, old.lock_reopens), (0, None));
+    }
+
+    #[test]
     fn state_transitions() {
         let mut j = JobJournal::default();
         let jid = B256::repeat_byte(0x01);
         j.record_claim_intent(jid, 100, Some(B256::repeat_byte(0x02)));
         assert_eq!(j.entries[&jid].state, JournalState::Claiming);
-        // A second claim intent never overwrites an existing entry (it may track an unresolved
-        // earlier claim): its age and data stay.
-        let before = j.entries[&jid].claimed_at;
+        // A second claim intent never overwrites an existing entry's data (it may track an
+        // unresolved earlier claim), but a claim sent again restarts its age: an OPEN read is "may
+        // still be pending" for as long after the LATEST send.
+        j.entries.get_mut(&jid).unwrap().claimed_at = 1;
         j.record_claim_intent(jid, 999, None);
-        assert_eq!(j.entries[&jid].claimed_at, before);
+        assert!(j.entries[&jid].claimed_at > 1);
         assert_eq!(j.entries[&jid].lock_deadline, 100);
         assert_eq!(j.entries[&jid].submit_tx, Some(B256::repeat_byte(0x02)));
         j.mark_claimed(jid, None, 100);
         assert_eq!(j.entries[&jid].state, JournalState::Claimed);
+        // Past Claiming, the age is the lock's and stays.
+        j.entries.get_mut(&jid).unwrap().claimed_at = 1;
+        j.record_claim_intent(jid, 999, None);
+        assert_eq!(j.entries[&jid].claimed_at, 1);
         j.mark_proving(jid);
         assert_eq!(j.entries[&jid].state, JournalState::Proving);
         j.mark_fulfilling(jid);

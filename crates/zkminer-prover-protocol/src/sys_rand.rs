@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 /// Carries the key, hex-encoded, from the miner to each risc0 worker it spawns.
 pub const SYS_RAND_KEY_ENV: &str = "ZKMINER_RISC0_SYS_RAND_KEY";
 
+/// Set to `1` beside [`SYS_RAND_KEY_ENV`] when the key is for this miner run only (the file was
+/// unusable): the workers still agree with each other, but a lock re-proved after a restart would
+/// not, so they report no journal to check a binding against.
+pub const SYS_RAND_KEY_EPHEMERAL_ENV: &str = "ZKMINER_RISC0_SYS_RAND_EPHEMERAL";
+
 /// Where the key lives under `home`.
 pub fn key_path(home: &Path) -> PathBuf {
     home.join(".zkminer").join("risc0-sys-rand.key")

@@ -27,6 +27,10 @@ const FULFIL_RECEIPT_WAIT: Duration = Duration::from_secs(14);
 /// After an unconfirmed fulfil attempt, how long to poll job state before re-publishing (the next
 /// attempt's lock read is a state check too).
 const FULFIL_STATE_POLL: Duration = Duration::from_secs(4);
+/// A fulfil pending at its fee ceiling can't be bumped: wait this long for it between re-publishes
+/// (each re-publish also re-broadcasts it, should a node have dropped it), reading once a block.
+const FULFIL_HELD_WAIT: Duration = Duration::from_secs(60);
+const FULFIL_HELD_POLL: Duration = Duration::from_secs(12);
 /// Wait between reads while a lagging replica's head is still below a block we hold a receipt for.
 const LAG_RETRY_WAIT: Duration = Duration::from_secs(2);
 /// Per-rung receipt wait and state poll on the RELEASE ladder (~3 blocks + 1). The release window
@@ -1114,6 +1118,71 @@ impl ChainClient {
         Ok(cap.min(U256::from(u128::MAX)).to::<u128>())
     }
 
+    /// [`get_job_snapshots`](Self::get_job_snapshots) for many jobs: two Multicall3 requests per 25
+    /// jobs, both pinned at one fresh head. `getJobSnapshots` does not revert for a job the serving
+    /// node hasn't seen — it answers with the live defaults — so each job's `jobs()` record is read at
+    /// the same block, and only a job that exists there gets `Some`. A replica behind that block
+    /// fails the pinned call rather than answering for an older state. `None` = unknown for now.
+    pub async fn get_job_snapshots_batch(
+        &self,
+        job_ids: &[B256],
+    ) -> Result<Vec<(B256, Option<(u128, u128, u128)>)>> {
+        use alloy::providers::MulticallItem;
+        const MC_CHUNK: usize = 25;
+        if job_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let head = self
+            .provider
+            .get_block_number()
+            .await
+            .context("getJobSnapshots: block number")?;
+        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
+        let clamp = |v: U256| v.min(U256::from(u128::MAX)).to::<u128>();
+        let mut out = Vec::with_capacity(job_ids.len());
+        for chunk in job_ids.chunks(MC_CHUNK) {
+            let mut snaps = self
+                .provider
+                .multicall()
+                .dynamic::<IHemiProveAux::getJobSnapshotsCall>()
+                .block(BlockId::number(head));
+            let mut recs = self
+                .provider
+                .multicall()
+                .dynamic::<IHemiProveAux::jobsCall>()
+                .block(BlockId::number(head));
+            for jid in chunk {
+                snaps = snaps.add_call_dynamic(aux.getJobSnapshots(*jid).into_call(true));
+                recs = recs.add_call_dynamic(aux.jobs(*jid).into_call(true));
+            }
+            let (snaps, recs) = match (snaps.aggregate3().await, recs.aggregate3().await) {
+                (Ok(s), Ok(r)) => (s, r),
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::debug!("getJobSnapshots batch at block {head} failed: {e:#}");
+                    out.extend(chunk.iter().map(|jid| (*jid, None)));
+                    continue;
+                }
+            };
+            for ((jid, snap), rec) in chunk.iter().zip(snaps).zip(recs) {
+                let exists = rec
+                    .ok()
+                    .and_then(|w| JobRecord::from_words(&w).ok())
+                    .is_some_and(|r| r.caller != Address::ZERO);
+                out.push((
+                    *jid,
+                    snap.ok().filter(|_| exists).map(|r| {
+                        (
+                            clamp(r.releasePenaltyBps),
+                            clamp(r.minCollateral),
+                            clamp(r.collateralBps),
+                        )
+                    }),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     /// `bidConfigs(jobId).underbidWindow`: non-zero means a COMPETITIVE job (priced by public,
     /// binding descending bids once a round starts). Immutable per job.
     pub async fn get_underbid_window(&self, job_id: B256) -> Result<u64> {
@@ -1570,12 +1639,7 @@ impl ChainClient {
 
         let quote = match self.quote_claim(job_id).await {
             Ok(q) => q,
-            Err(e) => {
-                if e.downcast_ref::<ClaimFailure>().is_some_and(|f| f.class == ClaimClass::Gone) {
-                    forget_claim_high_water(job_id);
-                }
-                return self.reconcile_claim_refusal(job_id, e).await;
-            }
+            Err(e) => return self.reconcile_claim_refusal(job_id, e).await,
         };
         // A quote below our high-water mark is a Wait refusal like any other: it can come from a
         // replica lagging behind a block where an EARLIER claim of ours already locked the job, so it
@@ -1603,9 +1667,6 @@ impl ChainClient {
             }
             Err(e) => {
                 if let Some(f) = e.downcast_ref::<ClaimFailure>() {
-                    if f.class == ClaimClass::Gone {
-                        forget_claim_high_water(job_id);
-                    }
                     if f.definitely_not_locked {
                         return self.reconcile_claim_refusal(job_id, e).await;
                     }
@@ -1657,11 +1718,20 @@ impl ChainClient {
                     settled_price: None,
                 }))
             }
+            // Another prover's lock keeps the mark (handoff/guide: a sybil's settle is such a lock, and
+            // the job can come back at its lower price); only a job that can never be claimed again
+            // drops it.
             Ok((rec, _)) if rec.prover != Address::ZERO && rec.prover != self.address => {
-                forget_claim_high_water(job_id);
                 Ok(ClaimOutcome::LostRace)
             }
-            Ok(_) => Err(e),
+            Ok((rec, _)) => {
+                if rec.reopen_count >= MAX_REOPEN_COUNT
+                    || (rec.status != JOB_STATUS_OPEN && rec.status != JOB_STATUS_LOCKED)
+                {
+                    forget_claim_high_water(job_id);
+                }
+                Err(e)
+            }
             Err(re) => Err(ClaimFailure {
                 definitely_not_locked: false,
                 reason: format!("{} (ownership unconfirmed: {re:#})", f.reason),
@@ -1929,11 +1999,14 @@ impl ChainClient {
                                 "fulfillJob at nonce {nonce} is pending at its fee ceiling (attempt \
                                  {attempt}/{MAX_ATTEMPTS}) — waiting for it"
                             );
-                            let mut poll_end = std::time::Instant::now() + FULFIL_RECEIPT_WAIT;
+                            let mut poll_end = std::time::Instant::now() + FULFIL_HELD_WAIT;
                             if let Some(b) = budget {
                                 poll_end = poll_end.min(started + b);
                             }
-                            if self.poll_fulfilled_until(job_id, poll_end).await {
+                            if self
+                                .poll_fulfilled_until(job_id, poll_end, FULFIL_HELD_POLL)
+                                .await
+                            {
                                 self.abort_nonce(nonce);
                                 tracing::info!(
                                     "Job {} Fulfilled (confirmed via state poll)",
@@ -2120,7 +2193,10 @@ impl ChainClient {
                     if let Some(b) = budget {
                         poll_end = poll_end.min(started + b);
                     }
-                    if self.poll_fulfilled_until(job_id, poll_end).await {
+                    if self
+                        .poll_fulfilled_until(job_id, poll_end, Duration::from_secs(5))
+                        .await
+                    {
                         self.abort_nonce(nonce);
                         tracing::info!("Job {} Fulfilled (confirmed via state poll)", job_id);
                         return Ok(());
@@ -2157,8 +2233,13 @@ impl ChainClient {
         ))
     }
 
-    /// Poll `jobs()` until `poll_end` for this job Fulfilled by us.
-    async fn poll_fulfilled_until(&self, job_id: B256, poll_end: std::time::Instant) -> bool {
+    /// Poll `jobs()` every `every` until `poll_end` for this job Fulfilled by us.
+    async fn poll_fulfilled_until(
+        &self,
+        job_id: B256,
+        poll_end: std::time::Instant,
+        every: Duration,
+    ) -> bool {
         while std::time::Instant::now() < poll_end {
             let call_budget = poll_end.saturating_duration_since(std::time::Instant::now());
             if let Ok(Ok((rec, _))) =
@@ -2168,7 +2249,10 @@ impl ChainClient {
                     return true;
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(
+                every.min(poll_end.saturating_duration_since(std::time::Instant::now())),
+            )
+            .await;
         }
         false
     }
@@ -2197,7 +2281,7 @@ impl ChainClient {
     /// after a release the job reopens (prover cleared) or is reclaimed by another
     /// prover — in every case our collateral is no longer tied to a lock we hold.
     pub async fn release_job(&self, job_id: B256) -> Result<()> {
-        self.release_job_with_nonce(job_id, None).await
+        self.release_job_with_nonce(job_id, None, None).await
     }
 
     /// As [`Self::release_job`], but starts from a nonce the CALLER already reserved.
@@ -2212,6 +2296,7 @@ impl ChainClient {
         &self,
         job_id: B256,
         preassigned: Option<u64>,
+        lock_block: Option<u64>,
     ) -> Result<()> {
         const MAX_ATTEMPTS: u32 = MAX_TX_ATTEMPTS;
         let fulfill = IHemiProveFulfill::new(self.hemi_prove, &*self.provider);
@@ -2258,8 +2343,10 @@ impl ChainClient {
         // This path is the one that DELETES it: our `Ok(())` makes `release_and_clean` drop
         // the breadcrumb, which is the only record that collateral is locked — after which
         // the drain union, the abandon list and the EX_TEMPFAIL exit gate (all
-        // `active_jobs ∪ journal`) can never see the lock again. Positive evidence (prover
-        // set to a DIFFERENT address) is still accepted immediately.
+        // `active_jobs ∪ journal`) can never see the lock again. Before broadcasting, a DIFFERENT
+        // prover is accepted at once only when no block of our lock is known; given `lock_block`,
+        // only a read pinned at or after it decides (an unpinned replica behind our claim still
+        // shows the job's previous holder, or none).
         let mut broadcast = false;
 
         for attempt in 1..=MAX_ATTEMPTS {
@@ -2267,7 +2354,18 @@ impl ChainClient {
             // never saw, or the job was reopened/slashed out from under us). Our lock
             // being gone means our collateral is free — treat as success.
             if let Ok(view) = self.get_job_status_view(job_id).await {
-                if view.prover != self.address && (broadcast || view.prover != Address::ZERO) {
+                let gone = view.prover != self.address
+                    && (broadcast
+                        || match lock_block {
+                            None => view.prover != Address::ZERO,
+                            // Pinned at or after a block where the job was ours: anyone else, or
+                            // no one, holding it there means our lock is gone.
+                            Some(b) => matches!(
+                                self.read_job_record(job_id, Some(b)).await,
+                                Ok((rec, _)) if rec.prover != self.address
+                            ),
+                        });
+                if gone {
                     // Our lock is gone (release landed, or the fulfill we were displacing
                     // actually mined) → success. Recycle the nonce; self-heals if consumed.
                     self.abort_nonce(nonce);

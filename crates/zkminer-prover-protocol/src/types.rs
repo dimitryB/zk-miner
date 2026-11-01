@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 /// handshake reject a mismatched (old) worker at spawn rather than fail cryptically at first Execute.
 /// 7: `ExecuteResult` gained `journal`, the bytes the host checks a job's journal binding against
 /// before claiming it.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// 8: no new field, a new meaning: risc0 `ExecuteResult.cycles` is the padded proving total (plus
+/// the keccak proofs), the `sys_rand` seed hashes the image id and the key comes from the miner. A
+/// v7 risc0 worker would measure in other units and seed guests differently from a v8 one proving
+/// the same job, so the handshake refuses it.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The longest journal an `ExecuteResult` carries. The router refuses a longer one on every fulfil
 /// path (`MAX_JOURNAL_BYTES`, `JournalTooLarge`), so a longer journal is reported by its length alone.

@@ -62,7 +62,7 @@ impl Decoded {
     pub fn name(&self) -> String {
         match self {
             Decoded::Hemi(e) => format!("{e:?}")
-                .split(|c: char| c == '(' || c == ' ' || c == '{')
+                .split(['(', ' ', '{'])
                 .next()
                 .unwrap_or("HemiError")
                 .to_string(),

@@ -127,6 +127,15 @@ pub fn keccak_offsets_zeroed(code: &[u8], offsets: &[usize]) -> Option<B256> {
     Some(keccak256(&buf))
 }
 
+/// Whether every 32-byte word of `code` at `offsets` is `word`: the immutables
+/// [`keccak_offsets_zeroed`] blanks must hold the value the caller then pins, or the pinned value and
+/// the one the code actually uses can differ.
+pub fn immutables_are(code: &[u8], offsets: &[usize], word: B256) -> bool {
+    offsets
+        .iter()
+        .all(|&off| code.get(off..off + 32) == Some(word.as_slice()))
+}
+
 /// Whether the operator opted out of the audited-code checks (e.g. a governance upgrade landed
 /// before this zkminer shipped its pins). Never skips the chain-id, address or wiring checks.
 fn code_pins_skipped() -> bool {
@@ -367,7 +376,13 @@ impl ChainClient {
             .context("adapter.nativeVerifier()")?;
         if !code_pins_skipped() {
             let acode = self.provider.get_code_at(entry.adapter).await.context("adapter code")?;
-            if keccak_offsets_zeroed(&acode, &pins::RISC0_GROTH16_ADAPTER_IMMUTABLES)
+            // Its immutables are its verifier: each must be the `nativeVerifier()` pinned below, or
+            // `verifyProof` could call another one (VerifierPins._adapterProblem checks the same).
+            if !immutables_are(
+                &acode,
+                &pins::RISC0_GROTH16_ADAPTER_IMMUTABLES,
+                B256::left_padding_from(native.as_slice()),
+            ) || keccak_offsets_zeroed(&acode, &pins::RISC0_GROTH16_ADAPTER_IMMUTABLES)
                 != Some(pins::RISC0_GROTH16_ADAPTER)
             {
                 return Err(ProofSystemRefused(format!(
@@ -408,6 +423,30 @@ impl ChainClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_adapters_immutables_must_all_be_its_verifier() {
+        let verifier = B256::left_padding_from(&[0xAB; 20]);
+        let mut code = vec![0u8; 200];
+        for off in [10, 100] {
+            code[off..off + 32].copy_from_slice(verifier.as_slice());
+        }
+        assert!(immutables_are(&code, &[10, 100], verifier));
+        assert!(!immutables_are(
+            &code,
+            &[10, 100],
+            B256::left_padding_from(&[0xCD; 20])
+        ));
+        code[100] ^= 1;
+        assert!(
+            !immutables_are(&code, &[10, 100], verifier),
+            "one reference differs"
+        );
+        assert!(
+            !immutables_are(&code, &[10, 190], verifier),
+            "out of the code"
+        );
+    }
 
     #[test]
     fn self_zeroing_matches_the_repos_method() {
