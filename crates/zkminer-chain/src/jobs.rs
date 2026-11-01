@@ -1102,6 +1102,18 @@ impl ChainClient {
         Ok((clamp(r.releasePenaltyBps), clamp(r.minCollateral), clamp(r.collateralBps)))
     }
 
+    /// `getPremiumCap(jobId)`: the most of the job's speed premium a fulfil can still earn (each
+    /// release lowers it, a slash zeroes it).
+    pub async fn get_premium_cap(&self, job_id: B256) -> Result<u128> {
+        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
+        let cap = aux
+            .getPremiumCap(job_id)
+            .call()
+            .await
+            .context("getPremiumCap")?;
+        Ok(cap.min(U256::from(u128::MAX)).to::<u128>())
+    }
+
     /// `bidConfigs(jobId).underbidWindow`: non-zero means a COMPETITIVE job (priced by public,
     /// binding descending bids once a round starts). Immutable per job.
     pub async fn get_underbid_window(&self, job_id: B256) -> Result<u64> {
@@ -1194,21 +1206,23 @@ impl ChainClient {
     /// anything (watch-only runs): the same ownership and reopen pre-checks, then the same quote.
     /// A refused quote is returned as the typed [`ClaimFailure`] the claim would have hit.
     pub async fn preview_claim(&self, job_id: B256) -> Result<ClaimPreview> {
-        let (rec, at) = self.read_job_record(job_id, None).await?;
-        if rec.prover != Address::ZERO {
-            return Ok(ClaimPreview::Held(rec.prover));
-        }
-        if rec.reopen_count >= MAX_REOPEN_COUNT {
-            return Err(ClaimFailure {
-                class: ClaimClass::Gone,
-                reason: format!(
-                    "job at {} reopens (MaxReopenCountReached)",
-                    rec.reopen_count
-                ),
-                definitely_not_locked: true,
-                block: Some(at),
+        // An unreadable record skips these pre-checks and goes to the quote, as the real claim does.
+        if let Ok((rec, at)) = self.read_job_record(job_id, None).await {
+            if rec.prover != Address::ZERO {
+                return Ok(ClaimPreview::Held(rec.prover));
             }
-            .into());
+            if rec.reopen_count >= MAX_REOPEN_COUNT {
+                return Err(ClaimFailure {
+                    class: ClaimClass::Gone,
+                    reason: format!(
+                        "job at {} reopens (MaxReopenCountReached)",
+                        rec.reopen_count
+                    ),
+                    definitely_not_locked: true,
+                    block: Some(at),
+                }
+                .into());
+            }
         }
         Ok(ClaimPreview::Claimable(self.quote_claim(job_id).await?))
     }
@@ -1826,6 +1840,9 @@ impl ChainClient {
                 .saturating_add(extra_gas);
 
             let mut bid: Option<(u128, u128, u128)> = None;
+            // The bid is at its ceiling: a re-publish is byte-identical, so the node answers "already
+            // known" and there is nothing to bump.
+            let mut held = false;
             let send_result = {
                 let _guard = self.tx_lock.lock().await;
                 let mut tx = fulfill
@@ -1855,7 +1872,11 @@ impl ChainClient {
                         RELEASE_DISPLACE_RUNGS,
                         affordable,
                     ) {
-                        JobBid::Send(t, m) | JobBid::Hold(t, m) => (t, m),
+                        JobBid::Send(t, m) => (t, m),
+                        JobBid::Hold(t, m) => {
+                            held = true;
+                            (t, m)
+                        }
                         JobBid::Exhausted => {
                             if let Some(st) = self.nonce_fee_floor_state(nonce) {
                                 log_fee_cap_exhausted("fulfillJob", nonce, &st);
@@ -1900,6 +1921,28 @@ impl ChainClient {
                     // verifier revert reason can carry terminal escapes).
                     let msg = crate::programs::sanitize_log(&raw);
                     if is_same_nonce_pending(&raw) {
+                        if held && published {
+                            // Our fulfil is pending at the ceiling bid: wait for it, as an unconfirmed
+                            // receipt does, rather than burn the remaining attempts (and the shared RPC
+                            // budget) in seconds re-sending the same bytes.
+                            tracing::info!(
+                                "fulfillJob at nonce {nonce} is pending at its fee ceiling (attempt \
+                                 {attempt}/{MAX_ATTEMPTS}) — waiting for it"
+                            );
+                            let mut poll_end = std::time::Instant::now() + FULFIL_RECEIPT_WAIT;
+                            if let Some(b) = budget {
+                                poll_end = poll_end.min(started + b);
+                            }
+                            if self.poll_fulfilled_until(job_id, poll_end).await {
+                                self.abort_nonce(nonce);
+                                tracing::info!(
+                                    "Job {} Fulfilled (confirmed via state poll)",
+                                    job_id
+                                );
+                                return Ok(());
+                            }
+                            continue;
+                        }
                         tracing::warn!("fulfillJob replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — bumping fee, keeping nonce");
                         if attempt < MAX_ATTEMPTS {
                             tokio::time::sleep(nonce_retry_backoff(
@@ -2077,19 +2120,10 @@ impl ChainClient {
                     if let Some(b) = budget {
                         poll_end = poll_end.min(started + b);
                     }
-                    while std::time::Instant::now() < poll_end {
-                        let call_budget =
-                            poll_end.saturating_duration_since(std::time::Instant::now());
-                        if let Ok(Ok((rec, _))) =
-                            tokio::time::timeout(call_budget, self.read_job_record(job_id, None)).await
-                        {
-                            if rec.status == JOB_STATUS_FULFILLED && rec.prover == self.address {
-                                self.abort_nonce(nonce);
-                                tracing::info!("Job {} Fulfilled (confirmed via state poll)", job_id);
-                                return Ok(());
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    if self.poll_fulfilled_until(job_id, poll_end).await {
+                        self.abort_nonce(nonce);
+                        tracing::info!("Job {} Fulfilled (confirmed via state poll)", job_id);
+                        return Ok(());
                     }
                 }
             }
@@ -2121,6 +2155,22 @@ impl ChainClient {
             format!("fulfillJob not confirmed after {attempt} attempt(s) (RPC may be dropping txs)"),
             published,
         ))
+    }
+
+    /// Poll `jobs()` until `poll_end` for this job Fulfilled by us.
+    async fn poll_fulfilled_until(&self, job_id: B256, poll_end: std::time::Instant) -> bool {
+        while std::time::Instant::now() < poll_end {
+            let call_budget = poll_end.saturating_duration_since(std::time::Instant::now());
+            if let Ok(Ok((rec, _))) =
+                tokio::time::timeout(call_budget, self.read_job_record(job_id, None)).await
+            {
+                if rec.status == JOB_STATUS_FULFILLED && rec.prover == self.address {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        false
     }
 
     /// After a fulfil gives up: if anything was broadcast at `nonce`, STASH it for this job (it may

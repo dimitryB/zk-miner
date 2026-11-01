@@ -57,6 +57,15 @@ fn sanitize_worker_line(line: &str) -> String {
     out
 }
 
+/// The `sys_rand` key the miner hands every risc0 worker it spawns (see
+/// `zkminer_prover_protocol::sys_rand`). Unset (a benchmark, the tests): each worker reads the file.
+static RISC0_SYS_RAND_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// Set the key passed to risc0 workers spawned from now on. Once per process.
+pub fn set_risc0_sys_rand_key(key: [u8; 32]) {
+    let _ = RISC0_SYS_RAND_KEY.set(key);
+}
+
 /// When true, worker stderr forwarding is suppressed (TUI mode).
 static SUPPRESS_WORKER_STDERR: AtomicBool = AtomicBool::new(false);
 
@@ -498,10 +507,11 @@ impl WorkerHandle {
         // `env_clear()` alone, so PATH / HOME / LD_LIBRARY_PATH / CUDA_* and everything the worker
         // genuinely needs are preserved. The dispatcher's explicit overrides are applied last.
         cmd.env_clear();
+        use zkminer_prover_protocol::sys_rand::{encode_key, SYS_RAND_KEY_ENV};
         for (k, v) in std::env::vars_os() {
             let is_secret = k
                 .to_str()
-                .map(is_secret_env_name)
+                .map(|n| is_secret_env_name(n) || n == SYS_RAND_KEY_ENV)
                 .unwrap_or(false);
             if !is_secret {
                 cmd.env(k, v);
@@ -510,6 +520,12 @@ impl WorkerHandle {
 
         for (k, v) in env_overrides {
             cmd.env(k, v);
+        }
+        // Only a risc0 worker gets the `sys_rand` key, and only the one this miner loaded.
+        if backend.starts_with("risc0") {
+            if let Some(key) = RISC0_SYS_RAND_KEY.get() {
+                cmd.env(SYS_RAND_KEY_ENV, encode_key(key));
+            }
         }
 
         // Kill worker if parent process dies (prevents orphan GPU processes after host crash).

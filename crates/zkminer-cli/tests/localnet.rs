@@ -4,7 +4,8 @@
 //! checks pin. Each test then sets up, on the fork only:
 //! - tHEMI for a submitter and a prover, minted as the token's owner;
 //! - the prover's stake;
-//! - programs in the ProgramRegistry, with storage URIs this test serves over HTTP;
+//! - programs in the ProgramRegistry, with storage URIs this test serves over HTTP (an id someone
+//!   already registered on 743111 is first cleared, as the registry's owner);
 //! - jobs covering the binding cases (see [`Case`]): three the miner must claim, the rest it must
 //!   refuse. Some are submitted before the miner starts and some after.
 //!
@@ -19,10 +20,12 @@
 //!   RISC Zero receipt fixture, which the deployed verifier accepts. The mock worker replays that
 //!   receipt instead of proving, so the miner claims and fulfils for real on the fork: every
 //!   on-chain step of mining, on a CPU. Checks exactly the claimable jobs are fulfilled, each
-//!   claimed in an earlier transaction than its fulfil, nothing else is claimed or released, and
-//!   no collateral is left locked.
-//! - `holds_its_lock_through_a_pause`: a lock held while the router pauses is kept, not released,
-//!   and fulfilled after the lift.
+//!   dispatched and claimed in an earlier transaction than its fulfil, nothing else is claimed or
+//!   released (the prover sends just a claim and a fulfil per job), and no collateral is left
+//!   locked.
+//! - `holds_its_lock_through_a_pause`: a lock held while the router pauses is kept, not released:
+//!   its fulfil is held with nothing sent for longer than the nonce-gap watchdog takes to act, and
+//!   sent after the lift.
 //! - `holds_off_while_the_router_is_paused`, `refuses_to_claim_while_its_adapter_is_disabled`,
 //!   `refuses_to_claim_on_a_skewed_clock`: the miner's own gates hold every claim (no claim is
 //!   dispatched, nothing is sent); the paused one claims and fulfils after the lift.
@@ -53,7 +56,7 @@
 //! - `ZKMINER_LOCALNET_EXPECT_CLAIMS=0`: in the watch test, don't require the would-claim verdicts
 //!   (for a host whose capacity or memory gates refuse every claim).
 //! - `ZKMINER_LOCALNET_MINE=1`, `ZKMINER_LOCALNET_MINE_TIMEOUT_SECS` (default 1800): the mining
-//!   test.
+//!   test. It honours `CUDA_VISIBLE_DEVICES` (see `mines_the_claimable_jobs`).
 #![cfg(unix)]
 
 use alloy::primitives::aliases::{U40, U96};
@@ -64,7 +67,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -80,7 +83,9 @@ use zkminer_contracts::bindings::{
 
 /// The 743111 block the fork starts from by default, after the deployment's setup. Move it forward
 /// whenever `zkminer_chain::deployment::HEMI_TESTNET_743111` changes: the fork would otherwise run
-/// the old deployment, and zkminer's startup checks refuse it.
+/// the old deployment, and zkminer's startup checks refuse it. A later block is fine even once
+/// someone registers this test's programs on 743111 (their ids are content-derived): setup clears
+/// such a registration first (see [`register_program`]).
 const FORK_BLOCK: u64 = 7_116_900;
 const DEFAULT_FORK_URL: &str = "https://testnet.rpc.hemi.network/rpc";
 const HEMI: u128 = 1_000_000_000_000_000_000;
@@ -107,6 +112,17 @@ const PROVER_STAKE: u128 = 1_000 * HEMI;
 const WATCH_TIMEOUT: Duration = Duration::from_secs(420);
 /// How long the replay tests wait for their fulfils.
 const REPLAY_TIMEOUT: Duration = Duration::from_secs(420);
+/// How long the mock proof takes in `holds_its_lock_through_a_pause`: the router's pause, sent once
+/// the job is claimed, must land well before the fulfil could.
+const PAUSE_PROVE_DELAY: Duration = Duration::from_secs(60);
+/// How long that test keeps the router paused once the fulfil is held: longer than the nonce-gap
+/// watchdog takes to fill a gap (within ~2 minutes: a probe a minute, filling a gap that has
+/// persisted 45 s), so a hold that touched the nonce allocator would show as a sent transaction.
+const PAUSE_HOLD: Duration = Duration::from_secs(150);
+/// How long a miner with nothing in flight may take to exit after SIGINT.
+const STOP_GRACE: Duration = Duration::from_secs(60);
+/// How long a mining miner may take to drain and exit after SIGINT.
+const DRAIN_GRACE: Duration = Duration::from_secs(120);
 /// After the outcome a test waits for, how long it keeps watching before its final checks, so a
 /// wrong claim or verdict that lands just after is still seen (several of the brain's 5 s ticks).
 const SETTLE: Duration = Duration::from_secs(30);
@@ -722,15 +738,21 @@ impl World {
         world
     }
 
-    /// Call `contract` as its `owner()`, which anvil impersonates.
-    async fn call_as_owner(&self, contract: Address, data: Vec<u8>, what: &str) {
-        let owner = owner_of(&self.provider, contract).await;
-        set_balance(&self.provider, owner, HEMI).await;
+    /// `contract`'s `owner()`, funded for gas (anvil impersonates it). On a fork the lookup and the
+    /// funding can each wait on the upstream RPC, so a test whose owner transaction must land at
+    /// once resolves the owner before the miner starts.
+    async fn funded_owner(&self, contract: Address) -> Address {
+        funded_owner(&self.provider, contract).await
+    }
+
+    /// Send `data` to `contract` from `from` (anvil impersonates it) and require success. Returns
+    /// the block it was mined in.
+    async fn send_as(&self, from: Address, contract: Address, data: Vec<u8>, what: &str) -> u64 {
         let receipt = tokio::time::timeout(SETUP_TX_TIMEOUT, async {
             self.provider
                 .send_transaction(
                     TransactionRequest::default()
-                        .from(owner)
+                        .from(from)
                         .to(contract)
                         .input(Bytes::from(data).into()),
                 )
@@ -743,16 +765,28 @@ impl World {
         .await
         .unwrap_or_else(|_| panic!("{what}: not mined within {SETUP_TX_TIMEOUT:?}"));
         assert!(receipt.status(), "{what} reverted");
+        receipt
+            .block_number
+            .unwrap_or_else(|| panic!("{what}: a receipt without a block"))
     }
 
-    async fn set_router_paused(&self, paused: bool) {
+    /// Call `contract` as its `owner()`.
+    async fn call_as_owner(&self, contract: Address, data: Vec<u8>, what: &str) {
+        let owner = self.funded_owner(contract).await;
+        self.send_as(owner, contract, data, what).await;
+    }
+
+    /// Pause or unpause the router as `owner`, its owner from [`World::funded_owner`]. Returns the
+    /// block the transaction was mined in.
+    async fn set_router_paused(&self, owner: Address, paused: bool) -> u64 {
         let selector = if paused { "pause()" } else { "unpause()" };
-        self.call_as_owner(
+        self.send_as(
+            owner,
             DEPLOYMENT.router,
             keccak256(selector).0[..4].to_vec(),
             &format!("router {selector}"),
         )
-        .await;
+        .await
     }
 
     async fn disable_risc0_adapter(&self) {
@@ -845,10 +879,9 @@ impl World {
 
     /// Submit the jobs held back for the live monitor, once the miner's monitor runs.
     async fn submit_after_start(&mut self, miner: &mut Miner) {
-        assert!(
-            wait_for_line(miner, "Job monitor started", Duration::from_secs(120)).await,
-            "the miner's job monitor did not start within 120 s"
-        );
+        if !wait_for_line(miner, "Job monitor started", Duration::from_secs(120)).await {
+            miner.fail("the miner's job monitor did not start within 120 s");
+        }
         for case in self.cases.clone().into_iter().filter(|c| !c.before_start()) {
             self.submit(case).await;
         }
@@ -913,7 +946,8 @@ impl World {
             std::os::unix::fs::symlink(worker, &link).unwrap();
             c.prover.worker_search_paths = vec![provers.display().to_string()];
         } else {
-            // Named outright, so a host without a GPU still gets the risc0 measure pool.
+            // Named outright, so a host without a GPU still gets the risc0 measure pool, and the
+            // dispatcher pins no CUDA_VISIBLE_DEVICES on it: the environment's setting holds.
             c.prover
                 .worker_binaries
                 .insert("risc0".into(), worker.display().to_string());
@@ -945,7 +979,32 @@ async fn owner_of(provider: &DynProvider, contract: Address) -> Address {
     Address::from_word(B256::from_slice(&word))
 }
 
+/// A contract's `owner()`, funded for gas: anvil impersonates it.
+async fn funded_owner(provider: &DynProvider, contract: Address) -> Address {
+    let owner = owner_of(provider, contract).await;
+    set_balance(provider, owner, HEMI).await;
+    owner
+}
+
+alloy::sol! {
+    /// The ProgramRegistry's governance calls (`onlyOwner`), which zkminer's bindings leave out
+    /// (zkmarket c8333aa, `src/core/ProgramRegistry.sol`).
+    #[sol(rpc)]
+    interface IProgramRegistryGovernance {
+        function revokeProgram(bytes32 programId, string calldata reason) external;
+        function clearRevokedProgram(bytes32 programId) external;
+    }
+}
+
+/// `ProgramStatus.Revoked`: a `ProgramVersion`'s `status` once governance revokes it.
+const PROGRAM_REVOKED: u8 = 2;
+
 /// Register `id` in the ProgramRegistry (permissionless) with one HTTP storage URI.
+///
+/// The ids are content-derived (an image id, a fixed hash), so anyone may already have registered
+/// one on 743111, with storage URIs this test does not serve. Such a registration is first revoked
+/// (unless it already is) and cleared, as the registry's owner: `clearRevokedProgram` deletes the
+/// record, its URIs, its build hashes and any pending registrant, so the id registers afresh.
 async fn register_program(
     provider: &DynProvider,
     from: Address,
@@ -955,15 +1014,33 @@ async fn register_program(
     content_hash: B256,
 ) {
     let registry = IProgramRegistry::new(DEPLOYMENT.program_registry, provider);
-    assert!(
-        !registry
-            .isRegistered(id)
-            .call()
-            .await
-            .expect("isRegistered"),
-        "program {id} ({name}) is already registered at the fork block, with storage URIs this \
-         test does not serve: move FORK_BLOCK to before its registration, or test another program"
-    );
+    if registry
+        .isRegistered(id)
+        .call()
+        .await
+        .expect("isRegistered")
+    {
+        let earlier = registry.getProgram(id).call().await.expect("getProgram");
+        eprintln!(
+            "localnet: program {id} ({name}) is already registered at the fork block (by {}, \
+             status {}): clearing it as the registry's owner",
+            earlier.registrant, earlier.status
+        );
+        let owner = funded_owner(provider, DEPLOYMENT.program_registry).await;
+        let governance = IProgramRegistryGovernance::new(DEPLOYMENT.program_registry, provider);
+        if earlier.status != PROGRAM_REVOKED {
+            mined!(
+                governance
+                    .revokeProgram(id, "zkminer localnet: re-registered on a local fork".into())
+                    .from(owner),
+                format!("revoke the earlier registration of {name}")
+            );
+        }
+        mined!(
+            governance.clearRevokedProgram(id).from(owner),
+            format!("clear the earlier registration of {name}")
+        );
+    }
     mined!(
         registry
             .registerProgram(
@@ -1117,12 +1194,15 @@ fn path_without_workers() -> String {
 struct Miner {
     child: Child,
     lines: Arc<Mutex<Vec<String>>>,
+    /// Its HOME, which holds its log.
+    dir: PathBuf,
 }
 
 impl Miner {
     /// Start `zkminer` from a link in `dir` (its own directory is searched for workers, so it finds
     /// only the ones the config names), with `dir` as its HOME and a cleaned environment: none of
-    /// this shell's `ZKMINER_*` or `MOCK_*` settings, only `env`.
+    /// this shell's `ZKMINER_*`, `MOCK_*`, `BONSAI_*`, `RISC0_DEV_MODE`, `RISC0_PROVER` or
+    /// `RISC0_EXECUTOR` settings, only `env`.
     fn start(
         dir: &Path,
         config: &Path,
@@ -1143,7 +1223,16 @@ impl Miner {
             .args(args);
         for (k, _) in std::env::vars_os() {
             let name = k.to_string_lossy();
-            if name.starts_with("ZKMINER_") || name.starts_with("MOCK_") {
+            // risc0's own switches would change what a real worker does (dev mode fakes every
+            // proof, Bonsai proves remotely); RISC0_HOME stays, below.
+            if name.starts_with("ZKMINER_")
+                || name.starts_with("MOCK_")
+                || name.starts_with("BONSAI_")
+                || matches!(
+                    name.as_ref(),
+                    "RISC0_DEV_MODE" | "RISC0_PROVER" | "RISC0_EXECUTOR"
+                )
+            {
                 cmd.env_remove(&k);
             }
         }
@@ -1189,40 +1278,77 @@ impl Miner {
                 }
             });
         }
-        Miner { child, lines }
+        Miner {
+            child,
+            lines,
+            dir: dir.to_path_buf(),
+        }
     }
 
     fn lines(&self) -> Vec<String> {
         self.lines.lock().unwrap().clone()
     }
 
-    fn exited(&mut self) -> bool {
-        self.child.try_wait().ok().flatten().is_some()
+    fn exit_status(&mut self) -> Option<ExitStatus> {
+        self.child.try_wait().ok().flatten()
     }
 
-    /// SIGINT (the miner's drain), then wait up to `grace` before killing it. Returns whether it
-    /// exited on its own.
-    fn stop(&mut self, grace: Duration) -> bool {
-        if self.exited() {
-            return true;
+    fn exited(&mut self) -> bool {
+        self.exit_status().is_some()
+    }
+
+    /// SIGINT (the miner's drain), then wait up to `grace` before killing it. Returns its exit
+    /// status if it exited on its own (or already had), None if it had to be killed.
+    fn stop(&mut self, grace: Duration) -> Option<ExitStatus> {
+        if let Some(status) = self.exit_status() {
+            return Some(status);
         }
         signal(&self.child, libc::SIGINT);
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
-            if self.exited() {
-                return true;
+            if let Some(status) = self.exit_status() {
+                return Some(status);
             }
             std::thread::sleep(Duration::from_millis(200));
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        false
+        None
+    }
+
+    /// Panic with `what` for a miner that never got where a test needed it, after printing its log
+    /// tail, whether (and how) it exited, and its directory.
+    fn fail(&mut self, what: &str) -> ! {
+        let state = match self.child.try_wait() {
+            Ok(Some(status)) => {
+                // Let the readers take its last lines (often the reason it exited).
+                std::thread::sleep(Duration::from_millis(500));
+                format!("zkminer exited ({status})")
+            }
+            Ok(None) => "zkminer is still running".to_string(),
+            Err(e) => format!("zkminer's exit status is unreadable ({e})"),
+        };
+        dump_tail(&self.dir, &self.lines());
+        panic!("{what}; {state} (run directory {})", self.dir.display());
     }
 }
 
 impl Drop for Miner {
     fn drop(&mut self) {
-        self.stop(Duration::from_secs(20));
+        let _ = self.stop(Duration::from_secs(20));
+    }
+}
+
+/// What is wrong with how a miner stopped ([`Miner::stop`] with `grace`), if anything: it must
+/// exit 0, on its own.
+fn stop_failure(stopped: Option<ExitStatus>, grace: Duration) -> Option<String> {
+    match stopped {
+        Some(status) if status.success() => None,
+        Some(status) => Some(format!("zkminer stopped with {status}, not exit 0")),
+        None => Some(format!(
+            "zkminer did not exit within {} s of SIGINT",
+            grace.as_secs()
+        )),
     }
 }
 
@@ -1289,10 +1415,10 @@ async fn wait_for_line(miner: &mut Miner, needle: &str, timeout: Duration) -> bo
     wait_for_lines(miner, needle, 1, timeout).await
 }
 
-/// Wait for a watch-only miner's verdicts on every job, watch for [`SETTLE`] more, then stop it.
-/// As the staked prover, each claimable job must also be reported WOULD CLAIM (unless
-/// `ZKMINER_LOCALNET_EXPECT_CLAIMS=0`); nothing else, and nothing at all as an address with no
-/// stake, may be. Returns the failures and the log.
+/// Wait for a watch-only miner's verdicts on every job, watch for [`SETTLE`] more, then stop it
+/// (it must exit 0). As the staked prover, each claimable job must also be reported WOULD CLAIM
+/// (unless `ZKMINER_LOCALNET_EXPECT_CLAIMS=0`); nothing else, and nothing at all as an address with
+/// no stake, may be. Returns the failures and the log.
 async fn watch_and_check(
     world: &World,
     miner: &mut Miner,
@@ -1336,9 +1462,7 @@ async fn watch_and_check(
     if miner.exited() {
         failures.push("zkminer exited before every verdict was in".into());
     }
-    if !miner.stop(Duration::from_secs(60)) {
-        failures.push("zkminer did not exit within 60 s of SIGINT".into());
-    }
+    failures.extend(stop_failure(miner.stop(STOP_GRACE), STOP_GRACE));
     let lines = miner.lines();
     for job in &world.jobs {
         let would_claim = watch_lines(&lines, job.id)
@@ -1481,9 +1605,15 @@ async fn holds_its_lock_through_a_pause() {
     let world = World::new(&dir.0, Program::fixture(), &[Case::Full], Clock::Wall).await;
     let config = world.write_config(&dir.0, &worker, false);
     let job = world.jobs[0].id;
+    // Looked up and funded now, so the pause lands as soon as the job is claimed.
+    let router_owner = world.funded_owner(DEPLOYMENT.router).await;
+    let nonce_before = world.prover_nonce().await;
     // A proof that takes a while, so the router can pause while the lock is held.
     let mut env = replay_env();
-    env.push(("MOCK_PROVE_DELAY_SECS", "20".to_string()));
+    env.push((
+        "MOCK_PROVE_DELAY_SECS",
+        PAUSE_PROVE_DELAY.as_secs().to_string(),
+    ));
     let mut miner = start_mining(&world, &dir, &config, env, false);
 
     let mut failures = Vec::new();
@@ -1493,26 +1623,72 @@ async fn holds_its_lock_through_a_pause() {
         .await
         .is_empty()
     {
-        assert!(
-            started.elapsed() < Duration::from_secs(180) && !miner.exited(),
-            "the job was never claimed"
-        );
+        if miner.exited() || started.elapsed() > Duration::from_secs(180) {
+            miner.fail("the job was never claimed (waited 180 s)");
+        }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    world.set_router_paused(true).await;
-    // The proof finishes while paused; its fulfil must wait, and the lock must be kept.
-    tokio::time::sleep(Duration::from_secs(60)).await;
+    let pause_block = world.set_router_paused(router_owner, true).await;
+    let nonce_paused = world.prover_nonce().await;
+    // The proof finishes while paused: its fulfil must be held, nothing sent, and the lock kept.
+    let hold = format!(
+        "KEEP: {} fulfil held (router or Registry paused — holding the fulfil)",
+        short_id(job)
+    );
+    if !wait_for_line(
+        &mut miner,
+        &hold,
+        PAUSE_PROVE_DELAY + Duration::from_secs(120),
+    )
+    .await
+    {
+        failures.push(format!("the miner never logged {hold:?} while paused"));
+    }
+    // Held past the nonce-gap watchdog's reach.
+    tokio::time::sleep(PAUSE_HOLD).await;
     let (status, prover) = world.job_state(job).await;
     if status != zkminer_chain::jobs::JOB_STATUS_LOCKED || prover != world.prover.address() {
         failures.push(format!(
             "during the pause the job reads status {status} prover {prover}, not locked by us"
         ));
     }
-    world.set_router_paused(false).await;
+    let nonce_held = world.prover_nonce().await;
+    if nonce_held != nonce_paused {
+        failures.push(format!(
+            "the prover's nonce moved from {nonce_paused} to {nonce_held} while its fulfil was held"
+        ));
+    }
+    world.set_router_paused(router_owner, false).await;
     let (fulfilled, exited_early) = wait_fulfilled(&world, &mut miner, REPLAY_TIMEOUT).await;
     tokio::time::sleep(SETTLE).await;
-    let stopped = miner.stop(Duration::from_secs(120));
-    failures.extend(check_settlement(&world, &fulfilled, exited_early, stopped).await);
+    let stopped = miner.stop(DRAIN_GRACE);
+    failures.extend(
+        check_settlement(
+            &world,
+            &miner.lines(),
+            nonce_before,
+            &fulfilled,
+            exited_early,
+            stopped,
+        )
+        .await,
+    );
+    // A fulfil mined before the pause leaves nothing above to trust: say so first.
+    let fulfil_block = world
+        .logs::<IHemiProveFulfill::JobFulfilled>()
+        .await
+        .into_iter()
+        .find(|(j, _)| *j == job)
+        .map(|(_, l)| l.block);
+    if let Some(fulfil_block) = fulfil_block.filter(|&f| pause_block >= f) {
+        failures.insert(
+            0,
+            format!(
+                "the pause landed late (block {pause_block} ≥ fulfil block {fulfil_block}) — \
+                 harness race, not a miner bug"
+            ),
+        );
+    }
     finish_or_report(world, dir, miner, failures).await;
 }
 
@@ -1530,7 +1706,8 @@ async fn holds_off_while_the_router_is_paused() {
     )
     .await;
     let config = world.write_config(&dir.0, &worker, false);
-    world.set_router_paused(true).await;
+    let router_owner = world.funded_owner(DEPLOYMENT.router).await;
+    world.set_router_paused(router_owner, true).await;
     let nonce_before = world.prover_nonce().await;
     let mut miner = start_mining(&world, &dir, &config, replay_env(), false);
 
@@ -1553,12 +1730,22 @@ async fn holds_off_while_the_router_is_paused() {
     if world.prover_nonce().await != nonce_before {
         failures.push("the prover sent a transaction while the router was paused".into());
     }
-    // Lifted: the claimable job is claimed and fulfilled.
-    world.set_router_paused(false).await;
+    // Lifted: the claimable job is dispatched, claimed and fulfilled.
+    world.set_router_paused(router_owner, false).await;
     let (fulfilled, exited_early) = wait_fulfilled(&world, &mut miner, REPLAY_TIMEOUT).await;
     tokio::time::sleep(SETTLE).await;
-    let stopped = miner.stop(Duration::from_secs(120));
-    failures.extend(check_settlement(&world, &fulfilled, exited_early, stopped).await);
+    let stopped = miner.stop(DRAIN_GRACE);
+    failures.extend(
+        check_settlement(
+            &world,
+            &miner.lines(),
+            nonce_before,
+            &fulfilled,
+            exited_early,
+            stopped,
+        )
+        .await,
+    );
     finish_or_report(world, dir, miner, failures).await;
 }
 
@@ -1605,6 +1792,13 @@ async fn refuses_to_claim_on_a_skewed_clock() {
     .await;
 }
 
+/// The replay test with the real risc0 worker on the fibonacci guest: real GPU proofs.
+///
+/// The miner discovers the worker and starts one per card, each pinned with its own
+/// `CUDA_VISIBLE_DEVICES`, which overrides the developer's. So with `CUDA_VISIBLE_DEVICES` set the
+/// worker is named outright instead: one worker, which the dispatcher does not pin, so that setting
+/// holds. Its indices count in PCI bus order, as nvidia-smi's do (the dispatcher sets
+/// `CUDA_DEVICE_ORDER=PCI_BUS_ID`).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a GPU, anvil, the release risc0 worker and ZKMINER_LOCALNET_MINE=1"]
 async fn mines_the_claimable_jobs() {
@@ -1624,7 +1818,14 @@ async fn mines_the_claimable_jobs() {
     let worker = risc0_worker();
     let program = Program::fibonacci(&worker, &dir.0);
     let mut world = World::new(&dir.0, program, &Case::ALL, Clock::Wall).await;
-    let config = world.write_config(&dir.0, &worker, true);
+    let discover = std::env::var_os("CUDA_VISIBLE_DEVICES").is_none();
+    if !discover {
+        eprintln!(
+            "localnet: CUDA_VISIBLE_DEVICES is set: one risc0 worker, named outright, on the cards \
+             it allows"
+        );
+    }
+    let config = world.write_config(&dir.0, &worker, discover);
     mine_and_check(&mut world, &dir, &config, Vec::new(), timeout).await;
     dir.finish();
 }
@@ -1666,22 +1867,24 @@ async fn wait_fulfilled(world: &World, miner: &mut Miner, timeout: Duration) -> 
 }
 
 /// After a mining run: exactly the claimable jobs fulfilled, each by us, with the program's journal
-/// and claimed in an earlier transaction (the seal is never broadcast before the lock); none of the
-/// others claimed and every one of them still Open; no collateral left locked; the stake whole; a
-/// clean exit.
+/// and claimed in an earlier transaction (the seal is never broadcast before the lock), and each
+/// dispatched by the brain (the positive control for [`dispatched`], which the no-claim checks rely
+/// on); none of the others claimed and every one of them still Open; the prover's nonce moved from
+/// `nonce_before` by exactly a claim and a fulfil per claimable job; no collateral left locked; the
+/// stake whole; a clean exit (0, within [`DRAIN_GRACE`] of SIGINT).
 async fn check_settlement(
     world: &World,
+    lines: &[String],
+    nonce_before: u64,
     fulfilled: &[B256],
     exited_early: bool,
-    stopped: bool,
+    stopped: Option<ExitStatus>,
 ) -> Vec<String> {
     let mut failures = Vec::new();
     if exited_early {
         failures.push("zkminer exited on its own".to_string());
     }
-    if !stopped {
-        failures.push("zkminer did not drain and exit within 120 s of SIGINT".into());
-    }
+    failures.extend(stop_failure(stopped, DRAIN_GRACE));
     let claims = world.logs::<IHemiProveCore::JobClaimed>().await;
     let fulfils = world.logs::<IHemiProveFulfill::JobFulfilled>().await;
     for job in &world.jobs {
@@ -1696,6 +1899,13 @@ async fn check_settlement(
             fulfilled.contains(&job.id)
         );
         if job.case.claimable() {
+            if !dispatched(lines, job.id) {
+                failures.push(format!(
+                    "{:?}: the log has no `CLAIM {} (` line, which the no-claim checks look for",
+                    job.case,
+                    short_id(job.id)
+                ));
+            }
             match (claim, fulfil) {
                 (Some(c), Some(f)) => {
                     if c.tx == f.tx || c.block >= f.block {
@@ -1755,6 +1965,16 @@ async fn check_settlement(
             hemi(PROVER_STAKE)
         ));
     }
+    // Nothing else is sent in a clean run: no release, no resend at a new nonce, no nonce-gap fill.
+    let claimable = world.jobs.iter().filter(|j| j.case.claimable()).count() as u64;
+    let nonce_after = world.prover_nonce().await;
+    if nonce_after.checked_sub(nonce_before) != Some(2 * claimable) {
+        failures.push(format!(
+            "the prover's nonce moved from {nonce_before} to {nonce_after}, not by {} (a claim and \
+             a fulfil for each of the {claimable} claimable jobs)",
+            2 * claimable
+        ));
+    }
     failures
 }
 
@@ -1767,17 +1987,26 @@ async fn mine_and_check(
     env: Vec<(&'static str, String)>,
     timeout: Duration,
 ) {
+    let nonce_before = world.prover_nonce().await;
     let mut miner = start_mining(world, dir, config, env, false);
     world.submit_after_start(&mut miner).await;
     let (fulfilled, exited_early) = wait_fulfilled(world, &mut miner, timeout).await;
     tokio::time::sleep(SETTLE).await;
-    let stopped = miner.stop(Duration::from_secs(120));
-    let failures = check_settlement(world, &fulfilled, exited_early, stopped).await;
+    let stopped = miner.stop(DRAIN_GRACE);
+    let failures = check_settlement(
+        world,
+        &miner.lines(),
+        nonce_before,
+        &fulfilled,
+        exited_early,
+        stopped,
+    )
+    .await;
     report(world, dir, &miner, &failures).await;
 }
 
 /// A mining miner must log `needle` `times` times (the gate that holds it, at debug verbosity if
-/// `verbose`), dispatch no claim and send nothing.
+/// `verbose`), dispatch no claim, send nothing, and exit 0 when stopped.
 async fn no_claims_after(
     world: World,
     dir: RunDir,
@@ -1796,9 +2025,7 @@ async fn no_claims_after(
     if world.jobs.iter().any(|j| dispatched(&miner.lines(), j.id)) {
         failures.push("a claim was dispatched".into());
     }
-    if !miner.stop(Duration::from_secs(60)) {
-        failures.push("zkminer did not exit within 60 s of SIGINT".into());
-    }
+    failures.extend(stop_failure(miner.stop(STOP_GRACE), STOP_GRACE));
     let nonce_after = world.prover_nonce().await;
     if nonce_after != nonce_before {
         failures.push(format!(

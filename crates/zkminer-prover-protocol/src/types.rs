@@ -138,7 +138,8 @@ pub enum WorkerResponse {
     ExecuteResult {
         request_id: u64,
         /// Total cycles reported by the executor — the same quantity `ProofResult.cycles`
-        /// carries, obtained without proving.
+        /// carries, obtained without proving (risc0: each segment padded to its power of two, not
+        /// the guest's user cycles).
         cycles: u64,
         /// How long the execution itself took, so the caller can bound future ones.
         duration_secs: f64,

@@ -561,6 +561,7 @@ mod rate_tests {
             current_price: 1_000_000_000_000_000_000, // 1 HEMI
             bonus_amount: 0,
             speed_premium: 0,
+            premium_cap: None,
             token_price_usd: 1.0,
             fee_rate_bps: 0,
             max_price: 1_000_000_000_000_000_000,

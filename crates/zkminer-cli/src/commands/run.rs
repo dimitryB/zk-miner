@@ -895,13 +895,42 @@ type AssignedElsewhere = std::sync::Arc<
 /// exclusivity can lapse on-chain, so the job must become eligible again without a restart.
 const ASSIGNED_ELSEWHERE_TTL: Duration = Duration::from_secs(90);
 
-/// Mark a descriptor as assigned-elsewhere for `ASSIGNED_ELSEWHERE_TTL` so it is not re-measured each
-/// tick. Bounded like the measured cache so a flood of distinct decoys cannot grow the heap.
-fn mark_assigned_elsewhere(cache: &AssignedElsewhere, descriptor_hash: alloy::primitives::B256) {
+/// Mark a descriptor as assigned-elsewhere for `wait` so it is not re-measured each tick. Bounded like
+/// the measured cache so a flood of distinct decoys cannot grow the heap.
+fn mark_assigned_elsewhere(
+    cache: &AssignedElsewhere,
+    descriptor_hash: alloy::primitives::B256,
+    wait: Duration,
+) {
     if let Ok(mut m) = cache.lock() {
-        let until = std::time::Instant::now() + ASSIGNED_ELSEWHERE_TTL;
+        let until = std::time::Instant::now() + wait;
         bounded_insert(&mut m, descriptor_hash, until, MEASURED_CYCLES_CAP);
     }
+}
+
+/// Longest a FULL/FIELDS job assigned to another prover is set aside before its exclusivity is read
+/// again.
+const ASSIGNED_ELSEWHERE_MAX_WAIT: Duration = Duration::from_secs(3600);
+
+/// How long a FULL/FIELDS job assigned to ANOTHER prover stays theirs: `None` once anyone may claim
+/// it. The contract (`_checkExclusivityFromStorage`) enforces the assignment only for
+/// `exclusivityDuration` from `rampUpStart` — never when that is 0 — in job-local time, which a pause
+/// only stretches, so a wait judged by the chain clock may end early (the claim quote then refuses
+/// it) but never late. Clamped to [`ASSIGNED_ELSEWHERE_TTL`, `ASSIGNED_ELSEWHERE_MAX_WAIT`]; an
+/// unreadable record waits the minimum. (A NONE job's assignment is for life and is handled apart.)
+async fn assigned_exclusivity_wait(client: &ChainClient, job_id: B256) -> Option<Duration> {
+    let rec = match client.read_job_record(job_id, None).await {
+        Ok((rec, _)) => rec,
+        Err(_) => return Some(ASSIGNED_ELSEWHERE_TTL),
+    };
+    if rec.exclusivity_duration == 0 {
+        return None;
+    }
+    let ends = rec.ramp_up_start.saturating_add(rec.exclusivity_duration);
+    let now = zkminer_chain::client::chain_now();
+    (ends > now).then(|| {
+        Duration::from_secs(ends - now).clamp(ASSIGNED_ELSEWHERE_TTL, ASSIGNED_ELSEWHERE_MAX_WAIT)
+    })
 }
 
 /// True if this descriptor is still within its assigned-elsewhere cooldown. An expired entry returns
@@ -1156,15 +1185,19 @@ fn note_claim_retry_after(job_id: alloy::primitives::B256, class: zkminer_chain:
 /// guest-chosen strings, so this is deliberately class-agnostic: it cannot be evaded by choosing how
 /// to fail.
 ///
-/// Each failure marks the program (under its backend) and the submitter on an escalating TTL (1 h
-/// doubling to 24 h): self-healing, because the same signal also fires for a sick GPU, and never
-/// touching recovery (a lock we hold is still driven). `DIVERGENCE_HOLD_COUNT` DISTINCT programs
-/// failing within `DIVERGENCE_WINDOW` (a Sybil spreading failures over fresh programs and addresses,
-/// or our own hardware failing) page and hold new claims for programs not already PROVEN by a
-/// successful fulfil in this process — so the hold cannot be used to stop honest, established work.
+/// Each failure marks the submitter on an escalating TTL (1 h doubling to 24 h), and the program
+/// (under its backend) once jobs from `PROGRAM_MARK_SUBMITTERS` DISTINCT submitters have failed on it
+/// within `DIVERGENCE_MARK_MAX`: a program's id is public, so one submitter's heavy input must not
+/// block it for everyone (that submitter is already held). Self-healing, because the same signal also
+/// fires for a sick GPU, and never touching recovery (a lock we hold is still driven).
+/// `DIVERGENCE_HOLD_COUNT` DISTINCT programs failing within `DIVERGENCE_WINDOW` (a Sybil spreading
+/// failures over fresh programs and addresses, or our own hardware failing) page and hold new claims
+/// for programs not already PROVEN by a successful fulfil in this process (and not marked since) — so
+/// the hold cannot be used to stop honest, established work.
 const DIVERGENCE_WINDOW: Duration = Duration::from_secs(3600);
 const DIVERGENCE_HOLD_COUNT: usize = 3;
 const DIVERGENCE_MARK_MAX: Duration = Duration::from_secs(24 * 3600);
+const PROGRAM_MARK_SUBMITTERS: usize = 2;
 
 #[derive(Default)]
 struct DivergenceState {
@@ -1173,6 +1206,11 @@ struct DivergenceState {
     submitters: std::collections::HashMap<alloy::primitives::Address, (u32, std::time::Instant)>,
     /// Recent failures, with the program that failed.
     recent: std::collections::VecDeque<(std::time::Instant, B256)>,
+    /// Per program+backend, the submitters whose jobs on it failed, and when.
+    failers: std::collections::HashMap<
+        (B256, &'static str),
+        Vec<(std::time::Instant, alloy::primitives::Address)>,
+    >,
     /// Programs with a successful fulfil in this process and no recorded failure.
     proven: std::collections::HashSet<(B256, &'static str)>,
 }
@@ -1206,10 +1244,21 @@ fn note_post_claim_divergence(
     let mut g = DIVERGENCE.lock().unwrap_or_else(|p| p.into_inner());
     let st = g.get_or_insert_with(Default::default);
     let key = (program_id, backend);
-    st.proven.remove(&key);
-    if st.programs.len() < MEASURED_CYCLES_CAP || st.programs.contains_key(&key) {
-        let prev = st.programs.get(&key).map(|e| e.0);
-        st.programs.insert(key, escalate_mark(prev));
+    let now = std::time::Instant::now();
+    let failers = if st.failers.len() < MEASURED_CYCLES_CAP || st.failers.contains_key(&key) {
+        let f = st.failers.entry(key).or_default();
+        f.retain(|(t, a)| now.duration_since(*t) < DIVERGENCE_MARK_MAX && *a != caller);
+        f.push((now, caller));
+        f.len()
+    } else {
+        PROGRAM_MARK_SUBMITTERS
+    };
+    if failers >= PROGRAM_MARK_SUBMITTERS {
+        st.proven.remove(&key);
+        if st.programs.len() < MEASURED_CYCLES_CAP || st.programs.contains_key(&key) {
+            let prev = st.programs.get(&key).map(|e| e.0);
+            st.programs.insert(key, escalate_mark(prev));
+        }
     }
     if st.submitters.len() < MEASURED_CYCLES_CAP || st.submitters.contains_key(&caller) {
         let prev = st.submitters.get(&caller).map(|e| e.0);
@@ -1219,8 +1268,13 @@ fn note_post_claim_divergence(
     let distinct = st.distinct_recent();
     tracing::error!(
         "POST-CLAIM FAILURE: program {} ({backend}) from submitter {caller} measured clean but failed \
-         after the claim ({why}) — not claiming this program or submitter for a while",
-        short_id(program_id)
+         after the claim ({why}) — not claiming {} for a while",
+        short_id(program_id),
+        if failers >= PROGRAM_MARK_SUBMITTERS {
+            "this program or submitter"
+        } else {
+            "this submitter's jobs"
+        }
     );
     if distinct >= DIVERGENCE_HOLD_COUNT {
         tracing::error!(
@@ -1231,12 +1285,13 @@ fn note_post_claim_divergence(
     }
 }
 
-/// A successful fulfil: the program is proven in this session (unless it has a failure on record).
+/// A successful fulfil: the program is proven in this session (unless it is marked right now).
 fn note_fulfil_success(program_id: alloy::primitives::B256, backend: &'static str) {
     let mut g = DIVERGENCE.lock().unwrap_or_else(|p| p.into_inner());
     let st = g.get_or_insert_with(Default::default);
     let key = (program_id, backend);
-    if !st.programs.contains_key(&key) && st.proven.len() < MEASURED_CYCLES_CAP {
+    let now = std::time::Instant::now();
+    if st.programs.get(&key).is_none_or(|e| now >= e.1) && st.proven.len() < MEASURED_CYCLES_CAP {
         st.proven.insert(key);
     }
 }
@@ -1295,11 +1350,42 @@ fn job_is_bound(job_id: B256) -> bool {
     g.as_ref().is_some_and(|(s, _)| s.contains(&job_id))
 }
 
+/// Each job's own collateral terms `(minCollateral, collateralBps)`, snapshotted at submit and read
+/// with `getJobSnapshots` once per job. The claim locks `computeCollateral(price, collateralBps,
+/// minCollateral)` from these, and a submitter may set collateralBps up to 50,000 (500%), so sizing
+/// the claim gate from the adapter default under-reserved such a job by up to 3.3x. Immutable after
+/// submit, so cached by jobId; bounded (an evicted entry is just read again).
+static JOB_COLLATERAL_TERMS: std::sync::Mutex<
+    Option<std::collections::HashMap<B256, (u128, u128)>>,
+> = std::sync::Mutex::new(None);
+
+async fn job_collateral_terms(client: &ChainClient, job_id: B256) -> Result<(u128, u128)> {
+    if let Some(t) = JOB_COLLATERAL_TERMS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&job_id).copied())
+    {
+        return Ok(t);
+    }
+    let (_, min_collateral, collateral_bps) = client.get_job_snapshots(job_id).await?;
+    let mut g = JOB_COLLATERAL_TERMS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(Default::default);
+    if m.len() >= MEASURED_CYCLES_CAP {
+        m.clear();
+    }
+    m.insert(job_id, (min_collateral, collateral_bps));
+    Ok((min_collateral, collateral_bps))
+}
+
 /// The Open-set ranking key: a job settled as bound (FULL/FIELDS while bound-job claiming is off, by
-/// its one descriptor fetch) ranks LAST, so a pile of high-priced bound decoys can never push a
+/// its one descriptor fetch), or one set aside for now (assigned elsewhere, too slow to prove, a
+/// temporary refusal), ranks LAST, so a pile of high-priced decoys like these can never push a
 /// claimable job out of the capped Open set.
 fn open_rank(j: &TrackedJob) -> u128 {
-    if job_is_bound(j.info.job_id) {
+    if job_is_bound(j.info.job_id) || job_set_aside(j.info.job_id) {
         0
     } else {
         j.current_price
@@ -1416,6 +1502,14 @@ async fn requeue_open_job(state: &zkminer_tui::state::SharedState, job: TrackedJ
     }
 }
 
+/// [`claim_backing_off`] without pruning (for ranking under the state lock).
+fn job_set_aside(job_id: alloy::primitives::B256) -> bool {
+    claim_retry_after_map().lock().is_ok_and(|m| {
+        m.get(&job_id)
+            .is_some_and(|&until| std::time::Instant::now() < until)
+    })
+}
+
 fn claim_backing_off(job_id: alloy::primitives::B256) -> bool {
     if let Ok(mut m) = claim_retry_after_map().lock() {
         if let Some(&until) = m.get(&job_id) {
@@ -1440,9 +1534,11 @@ fn claim_backing_off(job_id: alloy::primitives::B256) -> bool {
 ///   * journalFields: it selects FULL vs FIELDS and the byte ranges, and a marker in slot 0 moves the
 ///     check to `publicValues[64:]` — a decoy differing only here must not poison the honest tuple.
 ///
-/// A COOLDOWN, not a permanent set (a self-healing breaker for a flood of distinct jobIds sharing one
-/// unsatisfiable binding). Fed ONLY by the decoded `JournalMismatch` selector. Bounded like the other
-/// brain maps.
+/// The map is a COOLDOWN, not a permanent set (a self-healing breaker for a flood of distinct jobIds
+/// sharing one unsatisfiable binding), but a job the lifecycle meets while its entry is live is
+/// dropped, not requeued: its siblings share the program and input of a guest whose bound journal
+/// already failed. Fed by the decoded `JournalMismatch` selector and by the local binding check of a
+/// proven journal. Bounded like the other brain maps.
 type PredicateKey = (
     alloy::primitives::B256,
     alloy::primitives::B256,
@@ -2017,6 +2113,19 @@ pub async fn run(
             .collect(),
         benchmark_timeout,
     );
+    // One `sys_rand` key for every risc0 worker this miner spawns, loaded once: a measured journal is
+    // only worth checking a binding against if the proof that follows, on whichever worker, seeds the
+    // guest alike — and the measurements live in this process, as long as the key does.
+    {
+        let (key, err) = zkminer_prover_protocol::sys_rand::host_key(dirs::home_dir().as_deref());
+        if let Some(e) = err {
+            tracing::warn!(
+                "risc0 sys_rand key file unusable ({e}): using a key for this run only — a lock \
+                 re-driven after a restart may see different guest randomness"
+            );
+        }
+        zkminer_prover::worker::set_risc0_sys_rand_key(key);
+    }
     // Watch-only proves nothing, and only measures what this build serves: no worker for another
     // backend (SP1's has host-wide startup effects: it installs its bundled `sp1-gpu-server` and
     // reaps orphaned servers' sockets, beside whatever miner runs on this host).
@@ -3826,34 +3935,12 @@ async fn miner_brain(
     // last re-read a header to confirm a large skew.
     let mut clock_skew_held = false;
     let mut last_skew_reread: Option<std::time::Instant> = None;
+    // Where the rotating quarter of the per-tick candidate cut resumes.
+    let mut candidate_rotation: usize = 0;
     let mut last_storm_seen: Option<std::time::Instant> = None;
 
     // Wait for benchmarks and initial state to settle.
     tokio::time::sleep(Duration::from_secs(10)).await;
-
-    // The governance-set per-job collateral floor. The on-chain claim floors
-    // computeCollateral() with MIN_COLLATERAL_AMOUNT, so the gate must use the SAME
-    // value — not an adapter's minStake (the prover-eligibility total-stake threshold,
-    // a different and typically much larger quantity, which made the gate over-provision
-    // small jobs). Constant per deployment → fetch once. Fall back to the deployed
-    // testnet value (10 HEMI) if the read fails so the gate still uses a sane floor.
-    const FALLBACK_MIN_COLLATERAL_AMOUNT: u128 = 10_000_000_000_000_000_000; // 10 HEMI
-    let min_collateral_amount = match client.get_min_collateral_amount().await {
-        Ok(v) => {
-            tracing::info!(
-                "MIN_COLLATERAL_AMOUNT = {} (collateral gate floor)",
-                fmt_hemi(v)
-            );
-            v
-        }
-        Err(e) => {
-            tracing::warn!(
-                "MIN_COLLATERAL_AMOUNT read failed ({e:#}); using fallback {}",
-                fmt_hemi(FALLBACK_MIN_COLLATERAL_AMOUNT)
-            );
-            FALLBACK_MIN_COLLATERAL_AMOUNT
-        }
-    };
 
     // Periodic recovery cadence. Startup recovery runs exactly once, so a job that
     // becomes held-but-undriven LATER in the session (a release whose RPC failed, a lock handed
@@ -4591,8 +4678,10 @@ async fn miner_brain(
         // so with the host clock ahead each fresh lock looks about to expire and is released at once:
         // the claim costs the release penalty and earns nothing. Behind, the "already past" checks run
         // late. Either way the host clock needs fixing (NTP) before it takes on collateral. With no
-        // header read at all there is nothing to check against, so that holds too. Held jobs
-        // continue. The header is refreshed with the pause poll above.
+        // header read at all there is nothing to check against, so that holds too. Held locks keep
+        // `chain_now()`: a large gap can't tell a host clock that is ahead (early release, 5%) from an
+        // RPC that lags (trusting its header would release after D+G, a 100% slash), so they keep the
+        // safe side. The header is refreshed with the pause poll above.
         {
             const SKEW_REREAD_EVERY: Duration = Duration::from_secs(10);
             let mut skew = zkminer_chain::client::chain_clock_skew_secs();
@@ -4618,7 +4707,11 @@ async fn miner_brain(
                     if s < 0 { "ahead of" } else { "behind" },
                     limit,
                     if s < 0 {
-                        "the host clock is off (check NTP), or the chain has stopped making blocks"
+                        // Held locks stay timed by this clock: the safe side if it is the RPC that
+                        // lags, at the cost of early releases if it is this host's clock that is off.
+                        "the host clock is off (check NTP), or the RPC or chain has fallen behind; \
+                         locks already held are still timed by this host's clock, so one may be \
+                         released early, at the penalty"
                     } else {
                         "the host clock is off (check NTP)"
                     }
@@ -4633,8 +4726,7 @@ async fn miner_brain(
                     // At once when the gate closes, then once a minute.
                     if !clock_skew_held || tick_count.is_multiple_of(WEDGE_CHECK_TICKS) {
                         let msg = format!(
-                            "PAGE: CLOCK-SKEW — {why}; not claiming new work until they agree, held \
-                             jobs continue"
+                            "PAGE: CLOCK-SKEW — {why}; not claiming new work until they agree"
                         );
                         tracing::warn!("{msg}");
                         if !clock_skew_held {
@@ -4862,7 +4954,9 @@ async fn miner_brain(
             .as_ref()
             .map(|si| si.available_collateral)
             .unwrap_or(0)
-            .saturating_sub(in_flight.values().copied().sum::<u128>());
+            .saturating_sub(in_flight.values().copied().sum::<u128>())
+            // Watch-only locks nothing, so take off what its would-be claims would have locked.
+            .saturating_sub(watch_locked_collateral());
 
         // Worst-case risc0 po2 an operator `po2_overrides` entry forces this tick, so the CLAIM
         // gate reserves the SAME host RAM the PROVE gate will. Host memory roughly DOUBLES per po2
@@ -4909,8 +5003,19 @@ async fn miner_brain(
             .filter(|j| !program_has_no_elf_source(j.info.program_id))
             .collect();
         candidates.sort_by_key(|j| std::cmp::Reverse(j.current_price));
+        // The top three quarters by price, the last quarter in rotation over everything below them:
+        // jobs that stay Open but that we never claim (a skip nobody backs off), priced above honest
+        // work by a submitter who can post them for a refundable deposit, cannot then hold every slot
+        // on every tick and keep the rest of the market from being evaluated at all.
         const MAX_CANDIDATES_PER_TICK: usize = 256;
-        candidates.truncate(MAX_CANDIDATES_PER_TICK);
+        const PRICE_SLOTS: usize = MAX_CANDIDATES_PER_TICK * 3 / 4;
+        if candidates.len() > MAX_CANDIDATES_PER_TICK {
+            let rest = candidates.split_off(PRICE_SLOTS);
+            let take = MAX_CANDIDATES_PER_TICK - PRICE_SLOTS;
+            let start = candidate_rotation % rest.len();
+            candidates.extend(rest.iter().cycle().skip(start).take(take).copied());
+            candidate_rotation = start + take;
+        }
 
         // Fetch EVERY candidate's status in one Multicall3 request (was one
         // getJobStatusView per candidate — the biggest per-tick RPC burst). All
@@ -5565,23 +5670,21 @@ async fn miner_brain(
                 (declared, None) => declared.max(FALLBACK_ESTIMATED_CYCLES),
             };
 
-            // Required collateral: compute from the auction formula.
-            // Resolution order mirrors the contract (HemiProveBase._resolveCollateralBps):
-            //   1. Per-job lockCollateralBps override (if non-zero)
-            //   2. Adapter defaultCollateralRatio (if non-zero)
-            //   3. Global GLOBAL_DEFAULT_COLLATERAL_BPS (15000)
-            // Include tier 3: a registered-Active adapter can carry
-            // defaultCollateralRatio == 0, which the contract resolves to the global
-            // default. Without this fallback effective_bps would be 0 → the gate would
-            // pass a job needing ~0 collateral → on-chain claim locks 150% → tail revert.
-            // (Tier 1 per-job override is currently never populated — the event/view don't
-            // expose lockCollateralBps — but the branch is kept for when they do.)
-            let effective_bps = if job.info.lock_collateral_bps > 0 {
-                job.info.lock_collateral_bps as u64
-            } else if adapter_info.default_collateral_bps > 0 {
-                adapter_info.default_collateral_bps as u64
-            } else {
-                zkminer_chain::auction::GLOBAL_DEFAULT_COLLATERAL_BPS
+            // Required collateral: compute from the auction formula, with the job's OWN terms as
+            // the router snapshotted them at submit (`getJobSnapshots`: the resolved collateralBps —
+            // per-job override, else the adapter's then-default, else the global default — and the
+            // then-MIN_COLLATERAL_AMOUNT). A submitter may set up to 500%, so the adapter's current
+            // default is not an upper bound. Unreadable: skip this tick rather than guess.
+            let (job_min_collateral, effective_bps) = match job_collateral_terms(&client, jid).await
+            {
+                Ok((min, bps)) => (min, u64::try_from(bps).unwrap_or(u64::MAX)),
+                Err(e) => {
+                    tracing::debug!(
+                        "Skipping {} this tick: its collateral terms are unreadable ({e:#})",
+                        short_id(jid)
+                    );
+                    continue;
+                }
             };
             // Collateral gate uses an UPPER BOUND on what the on-chain claim will lock,
             // NOT the current-price estimate. The claim locks
@@ -5606,13 +5709,21 @@ async fn miner_brain(
             let required_collateral = zkminer_chain::auction::compute_collateral(
                 job.info.max_price.max(snapshot.current_price),
                 effective_bps,
-                min_collateral_amount, // governance floor, not adapter.min_stake
+                job_min_collateral, // the job's snapshotted floor, not adapter.min_stake
             );
 
+            // A reopened job's premium is capped below its submit-time value; read the cap (only
+            // then: it equals the premium until a first release). Unreadable: assume none is left.
+            let premium_cap = if snapshot.reopen_count > 0 && snapshot.speed_premium > 0 {
+                Some(client.get_premium_cap(jid).await.unwrap_or(0))
+            } else {
+                None
+            };
             let params = JobParams {
                 current_price: snapshot.current_price,
                 bonus_amount: snapshot.bonus_amount,
                 speed_premium: snapshot.speed_premium,
+                premium_cap,
                 // The evaluator's speed-bonus term is gated on fulfillment_timeout > 0,
                 // but the view's timeRemaining (→ snapshot.fulfillment_timeout) is 0 for
                 // an OPEN job, so the bonus was silently zeroed for every claim decision.
@@ -5746,6 +5857,10 @@ async fn miner_brain(
                             short_id(jid),
                             proving_timeout.as_secs()
                         );
+                        // Deterministic for this (program, input) — an unmeasurable guest lands here
+                        // too — so set the job aside rather than let it hold a slot of the per-tick
+                        // candidate cut on every tick.
+                        note_job_retry_after(jid, UNMEASURABLE_RETRY_TTL);
                         continue;
                     }
                 }
@@ -5991,6 +6106,9 @@ async fn miner_brain(
                     // Prefer the planner's per-device, backlog-aware device over the fastest-eligible
                     // hint set above; dispatch tries it first, with the same graceful fallback.
                     snapshot.preferred_device = Some(a.device_id.clone());
+                    // Queued behind others, the job is done when the planner says, not one proof
+                    // from now: watch-only holds its would-be claim that long.
+                    snapshot.estimated_prove_secs = Some(a.finishes_in.as_secs());
                 }
                 reserved_this_tick = reserved_this_tick.saturating_add(required_collateral);
                 available_collateral = available_collateral.saturating_sub(required_collateral);
@@ -6344,7 +6462,12 @@ fn watch_enqueue(job: &TrackedJob) {
     }
     let mut q = WATCH_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
     if q.len() >= WATCH_MAP_CAP {
-        q.pop_front();
+        if let Some(old) = q.pop_front() {
+            tracing::warn!(
+                "watch-only: inspector backlog full — job {} will get no verdict",
+                short_id(old.info.job_id)
+            );
+        }
     }
     q.push_back(job.clone());
 }
@@ -6388,6 +6511,27 @@ fn describe_binding(d: &zkminer_contracts::bindings::JobDescriptor) -> String {
     }
 }
 
+/// Collateral watch-only's would-be claims would hold locked on-chain right now (see
+/// `watch_claim_preview`).
+static WATCH_LOCKED_COLLATERAL: std::sync::Mutex<u128> = std::sync::Mutex::new(0);
+
+fn watch_locked_collateral() -> u128 {
+    *WATCH_LOCKED_COLLATERAL
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+fn add_watch_locked_collateral(amount: u128, add: bool) {
+    let mut g = WATCH_LOCKED_COLLATERAL
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    *g = if add {
+        g.saturating_add(amount)
+    } else {
+        g.saturating_sub(amount)
+    };
+}
+
 /// Watch-only stand-in for the claim: what `claim_job_idempotent` would meet for this job now, read
 /// with the same pre-checks and quote and logged as the job's verdict. A job that would be claimed
 /// leaves the Open set, as a claimed one does; a temporary refusal keeps it a candidate behind the
@@ -6405,6 +6549,7 @@ async fn watch_claim_preview(
         || "unmeasured".to_string(),
         |c| format!("{c} cycles measured"),
     );
+    let mut would_claim_price = None;
     let (verdict, would_claim, keep) = match client.preview_claim(job_id).await {
         Ok(ClaimPreview::Claimable(q)) => (
             format!(
@@ -6413,7 +6558,10 @@ async fn watch_claim_preview(
                 fmt_hemi(q.premium_floor),
                 q.block
             ),
-            true,
+            {
+                would_claim_price = Some(q.price_floor);
+                true
+            },
             false,
         ),
         Ok(ClaimPreview::Held(p)) => (
@@ -6478,12 +6626,27 @@ async fn watch_claim_preview(
                 .saturating_add(CLAIM_AND_FULFIL_SECS)
                 .min(job.info.fulfillment_timeout.max(CLAIM_AND_FULFIL_SECS)),
         );
+        // A real lock takes this collateral out of `getAvailableCollateral` on top of the brain's
+        // reservation; the chain doesn't here, so count it until the hold ends.
+        let locked = match (
+            would_claim_price,
+            job_collateral_terms(client, job_id).await,
+        ) {
+            (Some(price), Ok((min, bps))) => zkminer_chain::auction::compute_collateral(
+                price,
+                u64::try_from(bps).unwrap_or(u64::MAX),
+                min,
+            ),
+            _ => 0,
+        };
+        add_watch_locked_collateral(locked, true);
         let until = std::time::Instant::now() + hold;
         while std::time::Instant::now() < until
             && !SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
         {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+        add_watch_locked_collateral(locked, false);
     }
 }
 
@@ -6563,7 +6726,12 @@ async fn watch_inspector(
             }
         }
         if pending.len() > WATCH_MAP_CAP {
-            pending.drain(..pending.len() - WATCH_MAP_CAP);
+            for p in pending.drain(..pending.len() - WATCH_MAP_CAP) {
+                tracing::warn!(
+                    "watch-only: inspector backlog full — job {} will get no verdict",
+                    short_id(p.job.info.job_id)
+                );
+            }
         }
         let mut still_pending = Vec::new();
         for mut p in std::mem::take(&mut pending) {
@@ -6683,11 +6851,14 @@ async fn watch_inspect(
             format!("{head}: reserved for prover {}", d.assignedProver),
         );
     }
-    if d.assignedProver != alloy::primitives::Address::ZERO && d.assignedProver != client.address {
+    if d.assignedProver != alloy::primitives::Address::ZERO
+        && d.assignedProver != client.address
+        && assigned_exclusivity_wait(client, job_id).await.is_some()
+    {
         return Inspected::Done(
             "assigned elsewhere",
             format!(
-                "{head}: assigned to prover {}, and the miner leaves such jobs alone",
+                "{head}: assigned to prover {}, and its exclusivity has not lapsed",
                 d.assignedProver
             ),
         );
@@ -9080,26 +9251,30 @@ async fn measure_cycles(
         mark_desc_unfulfillable(desc_input, descriptor_hash);
         return;
     }
-    // Skip a job the submitter assigned exclusively to a DIFFERENT prover: the candidate
-    // filter gates only on status/prover and JobStatusView does not expose `assignedProver`, so
-    // without this we would measure it (burning a measure-budget slot) and broadcast a claimJob the
-    // contract is guaranteed to revert. The descriptor carries the assignment. Conservative: skip
-    // whenever it is set to someone other than us (we may re-see it, free, once it opens up); never
-    // negative-cached, since the assignment/exclusivity can change.
+    // Skip a job the submitter assigned exclusively to a DIFFERENT prover while that exclusivity
+    // lasts: the candidate filter gates only on status/prover and JobStatusView does not expose
+    // `assignedProver`, so without this we would measure it (burning a measure-budget slot) and quote a
+    // claim the contract refuses. The descriptor carries the assignment, `jobs()` the window. Once the
+    // window has lapsed (or the job has none), it is anyone's and is measured as usual.
     {
         let assigned = descriptor.assignedProver;
         if assigned != alloy::primitives::Address::ZERO && assigned != client.address {
-            // Cooldown this descriptor so the measure-spawn gate stops re-selecting it (fetch + return)
-            // every tick and it cannot monopolize the measure budget. TIME-BOUNDED, not permanent:
-            // on-chain exclusivity expires, so after the cooldown the job is re-evaluated.
-            tracing::debug!(
-                "measure {}: job assigned to another prover ({}) — skipping for a cooldown (we cannot \
-                 claim it until exclusivity lapses)",
-                short_id(program_id),
-                assigned
-            );
-            mark_assigned_elsewhere(assigned_elsewhere, descriptor_hash);
-            return;
+            if let Some(wait) = assigned_exclusivity_wait(client, job_id).await {
+                // Set the descriptor aside, and the job too (so it leaves the per-tick candidate cut
+                // instead of holding a slot every tick), until the window ends.
+                tracing::debug!(
+                    "measure {}: job assigned to another prover ({}) — skipping for {}s (we cannot \
+                     claim it until its exclusivity lapses)",
+                    short_id(program_id),
+                    assigned,
+                    wait.as_secs()
+                );
+                mark_assigned_elsewhere(assigned_elsewhere, descriptor_hash, wait);
+                if paces_claims {
+                    note_job_retry_after(job_id, wait);
+                }
+                return;
+            }
         }
     }
     let input: Vec<u8> = descriptor.inputData.to_vec();
@@ -10397,15 +10572,21 @@ async fn recover_claimed_jobs(
             }
             true
         }
-        // Reads OPEN (prover == ZERO) while our claim could still be in flight →
-        // UNKNOWN, not "not ours". KEEP the breadcrumb but do not re-drive it this pass.
-        Some(v)
-            if v.prover == alloy::primitives::Address::ZERO && live_claim_intent.contains(jid) =>
-        {
+        // Reads OPEN (prover == ZERO), or held by ANOTHER prover, while our claim could still be in
+        // flight or our recorded lock is live → UNKNOWN, not "not ours". This read is unpinned: a
+        // replica below our claim block still shows the job's previous state, and a lock cannot pass
+        // from us to another prover without our own release (which drops the breadcrumb) or a
+        // slash after the deadline. KEEP the breadcrumb but do not re-drive it this pass.
+        Some(v) if v.prover != client.address && live_claim_intent.contains(jid) => {
             tracing::warn!(
-                "recover: {} reads OPEN but our claim may still be pending — retaining \
-                 breadcrumb",
-                jid
+                "recover: {} reads {} but our claim may still be pending or the read lags — \
+                 retaining breadcrumb",
+                jid,
+                if v.prover == alloy::primitives::Address::ZERO {
+                    "OPEN".to_string()
+                } else {
+                    format!("held by {}", v.prover)
+                }
             );
             // Look again soon, not at the periodic cadence: if that claim lands, the lock needs a
             // driver well before a short job's window closes.
@@ -10505,13 +10686,15 @@ async fn recover_claimed_jobs(
             }
         };
         if view.prover != client.address {
-            // ZERO = the job reads OPEN = UNKNOWN, not "not ours" — keep the breadcrumb
-            // while our claim could still be live; a later pass GCs it once it ages out.
-            if view.prover == alloy::primitives::Address::ZERO && live_claim_intent.contains(&jid) {
+            // ZERO = the job reads OPEN = UNKNOWN, not "not ours", and so is another prover on this
+            // unpinned read (see the batch arm above) — keep the breadcrumb while our claim could
+            // still be live; a later pass GCs it once it ages out.
+            if live_claim_intent.contains(&jid) {
                 tracing::warn!(
-                    "recover: {} reads OPEN but our claim may still be pending — retaining \
-                     breadcrumb",
-                    jid
+                    "recover: {} reads prover {} but our claim may still be pending or the read \
+                     lags — retaining breadcrumb",
+                    jid,
+                    view.prover
                 );
                 open_intent = true;
                 continue;
@@ -11952,23 +12135,36 @@ mod r2_sizing_tests {
         assert!(!divergence_blocks_claim(addr(0xD1), prog(0xD1), "risc0"));
         note_post_claim_divergence(prog(0xD1), "risc0", addr(0xD1), "test");
         assert!(divergence_blocks_claim(addr(0xD1), prog(0xEE), "risc0"), "the submitter is marked");
-        assert!(divergence_blocks_claim(addr(0xEE), prog(0xD1), "risc0"), "and its program");
+        assert!(
+            !divergence_blocks_claim(addr(0xEE), prog(0xD1), "risc0"),
+            "one submitter's failure does not block a public program for everyone"
+        );
         assert!(
             !program_vkey_mismatched(prog(0xD1), "risc0"),
             "a failure must not write the permanent mismatch verdict (recovery releases on that)"
         );
-        // One wave of the same program is not a Sybil spread.
+        // One wave of the same program, from the same submitter, is not a Sybil spread.
         note_post_claim_divergence(prog(0xD1), "risc0", addr(0xD1), "test");
         note_post_claim_divergence(prog(0xD1), "risc0", addr(0xD1), "test");
         assert!(!divergence_blocks_claim(addr(0xEE), prog(0xEE), "risc0"), "distinct programs count");
+        assert!(!divergence_blocks_claim(addr(0xEE), prog(0xD1), "risc0"));
+        // A second submitter failing on it marks the program itself.
+        note_post_claim_divergence(prog(0xD1), "risc0", addr(0xD2), "test");
+        assert!(
+            divergence_blocks_claim(addr(0xEE), prog(0xD1), "risc0"),
+            "and now its program"
+        );
         // Fresh programs and addresses trip the hold — for unproven programs only.
         note_post_claim_divergence(prog(0xD3), "risc0", addr(0xD3), "test");
         note_post_claim_divergence(prog(0xD4), "risc0", addr(0xD4), "test");
         assert!(divergence_blocks_claim(addr(0xEE), prog(0xEE), "risc0"), "unproven work is held");
         assert!(!divergence_blocks_claim(addr(0xEE), prog(0xD0), "risc0"), "proven work keeps flowing");
-        // A success cannot launder a program with a failure on record.
+        // A success cannot launder a program while it is marked.
+        note_fulfil_success(prog(0xD1), "risc0");
+        assert!(divergence_blocks_claim(addr(0xEE), prog(0xD1), "risc0"));
+        // One submitter's failure didn't mark D3, so a later success proves it again.
         note_fulfil_success(prog(0xD3), "risc0");
-        assert!(divergence_blocks_claim(addr(0xEE), prog(0xD3), "risc0"));
+        assert!(!divergence_blocks_claim(addr(0xEE), prog(0xD3), "risc0"));
     }
 
     #[test]

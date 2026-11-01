@@ -156,12 +156,18 @@ claim quote show, whatever this host's GPUs or stake. It signs with a throwaway 
 transport refuses every send. It also skips lock recovery and the nonce watchdog, and never
 writes the job journal, so it cannot touch the locks or nonces of a miner running on the same
 key. It keeps its own ELF cache (`~/.zkminer/watch/elfs`), starts workers only for the proof
-systems this build serves, and paces its RPC to 1 request/s
-(`chain.max_requests_per_sec`), since it shares the endpoint's per-IP limit with any miner on
-the same host. It does execute guests, though, so don't run it on a host whose RAM a live
+systems this build serves, and paces its RPC to 1 request/s, since it shares the endpoint's
+per-IP limit with any miner on the same host. A `chain.max_requests_per_sec` in the config
+overrides that for both, so give watch-only its own config file (`zkminer --config …`) if
+the miner's sets one. It does execute guests, though, so don't run it on a host whose RAM a live
 miner needs. It is always headless. It watches as the configured key's address unless you pass `--address 0x…`, which
 needs no key at all. It measures guests on the CPU, so it runs on a host without a GPU if
 `[prover.worker_binaries]` names a risc0 worker.
+
+Its verdicts are a rehearsal, not a replay. Its per-job report measures every job on the same
+measure workers and RPC budget the WOULD CLAIM decisions use, so on a busy market those can
+come a tick or two later than a real miner's would, and the per-job reports can lag well
+behind the market.
 
 Verbosity is `-v`/`-vv` **before** the subcommand (`RUST_LOG` is ignored). Logs go to
 stderr, so `zkminer benchmark --json` on stdout stays machine-readable.
