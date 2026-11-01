@@ -93,25 +93,6 @@
   },
   {
     "type": "function",
-    "name": "getPublicValues",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "bytes",
-        "internalType": "bytes"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "hasResult",
     "inputs": [
       {
@@ -138,6 +119,30 @@
         "name": "",
         "type": "address",
         "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "matches",
+    "inputs": [
+      {
+        "name": "jobId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "publicValues",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
       }
     ],
     "stateMutability": "view"
@@ -235,12 +240,7 @@
     ],
     "outputs": [
       {
-        "name": "programId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "proofSystemId",
+        "name": "publicValuesHash",
         "type": "bytes32",
         "internalType": "bytes32"
       },
@@ -253,16 +253,6 @@
         "name": "fulfilledAt",
         "type": "uint40",
         "internalType": "uint40"
-      },
-      {
-        "name": "publicValuesHash",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "publicValues",
-        "type": "bytes",
-        "internalType": "bytes"
       }
     ],
     "stateMutability": "view"

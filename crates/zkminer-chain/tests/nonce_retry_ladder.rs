@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use zkminer_chain::client::ChainClient;
-use zkminer_chain::jobs::MAX_TX_ATTEMPTS;
+use zkminer_chain::jobs::{ClaimQuote, MAX_TX_ATTEMPTS};
 
 const CHAIN_ID: u64 = 743111;
 const KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -186,7 +186,12 @@ async fn a_rejected_nonce_ladder_backs_off_between_sends() {
     let client = ChainClient::new(&config(&url), signer).await.unwrap();
 
     let t0 = Instant::now();
-    let outcome = client.claim_job(B256::repeat_byte(0x11)).await;
+    let quote = ClaimQuote {
+        block: 0,
+        price_floor: 0,
+        premium_floor: 0,
+    };
+    let outcome = client.claim_job(B256::repeat_byte(0x11), &quote).await;
     let total = t0.elapsed();
 
     assert!(

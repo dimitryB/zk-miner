@@ -1249,7 +1249,7 @@ mod healer_bid_tests {
         let m = NonceManager::new();
         m.anchor_if_unsynced(11_589);
 
-        // Seed from the RELEASE ladder (attempt + FULFILL_ESCALATION_HEADROOM), which is
+        // Seed from the old RELEASE ladder (attempt 10), which is
         // the shape that actually wedged 11589 -- not the shorter claim ladder.
         let mut v = base;
         for _ in 0..9 {

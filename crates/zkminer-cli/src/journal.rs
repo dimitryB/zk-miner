@@ -36,6 +36,9 @@ pub struct JournalEntry {
     pub claimed_at: i64,
     /// The claim tx hash (populated once the tx is broadcast).
     pub claim_tx: Option<B256>,
+    /// The job's submitting tx (from the monitor), so a restart can rebuild the descriptor of a held
+    /// lock with one tx read, without depending on a long log scan.
+    pub submit_tx: Option<B256>,
     /// On-chain lock deadline (unix seconds) — a hint; authoritative value is
     /// always re-read from chain before acting.
     pub lock_deadline: u64,
@@ -48,6 +51,7 @@ impl Default for JournalEntry {
             job_id: B256::ZERO,
             claimed_at: 0,
             claim_tx: None,
+            submit_tx: None,
             lock_deadline: 0,
             state: JournalState::Claiming,
         }
@@ -111,17 +115,18 @@ impl JobJournal {
         Ok(())
     }
 
-    pub fn record_claim_intent(&mut self, job_id: B256, lock_deadline: u64) {
-        self.entries.insert(
+    /// Record that a claim is about to be sent. An EXISTING entry is kept as is: it may track an
+    /// earlier claim tx of ours that is still pending (or mined unseen), and its age is what decides
+    /// when that intent is given up.
+    pub fn record_claim_intent(&mut self, job_id: B256, lock_deadline: u64, submit_tx: Option<B256>) {
+        self.entries.entry(job_id).or_insert(JournalEntry {
             job_id,
-            JournalEntry {
-                job_id,
-                claimed_at: chrono::Utc::now().timestamp(),
-                claim_tx: None,
-                lock_deadline,
-                state: JournalState::Claiming,
-            },
-        );
+            claimed_at: chrono::Utc::now().timestamp(),
+            claim_tx: None,
+            submit_tx,
+            lock_deadline,
+            state: JournalState::Claiming,
+        });
     }
 
     pub fn mark_claimed(&mut self, job_id: B256, claim_tx: Option<B256>, lock_deadline: u64) {
@@ -129,6 +134,7 @@ impl JobJournal {
             job_id,
             claimed_at: chrono::Utc::now().timestamp(),
             claim_tx: None,
+            submit_tx: None,
             lock_deadline,
             state: JournalState::Claimed,
         });
@@ -180,7 +186,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut j = JobJournal::default();
         let jid = B256::repeat_byte(0xAB);
-        j.record_claim_intent(jid, 12345);
+        j.record_claim_intent(jid, 12345, None);
         j.mark_claimed(jid, Some(B256::repeat_byte(0xCD)), 12345);
         j.save_to(&path).unwrap();
 
@@ -206,8 +212,15 @@ mod tests {
     fn state_transitions() {
         let mut j = JobJournal::default();
         let jid = B256::repeat_byte(0x01);
-        j.record_claim_intent(jid, 100);
+        j.record_claim_intent(jid, 100, Some(B256::repeat_byte(0x02)));
         assert_eq!(j.entries[&jid].state, JournalState::Claiming);
+        // A second claim intent never overwrites an existing entry (it may track an unresolved
+        // earlier claim): its age and data stay.
+        let before = j.entries[&jid].claimed_at;
+        j.record_claim_intent(jid, 999, None);
+        assert_eq!(j.entries[&jid].claimed_at, before);
+        assert_eq!(j.entries[&jid].lock_deadline, 100);
+        assert_eq!(j.entries[&jid].submit_tx, Some(B256::repeat_byte(0x02)));
         j.mark_claimed(jid, None, 100);
         assert_eq!(j.entries[&jid].state, JournalState::Claimed);
         j.mark_proving(jid);

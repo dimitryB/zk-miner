@@ -5,7 +5,6 @@
 //! descriptor, which we reconstruct by fetching the transaction that emitted the
 //! JobSubmitted event and decoding its calldata.
 
-use alloy::consensus::Transaction;
 use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
@@ -37,8 +36,9 @@ impl std::fmt::Display for UndecodableDescriptor {
 
 impl std::error::Error for UndecodableDescriptor {}
 
-/// Default lookback window for JobSubmitted log queries, in blocks.
-/// Hemi produces ~2-second blocks, so 500_000 blocks ≈ 11.5 days — well beyond
+/// Default lookback window for JobSubmitted log queries, in blocks (floored at the deployment's
+/// first block, `ChainClient::scan_from_block`). Hemi testnet produces 12-second blocks, so
+/// 500_000 blocks ≈ 69 days — well beyond
 /// any realistic lock_deadline + margin. This bounds the log scan to a range
 /// most RPC providers accept (typically 1k–10k is the per-request cap, but
 /// providers honour the absolute range here — the query is still narrowed by
@@ -109,8 +109,16 @@ pub async fn fetch_job_descriptor_checked(
         Some(expected_hash),
     )
     .await?;
-    verify_descriptor_hash(&d, expected_hash)?;
+    // The scan decoded the AUTHORITATIVE tx (the one whose JobSubmitted log names this jobId) and
+    // the hash is a pure function of it, so a mismatch can never heal: type it permanent so the
+    // caller negative-caches this jobId instead of re-scanning it every tick.
+    verify_descriptor_hash(&d, expected_hash).map_err(|e| undecodable(format!("{e:#}")))?;
     Ok(d)
+}
+
+/// A permanent decode verdict (see [`UndecodableDescriptor`]) as an `anyhow::Error`.
+fn undecodable(msg: String) -> anyhow::Error {
+    UndecodableDescriptor(msg).into()
 }
 
 /// Same as [`fetch_job_descriptor`] with an explicit lookback window.
@@ -141,7 +149,11 @@ async fn scan_for_descriptor(
         .head_block_cached()
         .await
         .context("Failed to get cached head block for descriptor lookup")?;
-    let from_block = latest.saturating_sub(lookback_blocks);
+    // Floor at the deployment's first block: no HemiProve log exists below it, and a 500k-block
+    // window at Hemi's 12-s blocks (~69 days) would otherwise reach far before the deployment.
+    let from_block = latest
+        .saturating_sub(lookback_blocks)
+        .max(client.scan_from_block.min(latest));
 
     // 1. Find the JobSubmitted log for this job_id. jobId is topic1 (indexed).
     let filter = Filter::new()
@@ -151,15 +163,31 @@ async fn scan_for_descriptor(
         .from_block(from_block)
         .to_block(latest);
 
-    let logs = client
-        .provider
-        .get_logs(&filter)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to query JobSubmitted logs for descriptor recovery (blocks {from_block}..={latest})"
-            )
-        })?;
+    // One query over the whole window first (the common case, cheap where the RPC allows it). An RPC
+    // that caps the block range refuses it every time, so fall back to a chunked scan BACKWARDS from
+    // the head, stopping at the first hit — otherwise a held lock's descriptor could never be rebuilt
+    // there, and the lock could only be released.
+    let logs = match client.provider.get_logs(&filter).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::debug!(
+                "JobSubmitted scan {from_block}..={latest} refused ({e:#}) — retrying in chunks"
+            );
+            const CHUNK: u64 = 9000;
+            let mut end = latest;
+            loop {
+                let start = end.saturating_sub(CHUNK - 1).max(from_block);
+                let chunk = filter.clone().from_block(start).to_block(end);
+                let l = client.provider.get_logs(&chunk).await.with_context(|| {
+                    format!("Failed to query JobSubmitted logs for descriptor recovery (blocks {start}..={end})")
+                })?;
+                if !l.is_empty() || start == from_block {
+                    break l;
+                }
+                end = start - 1;
+            }
+        }
+    };
 
     let log = logs
         .first()
@@ -182,15 +210,26 @@ async fn decode_descriptor_from_tx(
     tx_hash: B256,
     known_hash: Option<B256>,
 ) -> Result<JobDescriptor> {
-    // Fetch the submitting tx and extract its calldata.
-    let tx = client
+    // Fetch the submitting tx and extract its calldata — as RAW JSON, not through the typed
+    // Ethereum-network response. Hemi is an OP Stack chain: a job can be submitted from L1 through a
+    // deposit transaction (type 0x7E), which alloy's Ethereum `TxEnvelope` cannot deserialize. The
+    // typed fetch then fails like a transport error, the job looks "transient" forever, and a few
+    // such jobs priced above honest work hold every measure slot on every tick. Only `input` is
+    // needed, and every tx type carries it.
+    let raw: Option<serde_json::Value> = client
         .provider
-        .get_transaction_by_hash(tx_hash)
+        .raw_request("eth_getTransactionByHash".into(), (tx_hash,))
         .await
-        .context("Failed to fetch submitting transaction")?
-        .ok_or_else(|| anyhow::anyhow!("Transaction {} not found", tx_hash))?;
-
-    let calldata = tx.input();
+        .context("Failed to fetch submitting transaction")?;
+    let raw = raw.ok_or_else(|| anyhow::anyhow!("Transaction {} not found", tx_hash))?;
+    // The tx EXISTS (the node returned it); a missing or unparsable `input` cannot heal.
+    let calldata: Bytes = raw
+        .get("input")
+        .and_then(|v: &serde_json::Value| v.as_str())
+        .ok_or_else(|| undecodable(format!("submitting tx {tx_hash} carries no `input` field")))?
+        .parse()
+        .map_err(|e| undecodable(format!("submitting tx {tx_hash} has unparsable `input`: {e}")))?;
+    let calldata = &calldata[..];
     if calldata.len() < 4 {
         // Deterministic & permanent: the authoritative submit tx's calldata cannot carry a selector,
         // so the descriptor can never be reconstructed. Typed so the caller negative-caches it.
@@ -209,20 +248,22 @@ async fn decode_descriptor_from_tx(
     //    locked) but its descriptor can't be reconstructed → unfulfillable → strand. That
     //    is also a cheap griefing vector: a submitter can lock up a prover's collateral on
     //    a job it can never fulfill.
+    // A recognised selector whose calldata does not decode is as permanent as an unknown one: the
+    // calldata is immutable (typically a non-router contract exposing a same-selector function).
     let descriptor = if selector == IHemiProveCore::submitJobCall::SELECTOR {
         let decoded = IHemiProveCore::submitJobCall::abi_decode(calldata)
-            .context("Failed to decode submitJob calldata")?;
+            .map_err(|e| undecodable(format!("submitJob calldata does not decode: {e}")))?;
         decoded.descriptor
     } else if selector == IHemiProveCore::submitJobSimpleCall::SELECTOR {
         let decoded = IHemiProveCore::submitJobSimpleCall::abi_decode(calldata)
-            .context("Failed to decode submitJobSimple calldata")?;
+            .map_err(|e| undecodable(format!("submitJobSimple calldata does not decode: {e}")))?;
         decoded.descriptor
     } else if selector == IHemiProveCore::submitJobBatchCall::SELECTOR {
         // A batch tx carries N descriptors; jobIds are index-derived and not recoverable
         // from calldata, so select the descriptor whose hash matches THIS job's on-chain
         // descriptorHash.
         let decoded = IHemiProveCore::submitJobBatchCall::abi_decode(calldata)
-            .context("Failed to decode submitJobBatch calldata")?;
+            .map_err(|e| undecodable(format!("submitJobBatch calldata does not decode: {e}")))?;
         // When the caller already holds the on-chain descriptorHash, use it to
         // select the descriptor without the extra getJobStatusView read.
         let want = match known_hash {
@@ -237,18 +278,23 @@ async fn decode_descriptor_from_tx(
                     .descriptorHash
             }
         };
+        // `want` is the on-chain descriptorHash (caller-held or read from the chain), so no match in
+        // this immutable calldata is permanent.
         decoded
             .descriptors
             .into_iter()
             .find(|d| compute_descriptor_hash(d) == want)
             .ok_or_else(|| {
-                anyhow::anyhow!(
+                undecodable(format!(
                     "submitJobBatch: no descriptor in the batch matches job {job_id}'s hash {want}"
-                )
+                ))
             })?
     } else if selector == IHemiProveCore::submitJobDefaultCall::SELECTOR {
         let decoded = IHemiProveCore::submitJobDefaultCall::abi_decode(calldata)
-            .context("Failed to decode submitJobDefault calldata")?;
+            .map_err(|e| undecodable(format!("submitJobDefault calldata does not decode: {e}")))?;
+        // Mirrors HemiProveCore.submitJobDefault: zero assignedProver/tag, empty extra-data fields,
+        // and the CALLER-SUPPLIED journal binding (both words). Every open-market job is FULL or
+        // FIELDS bound, so the binding words are never implicitly zero here.
         JobDescriptor {
             programId: decoded.programId,
             proofSystemId: decoded.proofSystemId,
@@ -258,8 +304,8 @@ async fn decode_descriptor_from_tx(
             inputData: decoded.inputData,
             callbackExtraData: Bytes::new(),
             extraVerifierData: Bytes::new(),
-            // submitJobDefault never sets a predicate.
-            expectedJournalHash: B256::ZERO,
+            expectedJournalHash: decoded.expectedJournalHash,
+            journalFields: decoded.journalFields,
         }
     } else {
         // Deterministic & permanent: the authoritative submit tx used an entry point we cannot decode
@@ -276,14 +322,14 @@ async fn decode_descriptor_from_tx(
     Ok(descriptor)
 }
 
-/// Compute the descriptor hash matching the on-chain `_computeDescriptorHash`.
+/// Compute the descriptor hash matching the on-chain `_hashDescriptorFields` (HemiProveBase).
 ///
 /// The Solidity implementation pre-hashes each `bytes` field before encoding:
 /// ```solidity
 /// keccak256(abi.encode(
 ///     programId, proofSystemId, callback, assignedProver, tag,
 ///     keccak256(inputData), keccak256(callbackExtraData), keccak256(extraVerifierData),
-///     expectedJournalHash                 // 9th slot, raw bytes32
+///     expectedJournalHash, journalFields  // slots 9 and 10, raw bytes32
 /// ))
 /// ```
 ///
@@ -294,8 +340,8 @@ pub fn compute_descriptor_hash(descriptor: &JobDescriptor) -> B256 {
     let callback_extra_data_hash = keccak256(&descriptor.callbackExtraData);
     let extra_verifier_data_hash = keccak256(&descriptor.extraVerifierData);
 
-    // 9 words × 32 bytes = 288 bytes, matching abi.encode of 9 fixed-size values
-    let mut encoded = Vec::with_capacity(288);
+    // 10 words × 32 bytes = 320 bytes, matching abi.encode of 10 fixed-size values
+    let mut encoded = Vec::with_capacity(320);
     encoded.extend_from_slice(descriptor.programId.as_slice());
     encoded.extend_from_slice(descriptor.proofSystemId.as_slice());
     // address → left-padded 32 bytes
@@ -309,8 +355,9 @@ pub fn compute_descriptor_hash(descriptor: &JobDescriptor) -> B256 {
     encoded.extend_from_slice(input_data_hash.as_slice());
     encoded.extend_from_slice(callback_extra_data_hash.as_slice());
     encoded.extend_from_slice(extra_verifier_data_hash.as_slice());
-    // bytes32 expectedJournalHash (raw, NOT pre-hashed)
+    // bytes32 expectedJournalHash and bytes32 journalFields (raw, NOT pre-hashed)
     encoded.extend_from_slice(descriptor.expectedJournalHash.as_slice());
+    encoded.extend_from_slice(descriptor.journalFields.as_slice());
 
     keccak256(&encoded)
 }
@@ -363,23 +410,28 @@ mod tests {
         assert_eq!(t, expected);
     }
 
+    /// Descriptor with every field set to a distinct value (journalFields included).
+    fn full_descriptor() -> JobDescriptor {
+        JobDescriptor {
+            programId: B256::repeat_byte(0x42),
+            proofSystemId: keccak256("risczero.groth16.v1"),
+            callbackContract: Address::repeat_byte(0xAB),
+            assignedProver: Address::repeat_byte(0xCD),
+            tag: B256::repeat_byte(0xEF),
+            inputData: Bytes::from_static(b"hello world"),
+            callbackExtraData: Bytes::from_static(b"cb-extra"),
+            extraVerifierData: Bytes::from_static(b"vx"),
+            expectedJournalHash: B256::repeat_byte(0x33),
+            journalFields: B256::repeat_byte(0x55),
+        }
+    }
+
     #[test]
     fn descriptor_hash_prehashes_bytes_fields() {
         // With non-empty inputData, the hash must NOT equal naive abi.encode(struct).
-        let d = JobDescriptor {
-            programId: B256::repeat_byte(0x11),
-            proofSystemId: B256::repeat_byte(0x22),
-            callbackContract: Address::ZERO,
-            assignedProver: Address::ZERO,
-            tag: B256::ZERO,
-            inputData: Bytes::from_static(b"test input data"),
-            callbackExtraData: Bytes::new(),
-            extraVerifierData: Bytes::new(),
-            expectedJournalHash: B256::ZERO,
-        };
+        let d = full_descriptor();
         let correct_hash = compute_descriptor_hash(&d);
         let naive_hash = keccak256(d.abi_encode());
-        // These must differ — the naive encoding doesn't pre-hash bytes fields.
         assert_ne!(
             correct_hash, naive_hash,
             "descriptor hash should NOT equal naive abi.encode — bytes fields must be pre-hashed"
@@ -389,19 +441,22 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_hash_covers_both_binding_words() {
+        // journalFields is the 10th hashed word: a job differing ONLY in it (or only in
+        // expectedJournalHash) has a different descriptorHash, so the binding is pinned by the hash.
+        let d = full_descriptor();
+        let mut other_fields = d.clone();
+        other_fields.journalFields = B256::repeat_byte(0x56);
+        assert_ne!(compute_descriptor_hash(&d), compute_descriptor_hash(&other_fields));
+        let mut other_ejh = d.clone();
+        other_ejh.expectedJournalHash = B256::repeat_byte(0x34);
+        assert_ne!(compute_descriptor_hash(&d), compute_descriptor_hash(&other_ejh));
+    }
+
+    #[test]
     fn descriptor_hash_matches_prover_crate() {
         // Cross-validate with the zkminer_prover descriptor hash implementation.
-        let d = JobDescriptor {
-            programId: B256::repeat_byte(0xAA),
-            proofSystemId: keccak256("risczero.v1"),
-            callbackContract: Address::repeat_byte(0x01),
-            assignedProver: Address::ZERO,
-            tag: B256::repeat_byte(0xBB),
-            inputData: Bytes::from_static(b"hello world"),
-            callbackExtraData: Bytes::from_static(b"callback"),
-            extraVerifierData: Bytes::from_static(b"verifier"),
-            expectedJournalHash: B256::repeat_byte(0x77),
-        };
+        let d = full_descriptor();
         let our_hash = compute_descriptor_hash(&d);
         let prover_hash = zkminer_prover::descriptor::compute_descriptor_hash(
             d.programId,
@@ -413,6 +468,7 @@ mod tests {
             &d.callbackExtraData,
             &d.extraVerifierData,
             d.expectedJournalHash,
+            d.journalFields,
         );
         assert_eq!(
             our_hash, prover_hash,
@@ -421,167 +477,92 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_hash_empty_bytes_still_correct() {
-        // With all-empty bytes fields, verify consistency.
-        let d = JobDescriptor {
-            programId: B256::ZERO,
-            proofSystemId: B256::ZERO,
-            callbackContract: Address::ZERO,
-            assignedProver: Address::ZERO,
-            tag: B256::ZERO,
-            inputData: Bytes::new(),
-            callbackExtraData: Bytes::new(),
-            extraVerifierData: Bytes::new(),
-            expectedJournalHash: B256::ZERO,
-        };
-        let h = compute_descriptor_hash(&d);
-        assert!(verify_descriptor_hash(&d, h).is_ok());
-        assert!(verify_descriptor_hash(&d, B256::ZERO).is_err());
-    }
-
-    #[test]
     fn descriptor_hash_matches_independent_tuple_encoding() {
-        // Solidity reference: our hash must equal
-        //   keccak256(abi.encode(bytes32, bytes32, address, address, bytes32, bytes32, bytes32, bytes32))
-        // where the last three bytes32s are keccak256 of the bytes fields.
-        //
-        // alloy's `SolValue::abi_encode` on a Rust tuple of those exact types
-        // produces Solidity's `abi.encode(...)` output for those types, giving
-        // an independent reference encoding that does NOT go through the
-        // `sol!`-generated `JobDescriptor` struct path. If our manual
-        // byte-packing in `compute_descriptor_hash` matches this tuple encoding,
-        // the implementation is Solidity-correct.
-        let program_id = B256::repeat_byte(0x42);
-        let proof_system_id = keccak256("risczero.v1");
-        let callback = Address::repeat_byte(0xAB);
-        let assigned = Address::repeat_byte(0xCD);
-        let tag = B256::repeat_byte(0xEF);
-        let input_data = b"hello world".as_slice();
-        let callback_extra = b"cb-extra".as_slice();
-        let extra_verifier = b"vx".as_slice();
-        let expected_journal = B256::repeat_byte(0x33);
-
-        let d = JobDescriptor {
-            programId: program_id,
-            proofSystemId: proof_system_id,
-            callbackContract: callback,
-            assignedProver: assigned,
-            tag,
-            inputData: Bytes::copy_from_slice(input_data),
-            callbackExtraData: Bytes::copy_from_slice(callback_extra),
-            extraVerifierData: Bytes::copy_from_slice(extra_verifier),
-            expectedJournalHash: expected_journal,
-        };
-        let our_hash = compute_descriptor_hash(&d);
-
-        // Independent reference via alloy tuple abi.encode (9 fixed-size words).
+        // Independent reference: alloy's tuple `abi_encode` of the 10 fixed-size words (Solidity's
+        // `abi.encode(...)` for those types), NOT going through the sol!-generated struct path.
+        let d = full_descriptor();
         let reference_tuple = (
-            program_id,
-            proof_system_id,
-            callback,
-            assigned,
-            tag,
-            keccak256(input_data),
-            keccak256(callback_extra),
-            keccak256(extra_verifier),
-            expected_journal,
+            d.programId,
+            d.proofSystemId,
+            d.callbackContract,
+            d.assignedProver,
+            d.tag,
+            keccak256(&d.inputData),
+            keccak256(&d.callbackExtraData),
+            keccak256(&d.extraVerifierData),
+            d.expectedJournalHash,
+            d.journalFields,
         );
         let reference_encoded = reference_tuple.abi_encode();
-        let reference_hash = keccak256(&reference_encoded);
-        assert_eq!(
-            our_hash, reference_hash,
-            "compute_descriptor_hash must equal keccak256(abi.encode(bytes32,bytes32,address,address,bytes32,bytes32,bytes32,bytes32,bytes32)) with bytes fields pre-hashed"
-        );
-
-        // The encoding length must be exactly 9*32 = 288 bytes (no dynamic tails).
-        assert_eq!(
-            reference_encoded.len(),
-            288,
-            "abi.encode of 9 fixed-size values must be 288 bytes"
-        );
+        assert_eq!(reference_encoded.len(), 320, "abi.encode of 10 fixed-size values is 320 bytes");
+        assert_eq!(compute_descriptor_hash(&d), keccak256(&reference_encoded));
     }
 
-    /// Solidity-derived hardcoded reference vector.
-    ///
-    /// Inputs:
-    ///   programId       = 0x0000…01 (all zero except last byte = 1)
-    ///   proofSystemId   = keccak256("risczero.v1")
-    ///                   = 0x0b01f44f... (verified by `cast keccak "risczero.v1"`)
-    ///   callback        = 0x0000…0000 (zero address)
-    ///   assignedProver  = 0x0000…0000
-    ///   tag             = 0x0000…0000
-    ///   inputData       = ""
-    ///   callbackExtra   = ""
-    ///   extraVerifier   = ""
-    ///
-    /// keccak256("") = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
-    ///
-    /// We don't have a live Solidity runtime in tests, so this test reconstructs
-    /// the reference via an independent path (alloy's tuple abi_encode of the
-    /// 8 fixed-size words) and captures the resulting hash as a regression
-    /// fixture. A future change to either `compute_descriptor_hash` OR
-    /// `alloy::sol_types::SolValue::abi_encode` that diverges will fail this
-    /// test. If the contract ever changes its encoding, this test's expected
-    /// vector must be regenerated from the new contract.
+    /// The c8333aa Solidity test suite's pinned vector (test/utils/SP1PlonkNonceScenario.sol, asserted
+    /// in test/integration/SP1PlonkProofs.t.sol `test_scenario_pinnedDerivations`): an SP1 PLONK job
+    /// with a FULL expectedJournalHash AND the proof-nonce marker in journalFields slot 0. The
+    /// expected values were produced by the deployed contracts' own code (and re-derived independently
+    /// with Foundry's `cast abi-encode`), so this anchors zkminer to the CONTRACT, not to itself.
     #[test]
-    fn descriptor_hash_regression_vector() {
-        let program_id = {
-            let mut b = [0u8; 32];
-            b[31] = 1;
-            B256::from(b)
-        };
-        let proof_system_id = keccak256("risczero.v1");
+    fn descriptor_hash_matches_the_contract_suites_pinned_vector() {
+        let vkey: B256 = "0x00122a038d1d9663aa5bd7cbd78d74f71c5e878ed253458363d8cb3ea9dafe7f"
+            .parse()
+            .unwrap();
+        let journal = alloy::hex::decode(
+            "48656d6950726f766520535031206e6f6e636520666978747572652076310000",
+        )
+        .unwrap();
+        let sp1_plonk_v1 = keccak256("sp1.plonk.v1");
+        let domain = keccak256("HemiProve.JournalPredicate.v1");
+        assert_eq!(
+            format!("{domain:x}"),
+            "8fc1eec9ac3fed1ebf9116804d90a1da182248d5fcdc1edcc673416bf4231898"
+        );
+        // FULL hash = keccak256(abi.encode(DOMAIN, proofSystemId, programId, bytes publicValues)):
+        // Solidity's abi.encode of a parameter LIST (abi_encode_params), not a wrapped tuple.
+        let ejh = keccak256(
+            (domain, sp1_plonk_v1, vkey, Bytes::from(journal.clone())).abi_encode_params(),
+        );
+        assert_eq!(
+            format!("{ejh:x}"),
+            "e677a15afce77fc76392d113eec364ff86ff836617a5c6da8f79aec1163bd6b5",
+            "FULL expectedJournalHash (cast-derived)"
+        );
+        let mut nonce_marker = [0u8; 32];
+        nonce_marker[..4].copy_from_slice(&[0xff, 0xff, 0xff, 0xfe]);
         let d = JobDescriptor {
-            programId: program_id,
-            proofSystemId: proof_system_id,
+            programId: vkey,
+            proofSystemId: sp1_plonk_v1,
             callbackContract: Address::ZERO,
             assignedProver: Address::ZERO,
             tag: B256::ZERO,
-            inputData: Bytes::new(),
+            inputData: Bytes::from(journal),
             callbackExtraData: Bytes::new(),
             extraVerifierData: Bytes::new(),
-            expectedJournalHash: B256::ZERO,
+            expectedJournalHash: ejh,
+            journalFields: B256::from(nonce_marker),
         };
-
-        let our_hash = compute_descriptor_hash(&d);
-
-        // Independent path: manually build the 288-byte abi.encode(bytes32*9)
-        // buffer and hash it. If `compute_descriptor_hash` matches this, they
-        // share the same encoding definition.
-        let empty_hash = keccak256(b"");
-        let mut buf = [0u8; 288];
-        buf[31] = 1; // programId
-        buf[32..64].copy_from_slice(proof_system_id.as_slice()); // proofSystemId
-                                                                 // callback: 32 zeros
-                                                                 // assignedProver: 32 zeros
-                                                                 // tag: 32 zeros
-        buf[160..192].copy_from_slice(empty_hash.as_slice()); // keccak256(inputData)
-        buf[192..224].copy_from_slice(empty_hash.as_slice()); // keccak256(callbackExtra)
-        buf[224..256].copy_from_slice(empty_hash.as_slice()); // keccak256(extraVerifier)
-                                                              // buf[256..288]: expectedJournalHash = 32 zeros
-        let manual_hash = keccak256(&buf);
-
+        let h = compute_descriptor_hash(&d);
         assert_eq!(
-            our_hash, manual_hash,
-            "descriptor hash must match manual abi.encode(bytes32*9) reference"
+            format!("{h:x}"),
+            "fac3c0e8c040b047fb89ef5ac44c4a760a3a5806f8150e46b08f74f74b160fd0",
+            "descriptorHash pinned by the contract test suite"
         );
-
-        // Also cross-check with the alloy tuple encoding.
-        let reference_tuple = (
-            program_id,
-            proof_system_id,
-            Address::ZERO,
-            Address::ZERO,
-            B256::ZERO,
-            empty_hash,
-            empty_hash,
-            empty_hash,
-            B256::ZERO,
+        // jobId = keccak256(abi.encode(chainid, router, uint48 jobIndex, descriptorHash)).
+        let router: Address = "0xC353289ef20D8846Fd7cf3c50111a16f06C3CbC7".parse().unwrap();
+        let job_id = keccak256(
+            (
+                alloy::primitives::U256::from(743111u64),
+                router,
+                alloy::primitives::aliases::U48::from(0u64),
+                h,
+            )
+                .abi_encode(),
         );
-        let reference_hash = keccak256(reference_tuple.abi_encode());
         assert_eq!(
-            our_hash, reference_hash,
-            "descriptor hash must match alloy tuple encoding"
+            format!("{job_id:x}"),
+            "d7410d92ac26dbf8270be9f4d856510a7ca693de9cb94fec10fa6ccffa101ca8",
+            "jobId pinned by the contract test suite"
         );
     }
 }

@@ -185,12 +185,25 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(_panic) => {
+                    Err(panic) => {
+                        // A prove-path panic is usually OURS: risc0's CUDA HAL panics on a failed
+                        // allocation or GPU call (`.unwrap()` / `panic!` in hal/cuda.rs). It does not
+                        // say the job is bad, so it must never be typed InvalidInput. OOM routes to a
+                        // bigger card; anything else is a sick worker to replace.
+                        let detail = panic
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("");
+                        let kind = if is_gpu_oom(detail) || detail.contains("allocation failed") {
+                            ErrorKind::ResourceExhausted
+                        } else {
+                            ErrorKind::Internal
+                        };
                         let resp = WorkerResponse::Error {
                             request_id,
-                            kind: ErrorKind::InvalidInput,
-                            message: "risc0 prover panicked on this ELF (malformed or hostile program)"
-                                .to_string(),
+                            kind,
+                            message: format!("risc0 prover panicked: {detail}"),
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -205,7 +218,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         // prevent. A guest that faults in the prove-only path is a BAD JOB, not a sick
                         // worker: classify InvalidInput and never let its text reach is_gpu_oom.
                         // (Session-/cycle-limit are too-heavy bad jobs; their text is host-generated.)
+                        // "Unknown syscall: <name>" quotes a GUEST-chosen string (and has no panic
+                        // prefix), so it is matched here, before any classifier reads the text.
                         let kind = if lower.contains("guest panicked")
+                            || lower.starts_with("unknown syscall")
+                            || lower.contains(": unknown syscall")
                             || lower.contains("session limit")
                             || lower.contains("exceeded cycle")
                             || lower.contains("non-zero exit code")
@@ -402,14 +419,14 @@ fn detect_gpu() -> (bool, Option<String>) {
 /// contend for the GPU that the proofs it sizes are running on.
 /// True when `image_id` (a risc0 guest image id, 32 bytes) corresponds to the on-chain `program_id`.
 ///
-/// The byte order the registry stores a risc0 programId in — vs risc0's native word layout from
-/// `Digest::as_bytes` — is deployment-defined and not knowable from this repo, so we accept EITHER
-/// order. A legitimately matching ELF matches under whichever order the chain used; an ELF that is a
-/// *different* program matches under neither (a 256-bit collision is infeasible). Accepting both
-/// orders is what guarantees the binding check can never false-reject a genuine job.
+/// NATIVE byte order only (`Digest::as_bytes`). The deployed HemiProve v2 risc0 adapter passes the
+/// job's programId VERBATIM as the image id to the risc0-ethereum verifier
+/// (`verify(seal, programId, sha256(journal))`, RiscZeroGroth16VerifierAdapter), and zkminer pins that
+/// adapter's code at startup — so only the native order can ever verify. Accepting the byte-reversed
+/// order too (as the v1 binding did) let a submitter register `reverse(imageId)` and have us claim,
+/// prove and publish a proof the adapter must reject (`VerifierCallFailed`), releasing at a penalty.
 fn image_id_matches(image_id: &[u8], program_id: &[u8; 32]) -> bool {
     image_id == program_id.as_slice()
-        || image_id.iter().rev().copied().eq(program_id.iter().copied())
 }
 
 /// Set `ZKMINER_RISC0_SKIP_PROGRAM_ID_CHECK=1` to disable the image-id↔programId binding (only for a
@@ -1209,17 +1226,18 @@ mod program_id_tests {
     use super::*;
 
     #[test]
-    fn matches_forward_and_reverse_but_not_a_different_id() {
+    fn matches_native_order_only_and_not_a_different_id() {
         let mut img = [0u8; 32];
         for (i, b) in img.iter_mut().enumerate() {
             *b = i as u8;
         }
-        // Same bytes (forward order) matches.
+        // Same bytes (native order) matches.
         assert!(image_id_matches(&img, &img));
-        // The chain may store the reversed order — that must still match.
+        // The v2 adapter verifies against programId verbatim: the reversed order can never verify,
+        // so it must NOT match (else a reversed registration is claimed, proved and rejected).
         let mut rev = img;
         rev.reverse();
-        assert!(image_id_matches(&img, &rev));
+        assert!(!image_id_matches(&img, &rev));
         // A genuinely different program (one bit flipped) matches under neither order.
         let mut other = img;
         other[0] ^= 0x01;

@@ -11872,6 +11872,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

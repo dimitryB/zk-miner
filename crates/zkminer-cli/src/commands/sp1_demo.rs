@@ -68,7 +68,7 @@ pub async fn run(config_path: Option<&Path>, n: u32) -> Result<()> {
     println!("Using wallet {}", client.address);
 
     // 4. Register the program (idempotent — skip if already registered)
-    let sp1_v1 = zkminer_chain::auction::sp1_v1_id();
+    let sp1_v1 = zkminer_chain::auction::sp1_groth16_v1_id();
     let program_registry_addr = client
         .program_registry
         .context("program_registry address not configured")?;
@@ -132,11 +132,8 @@ pub async fn run(config_path: Option<&Path>, n: u32) -> Result<()> {
         }
     }
 
-    println!("Minting tHEMI in case balance is short...");
-    use zkminer_contracts::bindings::ITestnetToken;
-    let minter = ITestnetToken::new(client.hemi_token, &*client.provider);
-    let mint_tx = minter.mint(client.address, deposit_approval);
-    let _ = mint_tx.send().await?.get_receipt().await?; // best-effort
+    // The 743111 tHEMI is OWNER-minted (a prover's `mint` reverts OwnableUnauthorizedAccount): the
+    // demo wallet must already hold enough tHEMI for the deposit (ask the HemiProve team).
 
     // Input data for fibonacci(n) — SP1 `read::<u32>()` reads 4 LE bytes.
     let input_data = Bytes::from(n.to_le_bytes().to_vec());
@@ -146,12 +143,15 @@ pub async fn run(config_path: Option<&Path>, n: u32) -> Result<()> {
         programId: program_id,
         proofSystemId: sp1_v1,
         callbackContract: Address::ZERO,
-        assignedProver: Address::ZERO,
+        // A NONE-bound job (no journal check) must name its assigned prover — only that prover can
+        // ever lock it (InvalidJournalBinding(3) otherwise). The demo proves its own job.
+        assignedProver: client.address,
         tag: B256::ZERO,
         inputData: input_data,
         callbackExtraData: Bytes::new(),
         extraVerifierData: Bytes::new(),
-        expectedJournalHash: B256::ZERO, // no predicate for the demo
+        expectedJournalHash: B256::ZERO,
+        journalFields: B256::ZERO,
     };
     use alloy::primitives::aliases::{U40, U96};
     let auction = AuctionConfig {
@@ -165,7 +165,7 @@ pub async fn run(config_path: Option<&Path>, n: u32) -> Result<()> {
         exclusivityDuration: U40::from(0u64),
         callbackGasLimit: 0,
         excludeFromEwma: false,
-        strictCallbackMode: false,
+        laxCallbackMode: false,
     };
     let cycle = CycleConfig {
         expectedCycles: 0,

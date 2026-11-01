@@ -394,9 +394,10 @@ impl From<u8> for StorageKind {
 }
 
 impl ChainClient {
-    /// Query the ProgramRegistry for a program's metadata. Cached per programId
-    /// (registered metadata is immutable), so repeated jobs for the same program
-    /// hit the registry only once.
+    /// Query the ProgramRegistry for a program's metadata. Cached per programId for a short TTL:
+    /// registered metadata is MUTABLE (`addStorageURI`, `removeStorageURI`, `setBuildInfo`), and an
+    /// unregistered or URI-less read — which succeeds with empty values — is never cached at all, so
+    /// a job seen before its program's registration cannot block that program for the process's life.
     pub async fn get_program_info(&self, program_id: B256) -> Result<ProgramInfo> {
         if let Some(hit) = self.program_info_cache.lock().unwrap().get(&program_id) {
             return Ok(hit);
@@ -469,8 +470,11 @@ impl ChainClient {
         // So do NOT cache a None elf_hash for an SP1 program — re-read it until the hash is set, then
         // cache normally. (The SP1 measure gate re-checks on a self-healing TTL, so this re-read is
         // bounded, not per-tick.) risc0 legitimately has no registry elf_hash — it is bound by its
-        // image-id — so its None is immutable and cached as before, with no re-read cost.
-        let cacheable = info.elf_hash.is_some() || info.proof_system_id != crate::auction::sp1_v1_id();
+        // image-id — so its None is immutable and cached as before, with no re-read cost. "An SP1
+        // program" means EITHER SP1 id: a program entry is served under both `sp1.groth16.v1` and
+        // `sp1.plonk.v1` (same vkey), so testing one id would re-open the permanent pin for the other.
+        let cacheable = !info.storage_uris.is_empty()
+            && (info.elf_hash.is_some() || !crate::auction::is_sp1_id(info.proof_system_id));
         if cacheable {
             self.program_info_cache
                 .lock()
@@ -590,6 +594,11 @@ impl ElfCache {
         Some(bytes)
     }
 
+    /// Whether an entry for `program_id` is on disk (no read, no hash).
+    pub fn contains(&self, program_id: &B256) -> bool {
+        self.cache_dir.join(format!("{}.elf", program_id)).is_file()
+    }
+
     /// Store an ELF in the cache.
     pub fn put(&self, program_id: &B256, elf: &[u8]) -> Result<()> {
         std::fs::create_dir_all(&self.cache_dir).context("Failed to create ELF cache directory")?;
@@ -676,11 +685,23 @@ impl ElfCache {
     }
 }
 
+/// The registry lists no storage URIs for a program: unregistered, or registered and not yet given a
+/// URI. Says nothing about the program's future, unlike a URI that fails.
+#[derive(Debug, Clone, Copy)]
+pub struct NoStorageUris;
+
+impl std::fmt::Display for NoStorageUris {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("No storage URIs available for this program")
+    }
+}
+impl std::error::Error for NoStorageUris {}
+
 /// Download an ELF binary from a list of storage URIs.
 /// Tries each URI in order until one succeeds.
 pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> Result<Vec<u8>> {
     if uris.is_empty() {
-        bail!("No storage URIs available for this program");
+        return Err(NoStorageUris.into());
     }
 
     // Cap the number of submitter-listed URIs actually tried. download_elf is on the

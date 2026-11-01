@@ -49,12 +49,26 @@ pub struct ChainConfig {
     /// on a rate-limited RPC). None = built-in default (10, ~chain block time).
     #[serde(default)]
     pub monitor_poll_secs: Option<u64>,
-    /// Explicit gas limit for `fulfillJob` txs. The router's settlement-gas
-    /// preflight (~4.6M) reverts `InsufficientGasForFullSettlement()` if the tx
-    /// is under-provisioned, and eth_estimateGas under-provisions it. None =
-    /// built-in default (5_000_000). Bump for verifier-heavy proof systems.
+    /// Minimum gas limit for `fulfillJob` txs. zkminer always sends at least the repo's formula
+    /// (`4.6M + callbackGasLimit + 250k + 16 x calldata + 8 x journal + 500k`, ~5.6M for a 1 KB
+    /// adapter job): the router refuses to start verifying below `4.6M + callbackGasLimit` and
+    /// reverts `InsufficientGasForFullSettlement()`. 5,000,000 is TOO LOW. None = built-in default
+    /// (10,000,000, above every valid job's formula).
     #[serde(default)]
     pub fulfill_gas_limit: Option<u64>,
+    /// Key-wide ceiling (gwei) for the fulfil and release fee ladders (handoff §10): an unmined
+    /// fulfil is re-published at the same nonce with both fees raised >= 12.5% up to this ceiling.
+    /// Size it from what the cheapest lock this key takes is worth: `(price + lockedCollateral) x
+    /// ETH-per-HEMI / ~643k gas` (about 3.6-4.7 gwei for 15-50 HEMI jobs at 50,000 HEMI/ETH). A low
+    /// ceiling makes holding our fulfil out of blocks cheap; fund the key for `fulfil gas limit x
+    /// ceiling` per pending fulfil. None = built-in default (4 gwei).
+    #[serde(default)]
+    pub fee_ceiling_gwei: Option<f64>,
+    /// First block of every HemiProve log scan (job discovery, lock recovery, descriptor
+    /// reconstruction): the deployment's `fromBlock`. None = the known deployment's value for this
+    /// chain (743111: 7095745), else no floor.
+    #[serde(default)]
+    pub scan_from_block: Option<u64>,
     /// Whether to claim jobs that carry a non-zero `expectedJournalHash`
     /// (Phase-2 "journal predicate"). Fulfilling such a job with a proof whose
     /// public values don't satisfy the predicate reverts `JournalMismatch`
@@ -87,6 +101,8 @@ impl Default for ChainConfig {
             monitor_backfill_blocks: None,
             monitor_poll_secs: None,
             fulfill_gas_limit: None,
+            fee_ceiling_gwei: None,
+            scan_from_block: None,
             claim_predicate_jobs: None,
         }
     }
@@ -370,6 +386,14 @@ impl ZkMinerConfig {
                      (got {g}, which rounds to {} wei); omit it to use automatic EIP-1559 \
                      estimation",
                     wei.max(0.0) as u128
+                );
+            }
+        }
+        if let Some(c) = self.chain.fee_ceiling_gwei {
+            if !c.is_finite() || !(0.01..=10_000.0).contains(&c) {
+                anyhow::bail!(
+                    "chain.fee_ceiling_gwei must be between 0.01 and 10000 gwei (got {c}); omit it \
+                     for the built-in default"
                 );
             }
         }
