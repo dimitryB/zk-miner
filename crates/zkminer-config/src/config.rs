@@ -77,6 +77,11 @@ pub struct ChainConfig {
     /// this prover.
     #[serde(default)]
     pub claim_predicate_jobs: Option<bool>,
+    /// Ceiling on JSON-RPC requests per second to `rpc_url`, so a burst cannot trip the endpoint's
+    /// per-IP rate limit. None = built-in default: 4, or 1 for `run --watch-only`, which shares the
+    /// limit with any miner on the same host and IP.
+    #[serde(default)]
+    pub max_requests_per_sec: Option<u32>,
 }
 
 fn default_rpc_url() -> String {
@@ -102,6 +107,7 @@ impl Default for ChainConfig {
             fee_ceiling_gwei: None,
             scan_from_block: None,
             claim_predicate_jobs: None,
+            max_requests_per_sec: None,
         }
     }
 }

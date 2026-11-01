@@ -560,12 +560,24 @@ impl Default for ElfCache {
     }
 }
 
+/// Where [`ElfCache::new`] keeps ELFs instead of `~/.zkminer/elfs`, when set (once, at startup).
+static ELF_CACHE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Keep this process's ELF cache in `dir`, apart from `~/.zkminer/elfs` (a watch-only run, which
+/// must not prune or purge the cache a miner on the same host relies on). Call before any cache is
+/// used; a second call is ignored.
+pub fn set_elf_cache_dir(dir: std::path::PathBuf) {
+    let _ = ELF_CACHE_DIR.set(dir);
+}
+
 impl ElfCache {
     pub fn new() -> Self {
-        let cache_dir = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".zkminer")
-            .join("elfs");
+        let cache_dir = ELF_CACHE_DIR.get().cloned().unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".zkminer")
+                .join("elfs")
+        });
         Self { cache_dir }
     }
 

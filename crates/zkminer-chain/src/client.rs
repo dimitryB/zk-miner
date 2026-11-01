@@ -231,9 +231,17 @@ fn observed_chain_now() -> Option<u64> {
     g.map(|(ts, at)| ts.saturating_add(at.elapsed().as_secs()))
 }
 
+/// The latest header read (its timestamp, and when it was read), whatever it implies: the chain's
+/// clock as the endpoint reports it now. Unlike [`CHAIN_CLOCK`] it can move back, so a chain that
+/// falls behind (a stall, catch-up blocks with past timestamps) shows in [`chain_clock_skew_secs`].
+static LAST_HEADER: std::sync::Mutex<Option<(u64, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
 /// Record a freshly-read block timestamp (kept only if it implies a later chain time than the
 /// current estimate — see [`CHAIN_CLOCK`]).
 pub fn note_chain_time(block_timestamp: u64) {
+    *LAST_HEADER.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some((block_timestamp, std::time::Instant::now()));
     let mut g = CHAIN_CLOCK.lock().unwrap_or_else(|p| p.into_inner());
     let current = g.map(|(ts, at)| ts.saturating_add(at.elapsed().as_secs()));
     if current.is_none_or(|c| block_timestamp > c) {
@@ -260,6 +268,15 @@ pub fn chain_now() -> u64 {
 pub fn chain_now_floor() -> u64 {
     let wall = wall_now();
     observed_chain_now().map_or(wall, |c| c.min(wall))
+}
+
+/// The chain's clock minus this host's, in seconds, from the latest header read (`None` before the
+/// first): its timestamp, plus the time since it was read, against the wall clock. Negative: the
+/// host clock runs ahead of the chain's. A header read before a host suspend reads as skewed by the
+/// suspend's length (`Instant` does not count it), so re-read one before acting on a large value.
+pub fn chain_clock_skew_secs() -> Option<i64> {
+    let g = LAST_HEADER.lock().unwrap_or_else(|p| p.into_inner());
+    g.map(|(ts, at)| ts.saturating_add(at.elapsed().as_secs()) as i64 - wall_now() as i64)
 }
 
 /// Default key-wide fee ceiling for the fulfil and release ladders (handoff §10 example: 15-50
@@ -352,7 +369,12 @@ impl ChainClient {
         // The send guard goes OUTERMOST, so a refused send is neither paced nor counted.
         let rpc_client = alloy::rpc::client::ClientBuilder::default()
             .layer(crate::send_guard::SendGuardLayer::new(watch_only))
-            .layer(crate::rpc_meter::ThrottleLayer::new(4))
+            .layer(crate::rpc_meter::ThrottleLayer::new(
+                config
+                    .chain
+                    .max_requests_per_sec
+                    .unwrap_or(if watch_only { 1 } else { 4 }),
+            ))
             .layer(crate::rpc_meter::MeterLayer::new(rpc_meter.clone()))
             .transport(http, false)
             .with_poll_interval(std::time::Duration::from_secs(12));

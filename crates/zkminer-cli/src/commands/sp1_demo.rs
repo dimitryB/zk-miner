@@ -14,8 +14,7 @@
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
 use zkminer_chain::client::ChainClient;
 use zkminer_config::wallet::load_signer;

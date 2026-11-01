@@ -1513,6 +1513,9 @@ pub struct WorkerPool {
     /// bonded and on a deadline, so the proof wins. See `preempt_measures_for_host` /
     /// `preempt_measures_for_shm` and `InflightMeasure`.
     inflight_measures: Mutex<HashMap<String, InflightMeasure>>,
+    /// When set, `discover_and_spawn` starts workers for these backends only (see
+    /// [`Self::only_backends`]).
+    only_backends: Option<HashSet<String>>,
 }
 
 /// Round-robin counter for load balancing across multiple GPU workers.
@@ -1541,7 +1544,19 @@ impl WorkerPool {
             last_measure_eviction: Mutex::new(None),
             shm_ledger: crate::memory::MemoryLedger::default(),
             inflight_measures: Mutex::new(HashMap::new()),
+            only_backends: None,
         }
+    }
+
+    /// Start workers (prove and measure) for these backends only; the others are not spawned at
+    /// all. For a process that serves a subset: a backend's worker can have host-wide startup side
+    /// effects (SP1's installs its bundled `sp1-gpu-server` and reaps orphaned servers' sockets).
+    pub fn only_backends<I, S>(&mut self, backends: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.only_backends = Some(backends.into_iter().map(Into::into).collect());
     }
 
     /// Build GPU environment variables for a given gpu_tag, PCI bus ID, and device index.
@@ -1692,7 +1707,10 @@ impl WorkerPool {
     /// Discover and spawn all available worker binaries.
     /// Returns the list of compound keys that were successfully connected.
     pub fn discover_and_spawn(&mut self) -> Vec<String> {
-        let discovered = discover_workers(&self.explicit_binaries, &self.search_dirs);
+        let mut discovered = discover_workers(&self.explicit_binaries, &self.search_dirs);
+        if let Some(only) = &self.only_backends {
+            discovered.retain(|w| only.contains(&w.backend));
+        }
         let mut connected = Vec::new();
         // Binary path of the first SP1 worker seen, used to spawn the dedicated measure worker below.
         let mut sp1_measure_path: Option<PathBuf> = None;
