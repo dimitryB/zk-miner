@@ -271,6 +271,70 @@ Calibration remains unsupported. The two tiny benchmark fixtures now use the
 same verified staged path as proofs, but do not establish comparative GPU
 rankings, speedup or profitability.
 
+## Controlled CPU/Metal benchmark
+
+Use the existing Command Line Tools to compile the read-only telemetry helper
+once, before the campaign. This creates a local executable and installs nothing:
+
+```sh
+source scripts/macos/env.sh
+mkdir -p target/macos/benchmark-tools
+xcrun clang -O2 -Wall -Wextra -Werror -fobjc-arc -mmacosx-version-min=12.0 -framework Foundation scripts/macos/benchmark-thermal.m -o target/macos/benchmark-tools/thermal
+python3 scripts/macos/benchmark-worker.py --engine "$ENGINE_DIR" --context colima-hemi-macos-cpu --samples 5
+```
+
+The dedicated helper VM must already be running with six CPUs and 32 GiB, with
+no leftover containers. The unrelated default VM remains unchanged at four CPUs
+and 8 GiB. Keep the existing six Rayon threads, 24 GiB helper cap, 32 GiB worker
+RSS ceiling, memory-pressure guard and 600-second proof watchdog. Each trial has
+a separate 900-second acceptance bound. No limit is relaxed for benchmarking.
+
+A fresh RISC Zero request needs at least **22 GiB of the production host-available
+estimate**: its six-GiB reservation plus the 16 GiB host reserve. Leave several
+additional GiB of headroom for changing application and VM usage. This estimate
+is free pages plus half the smaller of file-backed and inactive pages; it is not
+the machine's installed memory or a guarantee of allocatable RAM. Existing
+applications and the default VM are left running. If admission refuses a trial,
+the campaign stops and preserves the failure; reduce unrelated memory use only
+with the user's authorization before starting a new campaign.
+
+The runner uses the same sealed Metal-capable worker binary for explicit CPU
+and forced-Metal modes. It retains one complete verified warmup per mode, then
+runs five alternating CPU/Metal pairs. Every trial creates a fresh WorkerPool;
+OS/runtime/helper caches may be warm, but this is not a persistent warm-worker
+or cold-boot comparison. Setup discovery/spawn, proof-call, worker stages and
+external verifier times are recorded separately. The validation worker may be
+recycled before proving, so setup time is not a complete measure of the proof
+worker's startup. All proofs require unchanged-verifier acceptance and the
+three negative checks. Failures are retained, with no automatic retry or
+selective exclusion.
+
+Raw plans, telemetry and trial ledgers are saved under
+`target/macos/benchmarks/<campaign-id>`, linked to source-bound worker runs.
+Foundation thermal/low-power categories, `pmset` status, load averages and process
+executable names are sampled before/after trials and about every ten seconds.
+Nominal thermal state and low-power false can mean unknown/unsupported;
+`pmset`'s absence of warnings is not a temperature measurement. Process CPU
+percentages are decaying averages, not interval counters. No wattage or energy
+measurement is made. Background applications and the default VM can affect times.
+
+After a campaign has finalized, set `BENCHMARK_ID` to its printed directory name
+and collect it with fresh output filenames:
+
+```sh
+python3 scripts/macos/summarize-benchmark.py --benchmark "target/macos/benchmarks/$BENCHMARK_ID" --output "docs/macos/evidence/benchmark-$BENCHMARK_ID.json" --csv "docs/macos/evidence/benchmark-$BENCHMARK_ID.csv"
+```
+
+The collector also writes matching `-acceptance.json` and `-acceptance.csv`
+artifacts, validates source/build identities and retained raw evidence, and
+refuses existing output paths. Keep sealed sources and the telemetry executable
+unchanged through collection. A failed campaign is collected with its failures
+and unattempted trials; it has no complete comparison statistics. The first
+campaign, `f8b460c76d594ae88e6430ab29e1aa27`, retained one verified CPU warmup,
+a Metal warmup refused by actual memory admission, and ten unattempted measured
+trials. It does not establish a CPU/Metal speed comparison. See
+[BENCHMARKS.md](BENCHMARKS.md) for current results and interpretation.
+
 ## Additional workload and resource checks
 
 The first three commands below passed complete independently verified proofs:

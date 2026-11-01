@@ -515,3 +515,69 @@ Non-Mac runtime coverage is not claimed. Controlled benchmarks, benchmark IPC,
 physical memory-pressure/RSS-kill recovery, longer same-process allocation
 stability, GPU faults, exact contract-adapter and network acceptance remain open.
 No wallet, marketplace, privileged installation or push was used.
+
+
+## Controlled CPU/Metal benchmark attempt (2026-10-31 local)
+
+Local instrumentation commit `461965e` adds only acceptance timing, an
+orchestrator and a small read-only Foundation telemetry helper. Production
+worker/protocol/engine code, pinned graph, CPU binary and verifier are unchanged.
+The collector and evidence commit follows separately; no push or installation.
+
+Commands actually executed from the miner checkout (task-local env sourced):
+
+```sh
+colima start hemi-macos-cpu --cpu 6 --memory 32 --disk 80 --activate=false --ssh-config=false --template=false --mount /Users/dbur/dev/zk-miner/target/macos:w --vz-rosetta
+xcrun clang -O2 -Wall -Wextra -Werror -fobjc-arc -mmacosx-version-min=12.0 -framework Foundation scripts/macos/benchmark-thermal.m -o target/macos/benchmark-tools/thermal
+cargo +1.93.0 test --locked -p zkminer-prover --test macos_worker --no-run --message-format=json --target-dir target/macos/worker-acceptance-build > target/macos/worker-timing-compile.jsonl 2> target/macos/worker-timing-compile.stderr
+python3 -B scripts/macos/benchmark-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --context colima-hemi-macos-cpu --samples 5
+python3 scripts/macos/test-benchmark-summary-controls.py --benchmark target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27 --output docs/macos/evidence/benchmark-summary-controls.json
+python3 scripts/macos/summarize-benchmark.py --benchmark target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27 --output docs/macos/evidence/benchmark-attempt-1.json --csv docs/macos/evidence/benchmark-attempt-1.csv
+```
+
+The runner actually launched these two commands, each through the real
+WorkerPool acceptance binary with `--ignored --nocapture --test-threads=1`:
+
+```sh
+python3 scripts/macos/test-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --worker-kind metal --mode cpu --context colima-hemi-macos-cpu --proof-only --repeat 1 --workload fibonacci --po2 18 --staging-bytes 524288 --timeout 900
+python3 scripts/macos/test-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --worker-kind metal --mode metal --context colima-hemi-macos-cpu --proof-only --repeat 1 --workload fibonacci --po2 18 --staging-bytes 524288 --timeout 900
+```
+
+Campaign `f8b460c76d594ae88e6430ab29e1aa27` stopped after CPU warmup success and
+Metal warmup refusal. CPU run `257de3edef294d10b2f03edda0048d95`: 2 actual tests
+passed, 0 failed/ignored; one complete Groth16 proof accepted by the unchanged
+verifier, all three tamper cases rejected, zero proving GPU commands. Worker
+164.432s, exact supervisor prove call 164.731s, external positive+negative
+verification 39.937ms. Full trial 185.088s includes preflight/build/measurement.
+
+Metal run `dc005b12db1d44a5a98dad07ecb7ed01`: 1 actual preflight test passed,
+1 proof test failed, 0 ignored. The real admission guard rejected a proof before
+execution because available memory was below 22 GiB; the pre-call observation
+was 23,597,678,592 bytes. The request ledger retains the typed refusal message,
+resource observations and recycled preflight PID. No Metal proof or helper was
+started. This is an unexpected campaign failure, not an expected negative test
+or a completed proof. All ten measured trials are explicitly unattempted.
+No comparative statistics, automatic retries or discarded failed measurements.
+
+The new collector guards passed 13/13, zero proofs generated or verified. They
+exercise schedule/order, duplicates, stopped campaigns, known statistics with
+warmup exclusion, invalid timings, real timing/PID binding and ambiguous wrapping
+logs. They do not stand in for genuine proving. Archived JSON/CSV retain the
+failure, raw telemetry and source/binary/artifact hashes. Runtime Metal warmup
+preflight passed, but no complete Metal proof was generated in this attempt.
+
+All timing boundaries and thermal/background limitations are in BENCHMARKS.md.
+The owner was asked to free roughly 4–8 GiB from unused applications. The native
+16 GiB reserve, six-GiB proof estimate, 32 GiB worker watchdog and helper limits
+remain unchanged; no unrelated process was terminated. The next step is a new
+full campaign when host headroom permits. No non-Mac runtime, benchmark IPC,
+contract adapter or network acceptance test was added or claimed.
+
+Final checks: CPU/Metal/verifier build seals still match their prior values;
+44 raw acceptance artifact hashes and nine benchmark artifact hashes rechecked.
+Cargo.toml/Cargo.lock and both Hemi engine checkouts/upstream remain unchanged.
+After `docker --context colima-hemi-macos-cpu ps -a --format '{{.Names}}'` and
+owned PID checks showed no leftovers, `colima stop hemi-macos-cpu` completed.
+`colima list --json` confirmed dedicated Stopped, original default Running.
+Separate diffs: `target/macos/benchmark-miner.patch` from `244a3a1` and empty
+`target/macos/benchmark-engine.patch`. `git diff --check` passed.

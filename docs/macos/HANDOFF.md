@@ -7,11 +7,64 @@ outputs pass the unchanged pinned verifier. Full Gate 3 remains open for
 controlled performance measurements and additional fault/memory coverage.
 No push, privileged installation, wallet access, job claim or transaction.
 
-## Current completed workload/stability milestone
+## Current controlled-benchmark continuation (incomplete)
 
-Current acceptance changes start at miner
-`b871d7ed0f0de83d99cc3e5674bfba95c3f04d7f`; the containing/latest local commit
-records this milestone. Worker binaries, production worker/protocol code,
+Instrumentation/runner/thermal helper are locally committed at `461965e` on
+`codex/hemi-macos-metal`; the following collector/evidence/documentation commit
+records this attempt. Production workers, engine and CPU path remain unchanged.
+The full controlled comparison is **not complete**: host memory admission refused
+Metal warmup before proving. Do not infer a CPU/Metal speedup from this attempt.
+
+Campaign `f8b460c76d594ae88e6430ab29e1aa27` planned one complete warmup per mode,
+then five alternating complete trials per mode. It uses the same sealed
+Metal-capable worker in explicit CPU/Metal modes, identical Fibonacci(20), po2 18,
+512 KiB staging, six Rayon/helper CPUs, 32 GiB dedicated VM and 24 GiB helper cap.
+Fresh WorkerPools receive readiness and execute validation before proving;
+startup/setup, exact prove-call latency, external verification and cleanup have
+separate monotonic timers. This is neither a cold-boot nor a persistent warm-worker
+benchmark. Each successful proof requires unchanged-verifier acceptance and
+three tamper rejections; no automatic proof retries or sample removal.
+
+CPU warmup `257de3edef294d10b2f03edda0048d95` completed a real Groth16 proof:
+worker total 164.432s, supervisor prove call 164.731s, external verification
+39.937ms; all three negatives rejected, zero proving GPU commands. Metal warmup
+`dc005b12db1d44a5a98dad07ecb7ed01` failed production admission: 23,597,678,592 bytes
+available at the pre-call sample (21.977 GiB), below the unchanged 22 GiB
+requirement (6 GiB proof estimate + 16 GiB host reserve). Recycling its small
+preflight worker did not free enough memory. No Metal proof/helper started.
+Ten measured trials remain unattempted; no comparative statistics are emitted.
+Across both runs, 3 actual Rust tests passed, 1 failed, 0 ignored.
+
+Source-bound archive: `docs/macos/evidence/benchmark-attempt-1.json/.csv` and
+`benchmark-attempt-1-acceptance.json/.csv`; raw plan, ledger, telemetry and logs
+are in `target/macos/benchmarks/f8b460c76d594ae88e6430ab29e1aa27`, with receipts
+under `target/macos/worker-runs/<run-id>`. The 13 collector guards passed and
+count as zero proofs (`benchmark-summary-controls.json`). Source hashes bind
+all inputs; the failed trial and ten unattempted rows are retained.
+
+Host telemetry showed AC power and Foundation nominal/low-power=false; those
+API values can also mean unknown. `pmset` had no recorded warnings, not a measured
+absence of throttling. Background fseventsd CPU activity was retained (up to
+100.4% in decaying `ps` samples). No temperature, wattage or GPU driver-allocation
+peak was measured. Available-memory readings stayed around 21.8–21.9 GiB after
+the refusal. The user was asked to free roughly 4–8 GiB from unused applications;
+no application was closed and no admission guard or resource limit was reduced.
+
+Next concrete action: after host headroom is available, restart the dedicated
+VM if stopped and rerun the entire documented campaign, retaining attempt 1.
+Do not resume at the failed Metal trial or count the old warmup as a measured
+sample. The dedicated VM was stopped after confirming no containers or trial workers
+remained; the original default VM is still running. Both worker binaries and
+the verifier seal were rechecked, as were 44 raw acceptance artifacts and nine
+benchmark artifacts. No installation is required. See SETUP.md for the thermal helper build
+and benchmark/collector commands; BENCHMARKS.md and VALIDATION.md record the
+attempt and exact timing limits.
+
+## Previously completed workload/stability milestone
+
+The stability changes start at miner
+`b871d7ed0f0de83d99cc3e5674bfba95c3f04d7f` and were committed in
+`244a3a1eb69e2ed611fa1b52e00abfaae31b32f7`. Worker binaries, production worker/protocol code,
 engine, dependency pins and root lock remain unchanged. Changed code is
 `crates/zkminer-prover/tests/macos_worker.rs`,
 `scripts/macos/test-worker.py`, new `scripts/macos/summarize-worker.py` and
@@ -59,7 +112,7 @@ Implementation branch: `codex/hemi-macos-metal` in both implementation worktrees
 * Miner `/Users/dbur/dev/zk-miner`, remote `https://github.com/hemilabs/zk-miner.git`:
   the native-worker checkpoint was based on `3b2720110c1721a53d19c09a6ff2a16235aeb9be`;
   its sealed worker builds remain unchanged for this acceptance-only continuation.
-  Current acceptance work starts from `b871d7e`; resolve the latest local commit with `git log -1`.
+  The stability checkpoint is `244a3a1eb69e2ed611fa1b52e00abfaae31b32f7`; benchmark instrumentation is `461965e`. Resolve the latest local evidence commit with `git log -1`.
 * Engine `/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0`, remote
   `https://github.com/hemilabs/risc0.git`: unchanged during this milestone at
   `0d5b41e8e44876c1e8b5a8a671aabc154e33106c`.
@@ -159,8 +212,9 @@ The verifier target is separate, built from original Git pin without local
 patches/proving features. Raw runs, seals and logs are under
 `target/macos/worker-runs/<id>`; aggregate evidence is `docs/macos/evidence/native-worker-validation.json` and
 `native-worker-measurements.csv`, with executed commands in VALIDATION.md.
-The current separate miner diff is `target/macos/worker-stability-miner.patch`; no engine
-diff was introduced in this milestone. Previous engine patches remain under
+The current separate miner diff is `target/macos/benchmark-miner.patch` from
+stability checkpoint `244a3a1`; `target/macos/benchmark-engine.patch` is empty.
+The earlier stability diff remains `target/macos/worker-stability-miner.patch`. Previous engine patches remain under
 docs/macos/evidence. Source changes require rebuilding sealed artifacts.
 
 Dedicated profile `hemi-macos-cpu` / context `colima-hemi-macos-cpu` is
@@ -172,9 +226,9 @@ Pinned helper image digest:
 
 ## Next work and limits
 
-Next concrete step: run controlled CPU/Metal comparisons with warmup plus at
-least five measured complete runs per mode, identical inputs/resources, cold-
-start separation and thermal/background-load context. Benchmark/calibration IPC
+Next concrete step: obtain sufficient host-memory headroom and rerun the entire
+controlled CPU/Metal campaign with warmup plus five measured complete runs per
+mode. The first attempt was retained as failed before any measured trial. Benchmark/calibration IPC
 acceptance remains separate. The completed twenty-request run retained normal
 recycling; longer same-process and physical-memory-pressure recovery coverage
 remain open. Current correctness timings are not performance benchmarks.

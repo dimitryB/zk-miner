@@ -1,3 +1,65 @@
+# Controlled benchmark status: blocked by host-memory admission
+
+The first fixed-setting campaign did not reach measured trials. One CPU warmup
+produced an independently accepted complete Groth16 proof; Metal warmup was
+refused before proving by the existing host-memory guard. No CPU/Metal speedup,
+median comparison or performance conclusion is established. Attempt 1 and all
+unattempted slots are retained, rather than averaging only successful proofs.
+
+Campaign: `f8b460c76d594ae88e6430ab29e1aa27`, source commit `461965e`, engine
+`0d5b41e8e44876c1e8b5a8a671aabc154e33106c`, unchanged original verifier pin
+`f8dcbdf8124a3f1528146bb01d539c55545cbb3d`. Same sealed Metal-capable worker
+(`2c3bf297…`) in explicit CPU/Metal modes; separate CPU-only binary is preserved.
+Fibonacci(20), po2 18, final Groth16, six Rayon threads, one active proof, 512 KiB
+logical Metal staging, local linux/amd64 QEMU helper, six helper CPUs/24 GiB cap,
+32 GiB dedicated VM. No per-mode tuning or cryptographic changes.
+
+The immutable plan is one complete warmup per mode followed by five alternating
+CPU/Metal pairs. Every trial creates a fresh supervised pool. Existing readiness
+and valid/invalid execution checks precede proving; a validation worker may be
+retired before a proof. Cache warmup does not imply persistent worker reuse.
+No cache flushing or cold OS boot is claimed. Startup discovery is timed apart
+from proving; the exact prove-call timer includes admission/replacement and IPC,
+so its residual over worker time is not a pure startup measurement.
+
+| Planned phase | Result | Worker total | Exact prove call | External verifier |
+|---|---|---:|---:|---:|
+| CPU warmup | Complete Groth16; positive + 3 negative checks passed | 164.432s | 164.731s | 39.937ms |
+| Metal warmup | Host-memory admission refused before proving | — | 819.455ms refusal | — |
+| Five measured pairs | All ten slots unattempted | — | — | — |
+
+CPU warmup stages: execution plus segment 2.695s, recursion 7.366s,
+identity plus emulated wrapping 154.341s, final SDK verification 1.764ms.
+Rounded production stderr separately reports identity p254 33.146s and helper
+shrink/wrap 121.187s (0.1ms diagnostic precision, not new isolated instrumentation).
+Execution-only and isolated GPU-kernel durations remain unmeasured. CPU proving
+recorded zero GPU commands. Sampled native peak RSS was 1,965,539,328 bytes;
+this excludes VM/helper and unmeasured Metal driver allocations.
+
+At failed Metal admission, the pre-call observation was 23,597,678,592 available
+bytes (21.977 GiB); the unchanged policy requires 22 GiB (6 GiB expected proof +
+16 GiB reserve). Its small preflight worker was recycled, but admission still
+refused. No Metal proof or wrapping helper started. Later observed availability
+remained around 21.8–21.9 GiB. Roughly 4–8 GiB extra headroom was requested from
+the owner; applications, guard and limits were left intact. A new full campaign
+is required when headroom is available; this attempt must stay in the evidence.
+
+Telemetry was sampled before/after and about every ten seconds: AC power,
+Foundation nominal thermal category and low-power=false, with no recorded
+`pmset` thermal/performance warning. Foundation may map unknown state to those
+values; warning absence is not a temperature or no-throttling measurement.
+Background fseventsd reached 100.4% in decaying `ps` CPU samples; unrelated apps
+and the original Colima VM remained running. No watts/energy or profitability
+measurement was made. Raw telemetry retains interference and unknowns.
+
+`evidence/benchmark-attempt-1.json/.csv` stores the immutable plan, all twelve
+scheduled slots, timings, telemetry, provenance and failure; `statistics` is null.
+The companion `-acceptance.json/.csv` binds real proof artifacts and request
+ledgers. `benchmark-summary-controls.json` records 13 passed reporting guards,
+which are explicitly zero cryptographic proof tests. SETUP.md documents the
+runnable campaign and collector. Earlier correctness measurements follow and
+are not substitutes for the missing controlled comparison.
+
 # Correctness-run measurements
 
 These are observed CPU and hybrid correctness timings, **not a controlled
