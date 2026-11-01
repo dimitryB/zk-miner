@@ -155,8 +155,11 @@ would take, and for every open job, what its descriptor, measurement, journal bi
 claim quote show, whatever this host's GPUs or stake. It signs with a throwaway key, and its
 transport refuses every send. It also skips lock recovery and the nonce watchdog, and never
 writes the job journal, so it cannot touch the locks or nonces of a miner running on the same
-key. It does execute guests, though, so don't run it on a host whose RAM a live miner needs.
-It is always headless. It watches as the configured key's address unless you pass `--address 0x…`, which
+key. It keeps its own ELF cache (`~/.zkminer/watch/elfs`), starts workers only for the proof
+systems this build serves, and paces its RPC to 1 request/s
+(`chain.max_requests_per_sec`), since it shares the endpoint's per-IP limit with any miner on
+the same host. It does execute guests, though, so don't run it on a host whose RAM a live
+miner needs. It is always headless. It watches as the configured key's address unless you pass `--address 0x…`, which
 needs no key at all. It measures guests on the CPU, so it runs on a host without a GPU if
 `[prover.worker_binaries]` names a risc0 worker.
 
@@ -214,31 +217,42 @@ piping to `tail`, which buffers and can hide a hang.
 
 `crates/zkminer-cli/tests/localnet.rs` runs the real `zkminer` binary against a local anvil
 fork of Hemi testnet 743111. The fork carries the live HemiProve v2 contracts. On the fork,
-the test:
+each test:
 
 - mints tHEMI and stakes a prover;
-- registers the fibonacci guest, with a storage URI it serves itself;
-- submits six jobs, one per binding case: three the miner must claim and three it must refuse.
+- registers its programs, with storage URIs the test serves itself;
+- submits jobs covering the binding cases: three the miner must claim, and the rest (wrong
+  FULL or FIELDS journals, jobs reserved for another prover, the journal-prefix marker, a
+  decoy ELF whose image id is not the job's program, an unreachable ELF) it must refuse.
 
-Half the jobs are submitted before the miner starts and half after, so both the startup
-backfill and the live monitor are covered. Nothing touches the real chain, and no key is
-involved.
+Some jobs are submitted before the miner starts and some after, so both the startup backfill
+and the live monitor are covered. Nothing touches the real chain, and no key of yours is
+involved; each miner runs with its own HOME and a cleaned environment.
 
 ```bash
 cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda
+cargo build -p zkminer-prover --features testing --bin mock-worker
 cargo test -p zkminer-cli --test localnet -- --ignored --nocapture --test-threads=1
 ```
 
-- **`watch_only_reports_every_job`** (CPU only, about 90 s) runs `zkminer run --watch-only`. It
-  checks every job's verdict, checks that exactly the claimable jobs would be claimed, and checks
-  that nothing was sent.
-- **`mines_the_claimable_jobs`** (`ZKMINER_LOCALNET_MINE=1`, needs a GPU) runs the miner for real.
-  It requires the claimable jobs to be fulfilled on the fork and the others never claimed.
+- **`watch_only_reports_every_job`** (CPU only) runs `zkminer run --watch-only`, as the staked
+  prover and then as an unstaked address. It checks every job's verdict, that exactly the
+  claimable jobs would be claimed, and that nothing was sent.
+- **`fulfils_with_a_replayed_receipt`** (CPU only) mines for real on the contract suite's RISC
+  Zero receipt fixture, which the deployed verifier accepts: the mock worker replays the receipt
+  instead of proving. It requires exactly the claimable jobs to be claimed and then fulfilled in a
+  later transaction, nothing released, and no collateral left locked.
+- **`holds_its_lock_through_a_pause`**: a lock held while the router pauses is kept, then
+  fulfilled after the lift.
+- **`holds_off_while_the_router_is_paused`**, **`refuses_to_claim_while_its_adapter_is_disabled`**,
+  **`refuses_to_claim_on_a_skewed_clock`**: the miner's own gates hold every claim (none is even
+  dispatched).
+- **`mines_the_claimable_jobs`** (`ZKMINER_LOCALNET_MINE=1`, needs a GPU) is the replay test with
+  real risc0 proofs of the fibonacci guest.
 
-The tests need Foundry's `anvil`. The first run at a fork block also needs the testnet RPC;
-anvil caches what it fetches, so repeat runs are quick. Settings (fork URL and block, worker
-path, echoing the log) are in the file's header. Move its `FORK_BLOCK` forward whenever
-`zkminer-chain/src/deployment.rs` changes.
+The tests need Foundry's `anvil` and the testnet RPC, which serves archive state; anvil caches
+what it fetches. Settings (fork URL and block, worker paths, echoing the log) are in the file's
+header. Move its `FORK_BLOCK` forward whenever `zkminer-chain/src/deployment.rs` changes.
 
 ## Examples
 

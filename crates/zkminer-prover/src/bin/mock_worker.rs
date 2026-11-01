@@ -10,6 +10,13 @@
 //! - `MOCK_CRASH_ON`: `"benchmark"`, `"prove"`, `"execute"`, `"both"` or `"warmup"` — exits
 //!   immediately with code 1 on the specified command type, simulating a worker crash.
 //! - `MOCK_BACKEND`: backend name for the HelloAck response. Default: `"mock"`.
+//! - `MOCK_JOURNAL_HEX` / `MOCK_SEAL_HEX`: replay a fixed receipt. Execute reports the journal, and
+//!   Prove returns the journal and the seal, whatever the ELF and input. With a real receipt (the
+//!   contract suite's RISC Zero fixture), the miner can claim and fulfil on a chain whose verifier
+//!   accepts it, without proving (crates/zkminer-cli/tests/localnet.rs). Unset = an empty journal
+//!   and seal.
+//! - `MOCK_PROVE_DELAY_SECS`: how long a Prove takes (default 0), so a test can act while a lock
+//!   is held.
 
 use std::io::{self, BufReader, BufWriter};
 use std::time::Duration;
@@ -22,6 +29,14 @@ fn main() {
     let hang_on = std::env::var("MOCK_HANG_ON").unwrap_or_default();
     let crash_on = std::env::var("MOCK_CRASH_ON").unwrap_or_default();
     let backend = std::env::var("MOCK_BACKEND").unwrap_or_else(|_| "mock".to_string());
+    let journal = hex_env("MOCK_JOURNAL_HEX");
+    let seal = hex_env("MOCK_SEAL_HEX");
+    let prove_delay = Duration::from_secs(
+        std::env::var("MOCK_PROVE_DELAY_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    );
 
     let mut stdin = BufReader::new(io::stdin().lock());
     let mut stdout = BufWriter::new(io::stdout().lock());
@@ -86,18 +101,19 @@ fn main() {
                         std::thread::sleep(Duration::from_secs(3600));
                     }
                 }
+                std::thread::sleep(prove_delay);
                 let resp = WorkerResponse::ProofResult {
                     request_id,
-                    journal: vec![],
-                    seal: vec![],
+                    journal: journal.clone(),
+                    seal: seal.clone(),
                     duration_secs: 0.01,
                     cycles: 1000,
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }
 
-            // Measures nothing: answers like a guest of 1,000 cycles, so a caller sees a well-formed
-            // reply rather than a hang.
+            // Measures nothing: answers like a guest of 1,000 cycles that commits `journal`, so a
+            // caller sees a well-formed reply rather than a hang.
             WorkerCommand::Execute { request_id, .. } => {
                 if crash_on == "execute" || crash_on == "both" {
                     std::process::exit(1);
@@ -115,9 +131,9 @@ fn main() {
                     request_id,
                     cycles: 1000,
                     duration_secs: 0.01,
-                    journal_len: 0,
+                    journal_len: journal.len() as u64,
                     peak_host_bytes: 0,
-                    journal: Some(Vec::new()),
+                    journal: Some(journal.clone()),
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }
@@ -160,4 +176,19 @@ fn main() {
             WorkerCommand::Shutdown => break,
         }
     }
+}
+
+/// The bytes of a hex environment variable (an optional `0x` prefix allowed); empty when unset.
+fn hex_env(name: &str) -> Vec<u8> {
+    let Ok(v) = std::env::var(name) else {
+        return Vec::new();
+    };
+    let v = v.trim().trim_start_matches("0x");
+    assert!(v.len() % 2 == 0, "{name} has an odd number of hex digits");
+    (0..v.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&v[i..i + 2], 16).unwrap_or_else(|_| panic!("{name} is not hex"))
+        })
+        .collect()
 }

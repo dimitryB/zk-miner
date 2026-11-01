@@ -4,23 +4,38 @@
 //! checks pin. Each test then sets up, on the fork only:
 //! - tHEMI for a submitter and a prover, minted as the token's owner;
 //! - the prover's stake;
-//! - the fibonacci guest in the ProgramRegistry, with a storage URI this test serves over HTTP;
-//! - one job per binding case (see [`Case`]): three the miner should claim and three it must not.
+//! - programs in the ProgramRegistry, with storage URIs this test serves over HTTP;
+//! - jobs covering the binding cases (see [`Case`]): three the miner must claim, the rest it must
+//!   refuse. Some are submitted before the miner starts and some after.
 //!
 //! and runs the `zkminer` binary against the fork. anvil impersonates every sender, so setting up
-//! needs no key.
+//! needs no key. Each miner runs with its own HOME and a cleaned environment.
 //!
-//! - `watch_only_reports_every_job`: `zkminer run --watch-only` as the prover. Checks each job's
-//!   verdict, that exactly the claimable jobs would be claimed, and that nothing was sent. CPU only.
-//! - `mines_the_claimable_jobs`: `zkminer run` with the prover's key: real claims, GPU proofs and
-//!   fulfils, on the fork. Runs only with `ZKMINER_LOCALNET_MINE=1`.
+//! The tests:
+//! - `watch_only_reports_every_job`: `zkminer run --watch-only`, on the fibonacci guest, as the
+//!   staked prover and then as an address with no stake. Checks each job's verdict, that exactly
+//!   the claimable jobs would be claimed, and that nothing was sent. CPU only.
+//! - `fulfils_with_a_replayed_receipt`: `zkminer run` with the prover's key on the contract suite's
+//!   RISC Zero receipt fixture, which the deployed verifier accepts. The mock worker replays that
+//!   receipt instead of proving, so the miner claims and fulfils for real on the fork: every
+//!   on-chain step of mining, on a CPU. Checks exactly the claimable jobs are fulfilled, each
+//!   claimed in an earlier transaction than its fulfil, nothing else is claimed or released, and
+//!   no collateral is left locked.
+//! - `holds_its_lock_through_a_pause`: a lock held while the router pauses is kept, not released,
+//!   and fulfilled after the lift.
+//! - `holds_off_while_the_router_is_paused`, `refuses_to_claim_while_its_adapter_is_disabled`,
+//!   `refuses_to_claim_on_a_skewed_clock`: the miner's own gates hold every claim (no claim is
+//!   dispatched, nothing is sent); the paused one claims and fulfils after the lift.
+//! - `mines_the_claimable_jobs`: the replay test with the real risc0 worker on the fibonacci guest:
+//!   real GPU proofs. Runs only with `ZKMINER_LOCALNET_MINE=1`.
 //!
-//! Both are ignored by default: they need anvil (Foundry), the release risc0 worker, and, on the
-//! first run at a fork block, the testnet RPC (anvil caches what it fetches under
-//! `~/.foundry/cache/rpc`, so later runs at the same block are quick):
+//! All are ignored by default: they need anvil (Foundry), the workers, and the testnet RPC, which
+//! must serve state at the fork block (it does: it is an archive node). anvil caches what it
+//! fetches under `~/.foundry/cache/rpc`, so later runs at the same block are quicker.
 //!
 //! ```text
 //! cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda
+//! cargo build -p zkminer-prover --features testing --bin mock-worker
 //! cargo test -p zkminer-cli --test localnet -- --ignored --nocapture --test-threads=1
 //! ```
 //!
@@ -30,10 +45,11 @@
 //!   head).
 //! - `ZKMINER_LOCALNET_RISC0_WORKER`: the risc0 worker (default:
 //!   `target/release/zkminer-prove-risc0-cuda`).
+//! - `ZKMINER_LOCALNET_MOCK_WORKER`: the mock worker (default: `target/debug/mock-worker`).
 //! - `ANVIL`: the anvil binary (default: `anvil` on `PATH`).
 //! - `ZKMINER_LOCALNET_ECHO=1`: echo zkminer's log while it runs.
-//! - `ZKMINER_LOCALNET_KEEP=1`: keep the run directory (logs, config) after a pass; a failed run
-//!   always keeps it.
+//! - `ZKMINER_LOCALNET_KEEP=1`: keep the run directory (under `target/tmp`) after a pass; a failed
+//!   run always keeps it.
 //! - `ZKMINER_LOCALNET_EXPECT_CLAIMS=0`: in the watch test, don't require the would-claim verdicts
 //!   (for a host whose capacity or memory gates refuse every claim).
 //! - `ZKMINER_LOCALNET_MINE=1`, `ZKMINER_LOCALNET_MINE_TIMEOUT_SECS` (default 1800): the mining
@@ -57,9 +73,9 @@ use zkminer_chain::binding::{fields_hash, full_hash};
 use zkminer_chain::deployment::HEMI_TESTNET_743111 as DEPLOYMENT;
 use zkminer_config::ZkMinerConfig;
 use zkminer_contracts::bindings::{
-    AuctionConfig, CompetitiveBidConfig, CycleConfig, IHemiProveCore, IHemiProveFulfill,
-    IHemiProveStaking, IProgramRegistry, ITestnetToken, JobDescriptor, ResourceEstimate,
-    StorageURI, IERC20,
+    AuctionConfig, CompetitiveBidConfig, CycleConfig, IHemiProveAux, IHemiProveCore,
+    IHemiProveFulfill, IHemiProveStaking, IProgramRegistry, ITestnetToken, JobDescriptor,
+    ResourceEstimate, StorageURI, IERC20,
 };
 
 /// The 743111 block the fork starts from by default, after the deployment's setup. Move it forward
@@ -68,39 +84,81 @@ use zkminer_contracts::bindings::{
 const FORK_BLOCK: u64 = 7_116_900;
 const DEFAULT_FORK_URL: &str = "https://testnet.rpc.hemi.network/rpc";
 const HEMI: u128 = 1_000_000_000_000_000_000;
-/// Every job proves fibonacci(FIB_N).
+/// The fibonacci guest's jobs prove fibonacci(FIB_N).
 const FIB_N: u32 = 10;
+/// The contract suite's RISC Zero Groth16 receipt (zkmarket c8333aa,
+/// `test/fixtures/RiscZeroTestReceipt.sol`): risc0 v3.0 Groth16, accepted by the deployed
+/// `RiscZeroGroth16Verifier` (SELECTOR 0x73c457ba) for this image id and journal.
+const FIXTURE_IMAGE_ID: B256 =
+    alloy::primitives::b256!("bc93ea63d7adda6b4e2f0f930c2c9fe53d57e8f4add5aa81af2373949517edfe");
+const FIXTURE_JOURNAL: &[u8] = b"zkpool e2e test";
+/// The fixture's 260-byte seal: the 4-byte selector, then the proof.
+const FIXTURE_SEAL_HEX: &str = concat!(
+    "73c457ba24677d214ea29517cc0f883aa3a8b2514eb49f2dc4a36b217d42b5846a230e28278fb944762bb974fe0383a41cf1dc78",
+    "58050e64b70a2ffc4503598c41eb12382402e2f159318f290703591d36b097fe07ae8709d72805e5eed3e229d88e713b26d90595",
+    "7d4a98702d3dbf19047b05102eb0b9726a70e7f146f2026f272973b222028908b6aa9c6e87b36e63121c601016261f92be7877f7",
+    "58475101f64277d40fb8f805de9db44c9ac2e6095f5422599ceb8bf8df9edbb766ab19bb89f2b2a824d17896c55a0487f4172c96",
+    "1aba47cd3e0422037fc1bf524fdb01e21dc4f8300bc0f922f535135f8a0a36942ceae7c81d12e0b255cda9eda5d161715ad74d46",
+);
 /// Every job is fixed-price at this.
 const JOB_PRICE: u128 = 5 * HEMI;
 const PROVER_STAKE: u128 = 1_000 * HEMI;
 /// How long the watch test waits for every verdict.
-const WATCH_TIMEOUT: Duration = Duration::from_secs(300);
+const WATCH_TIMEOUT: Duration = Duration::from_secs(420);
+/// How long the replay tests wait for their fulfils.
+const REPLAY_TIMEOUT: Duration = Duration::from_secs(420);
+/// After the outcome a test waits for, how long it keeps watching before its final checks, so a
+/// wrong claim or verdict that lands just after is still seen (several of the brain's 5 s ticks).
+const SETTLE: Duration = Duration::from_secs(30);
 
-/// The binding cases. Each is one job, all on the same program and input.
+/// The binding cases. Each is one job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Case {
     /// FULL: `keccak256(abi.encode(domain, psId, programId, journal))` of the real journal.
     Full,
-    /// FIELDS: the journal's 8 bytes as one range.
+    /// FIELDS: the journal's first 8 bytes as one range.
     Fields,
-    /// FULL over a journal the guest does not commit: the miner must refuse it before claiming.
+    /// FULL over a journal the program does not commit: refused before the claim.
     FullWrongJournal,
+    /// FIELDS over bytes the program does not commit: refused before the claim.
+    FieldsWrongJournal,
     /// NONE, assigned to the prover.
     NoneForUs,
     /// NONE, assigned to another prover: reserved for it.
     NoneForAnother,
     /// FULL with the journal-prefix marker, which this build does not support.
     PrefixMarker,
+    /// FULL, for a program whose registry URI serves another program's ELF (this run's): its image
+    /// id is not the job's `programId`, so the worker refuses to execute it. Real workers only (the
+    /// mock worker checks nothing).
+    DecoyElf,
+    /// FULL, for a program whose registry URI is unreachable.
+    ElfUnreachable,
 }
 
 impl Case {
-    const ALL: [Case; 6] = [
+    /// Every case, for a run with a real worker.
+    const ALL: [Case; 9] = [
         Case::Full,
         Case::Fields,
         Case::FullWrongJournal,
+        Case::FieldsWrongJournal,
         Case::NoneForUs,
         Case::NoneForAnother,
         Case::PrefixMarker,
+        Case::DecoyElf,
+        Case::ElfUnreachable,
+    ];
+    /// Every case the mock worker can serve.
+    const REPLAYABLE: [Case; 8] = [
+        Case::Full,
+        Case::Fields,
+        Case::FullWrongJournal,
+        Case::FieldsWrongJournal,
+        Case::NoneForUs,
+        Case::NoneForAnother,
+        Case::PrefixMarker,
+        Case::ElfUnreachable,
     ];
 
     fn claimable(self) -> bool {
@@ -113,19 +171,37 @@ impl Case {
     fn before_start(self) -> bool {
         matches!(
             self,
-            Case::Full | Case::FullWrongJournal | Case::NoneForAnother
+            Case::Full | Case::FullWrongJournal | Case::NoneForAnother | Case::DecoyElf
         )
     }
 
-    /// What the watch-only inspector's verdict for this job must contain.
-    fn inspector_verdict(self) -> String {
-        let quote = format!("claim quote {} HEMI", hemi(JOB_PRICE));
+    /// What the watch-only inspector's verdict for this job must contain, watching as the staked
+    /// prover or as an address with no stake.
+    fn inspector_verdict(self, staked: bool) -> String {
+        let quote = if staked {
+            format!("claim quote {} HEMI", hemi(JOB_PRICE))
+        } else {
+            "the claim would be refused (StakeShort)".to_string()
+        };
         match self {
             Case::Full | Case::Fields => format!("binding satisfied; {quote}"),
-            Case::NoneForUs => format!("no journal binding; {quote}"),
-            Case::FullWrongJournal => "the measured journal FAILS its binding".into(),
+            Case::NoneForUs if staked => format!("no journal binding; {quote}"),
+            Case::NoneForUs => "reserved for prover".into(),
+            Case::FullWrongJournal | Case::FieldsWrongJournal => {
+                "the measured journal FAILS its binding".into()
+            }
             Case::NoneForAnother => "reserved for prover".into(),
             Case::PrefixMarker => "its binding marker is not supported".into(),
+            Case::DecoyElf | Case::ElfUnreachable => "it cannot be measured".into(),
+        }
+    }
+
+    /// The `programId` this case's job is for.
+    fn program_id(self, program: &Program) -> B256 {
+        match self {
+            Case::DecoyElf => keccak256(b"zkminer localnet decoy program"),
+            Case::ElfUnreachable => keccak256(b"zkminer localnet unreachable program"),
+            _ => program.id,
         }
     }
 }
@@ -138,13 +214,61 @@ fn fib(n: u32) -> u64 {
     a
 }
 
-/// The fibonacci guest reads a `u32` and commits the `u64` result.
-fn guest_input() -> Vec<u8> {
-    FIB_N.to_le_bytes().to_vec()
+/// Where the fork's clock is set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Clock {
+    /// On the wall clock, like a live chain.
+    Wall,
+    /// This many seconds behind it: this host's clock runs ahead of the chain's.
+    Lagging(u64),
 }
 
-fn guest_journal() -> Vec<u8> {
-    fib(FIB_N).to_le_bytes().to_vec()
+/// The program a run's jobs are for: what its registry URI serves, and what its jobs bind.
+struct Program {
+    name: &'static str,
+    /// The image id: the jobs' `programId`.
+    id: B256,
+    /// The bytes its storage URI serves.
+    elf: Vec<u8>,
+    /// Every job's `inputData`.
+    input: Vec<u8>,
+    /// The journal a proof of `input` commits.
+    journal: Vec<u8>,
+}
+
+impl Program {
+    /// The fibonacci guest, exported by the risc0 worker that runs it. It reads a `u32` and commits
+    /// the `u64` result.
+    fn fibonacci(worker: &Path, dir: &Path) -> Self {
+        let (elf, id) = export_guest(worker, dir);
+        Program {
+            name: "fibonacci (zkminer localnet)",
+            id,
+            elf,
+            input: FIB_N.to_le_bytes().to_vec(),
+            journal: fib(FIB_N).to_le_bytes().to_vec(),
+        }
+    }
+
+    /// The receipt fixture's statement. Nothing runs its binary: the mock worker replays the
+    /// receipt, so the URI serves a placeholder and the input is arbitrary.
+    fn fixture() -> Self {
+        Program {
+            name: "receipt fixture (zkminer localnet)",
+            id: FIXTURE_IMAGE_ID,
+            elf: b"zkminer localnet: the mock worker replays this program's receipt".to_vec(),
+            input: b"zkminer localnet".to_vec(),
+            journal: FIXTURE_JOURNAL.to_vec(),
+        }
+    }
+
+    /// A journal this program does not commit: its own with the first byte changed (inside the
+    /// FIELDS range too).
+    fn wrong_journal(&self) -> Vec<u8> {
+        let mut j = self.journal.clone();
+        j[0] ^= 0x01;
+        j
+    }
 }
 
 /// `fmt_hemi`'s format: whole HEMI and two decimals.
@@ -164,6 +288,13 @@ fn env_flag(name: &str) -> bool {
     matches!(std::env::var(name).as_deref(), Ok("1") | Ok("true"))
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
@@ -171,13 +302,40 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// A directory for one run: the miner's HOME, its config and every log.
+/// Send `signal` to `child`.
+fn signal(child: &Child, signal: libc::c_int) {
+    // SAFETY: kill(2) on the pid of a child this process has not yet reaped.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, signal);
+    }
+}
+
+/// Have `cmd`'s process killed if this one dies first (a test killed mid-run must not leave anvil
+/// or a miner behind).
+fn die_with_parent(cmd: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: prctl is async-signal-safe and touches nothing but the new process.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
+}
+
+/// A directory for one run, under cargo's per-target scratch directory: the miner's HOME, its
+/// config and every log.
 struct RunDir(PathBuf);
 
 impl RunDir {
     fn new(name: &str) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("zkminer-localnet-{name}-{}", std::process::id()));
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("zkminer-localnet-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".zkminer")).expect("create the run directory");
         Self(dir)
@@ -193,7 +351,7 @@ impl RunDir {
     }
 }
 
-/// anvil forking 743111; killed on drop.
+/// anvil forking 743111; stopped on drop.
 struct Anvil {
     child: Child,
     url: String,
@@ -201,6 +359,15 @@ struct Anvil {
 
 impl Drop for Anvil {
     fn drop(&mut self) {
+        // SIGINT first: anvil writes its fork cache when it shuts down cleanly.
+        signal(&self.child, libc::SIGINT);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -234,11 +401,13 @@ fn start_anvil(dir: &Path) -> Anvil {
             "--timeout",
             "60000",
         ])
+        .stdin(Stdio::null())
         .stdout(log.try_clone().unwrap())
         .stderr(log);
     if let Some(b) = fork_block {
         cmd.args(["--fork-block-number", &b.to_string()]);
     }
+    die_with_parent(&mut cmd);
     let child = cmd
         .spawn()
         .expect("start anvil: install Foundry, or set ANVIL to its path");
@@ -251,7 +420,7 @@ fn start_anvil(dir: &Path) -> Anvil {
 /// Serve `body` to every GET on a local port; counts the requests.
 fn serve_file(body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the ELF server");
-    let url = format!("http://{}/fibonacci.bin", listener.local_addr().unwrap());
+    let url = format!("http://{}/program.bin", listener.local_addr().unwrap());
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = hits.clone();
     std::thread::spawn(move || {
@@ -292,6 +461,20 @@ fn risc0_worker() -> PathBuf {
     path
 }
 
+/// The mock worker, which replays the receipt fixture (crates/zkminer-prover/src/bin/mock_worker.rs).
+fn mock_worker() -> PathBuf {
+    let path = std::env::var("ZKMINER_LOCALNET_MOCK_WORKER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root().join("target/debug/mock-worker"));
+    assert!(
+        path.is_file(),
+        "no mock worker at {}: build it (cargo build -p zkminer-prover --features testing --bin \
+         mock-worker) or set ZKMINER_LOCALNET_MOCK_WORKER",
+        path.display()
+    );
+    path
+}
+
 /// The fibonacci guest and its image id (the jobs' `programId`), from the worker that runs it.
 fn export_guest(worker: &Path, dir: &Path) -> (Vec<u8>, B256) {
     let path = dir.join("fibonacci.bin");
@@ -312,17 +495,24 @@ fn export_guest(worker: &Path, dir: &Path) -> (Vec<u8>, B256) {
     (std::fs::read(&path).expect("read the exported guest"), id)
 }
 
-/// Wait for a mined receipt and require success.
+/// How long a setup transaction may take to be sent and mined.
+const SETUP_TX_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Send, wait for the mined receipt, and require success.
 macro_rules! mined {
     ($call:expr, $what:expr) => {{
         let what = $what;
-        let receipt = $call
-            .send()
-            .await
-            .unwrap_or_else(|e| panic!("{what}: {e}"))
-            .get_receipt()
-            .await
-            .unwrap_or_else(|e| panic!("{what}: no receipt: {e}"));
+        let receipt = tokio::time::timeout(SETUP_TX_TIMEOUT, async {
+            $call
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{what}: {e}"))
+                .get_receipt()
+                .await
+                .unwrap_or_else(|e| panic!("{what}: no receipt: {e}"))
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}: not mined within {SETUP_TX_TIMEOUT:?}"));
         assert!(
             receipt.status(),
             "{what} reverted ({})",
@@ -338,7 +528,14 @@ struct Job {
     id: B256,
 }
 
-/// The fork, set up: a staked prover, the guest registered and served, one job per case.
+/// A router event of one job, where it was mined.
+struct Logged<E> {
+    block: u64,
+    tx: B256,
+    event: E,
+}
+
+/// The fork, set up: a staked prover, the programs registered and served, the jobs.
 struct World {
     _anvil: Anvil,
     rpc_url: String,
@@ -346,7 +543,9 @@ struct World {
     prover: PrivateKeySigner,
     submitter: Address,
     another_prover: Address,
-    program_id: B256,
+    program: Program,
+    /// The cases this run submits.
+    cases: Vec<Case>,
     /// The jobs submitted so far.
     jobs: Vec<Job>,
     /// The first block after setup started: every log query starts here.
@@ -356,8 +555,8 @@ struct World {
 }
 
 impl World {
-    async fn new(dir: &Path, worker: &Path) -> Self {
-        let anvil = start_anvil(dir);
+    async fn new(dir: &Path, program: Program, cases: &[Case], clock: Clock) -> Self {
+        let mut anvil = start_anvil(dir);
         let provider = ProviderBuilder::new()
             .connect_http(anvil.url.parse().unwrap())
             .erased();
@@ -369,41 +568,56 @@ impl World {
                     assert_eq!(id, DEPLOYMENT.chain_id);
                     break;
                 }
-                Err(e) if started.elapsed() > Duration::from_secs(180) => {
-                    panic!(
-                        "anvil did not come up ({e}); see {}/anvil.log",
-                        dir.display()
-                    )
+                Err(e) => {
+                    if let Some(status) = anvil.child.try_wait().ok().flatten() {
+                        panic!(
+                            "anvil exited ({status}) before serving; see {}/anvil.log",
+                            dir.display()
+                        );
+                    }
+                    if started.elapsed() > Duration::from_secs(180) {
+                        panic!(
+                            "anvil did not come up ({e}); see {}/anvil.log",
+                            dir.display()
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
             }
         }
+        assert!(
+            !provider
+                .get_code_at(DEPLOYMENT.router)
+                .await
+                .expect("read the router's code")
+                .is_empty(),
+            "the fork has no router at {}: the fork block predates the deployment pinned in \
+             zkminer-chain/src/deployment.rs (move FORK_BLOCK)",
+            DEPLOYMENT.router
+        );
+        // anvil carries on from the fork block's timestamp, hours behind the wall clock for a pinned
+        // block. The miner judges deadlines by the wall clock as well as the chain (a lock whose
+        // deadline looks past is released), so put the fork's clock on the wall clock (or behind
+        // it by the lag asked for).
+        let lag = match clock {
+            Clock::Wall => 0,
+            Clock::Lagging(secs) => secs,
+        };
+        let _: serde_json::Value = provider
+            .raw_request("evm_setTime".into(), (unix_now() - lag,))
+            .await
+            .expect("evm_setTime");
         let from_block = provider.get_block_number().await.unwrap() + 1;
 
-        let (elf, program_id) = export_guest(worker, dir);
-        let (elf_url, elf_hits) = serve_file(elf.clone());
+        let (elf_url, elf_hits) = serve_file(program.elf.clone());
 
         let submitter = Address::from_word(keccak256(b"zkminer localnet submitter"));
         let another_prover = Address::repeat_byte(0x42);
         let prover = PrivateKeySigner::random();
-        // tHEMI is minted by its owner (`owner()`), which anvil impersonates.
-        let owner_word = provider
-            .call(
-                TransactionRequest::default()
-                    .to(DEPLOYMENT.token)
-                    .input(Bytes::from_static(&[0x8d, 0xa5, 0xcb, 0x5b]).into()),
-            )
-            .await
-            .expect("read the token's owner");
-        let token_owner = Address::from_word(B256::from_slice(&owner_word));
+        // tHEMI is minted by its owner, which anvil impersonates.
+        let token_owner = owner_of(&provider, DEPLOYMENT.token).await;
         for a in [token_owner, submitter, prover.address()] {
-            let _: serde_json::Value = provider
-                .raw_request(
-                    "anvil_setBalance".into(),
-                    (a, U256::from(100u128) * U256::from(HEMI)),
-                )
-                .await
-                .expect("anvil_setBalance");
+            set_balance(&provider, a, 100 * HEMI).await;
         }
 
         let token = ITestnetToken::new(DEPLOYMENT.token, &provider);
@@ -441,29 +655,42 @@ impl World {
                 .from(submitter),
             "approve the registration fee"
         );
-        mined!(
-            IProgramRegistry::new(DEPLOYMENT.program_registry, &provider)
-                .registerProgram(
-                    program_id,
-                    risc_zero_groth16_v1_id(),
-                    B256::ZERO,
-                    ResourceEstimate {
-                        estimatedCycles: 0,
-                        peakMemoryBytes: 0,
-                        estimatedWallTimeS: 0,
-                    },
-                    "fibonacci (zkminer localnet)".into(),
-                    String::new(),
-                    String::new(),
-                    vec![StorageURI {
-                        storageType: 2, // HTTP
-                        uri: elf_url,
-                        contentHash: keccak256(&elf),
-                    }],
-                )
-                .from(submitter),
-            "register the guest"
-        );
+        let elf_hash = keccak256(&program.elf);
+        register_program(
+            &provider,
+            submitter,
+            program.id,
+            program.name,
+            &elf_url,
+            elf_hash,
+        )
+        .await;
+        if cases.contains(&Case::DecoyElf) {
+            // Another programId whose URI serves this run's ELF.
+            let id = Case::DecoyElf.program_id(&program);
+            register_program(
+                &provider,
+                submitter,
+                id,
+                "decoy (zkminer localnet)",
+                &elf_url,
+                elf_hash,
+            )
+            .await;
+        }
+        if cases.contains(&Case::ElfUnreachable) {
+            let id = Case::ElfUnreachable.program_id(&program);
+            let url = format!("http://127.0.0.1:{}/unreachable.bin", free_port());
+            register_program(
+                &provider,
+                submitter,
+                id,
+                "unreachable (zkminer localnet)",
+                &url,
+                B256::ZERO,
+            )
+            .await;
+        }
 
         mined!(
             erc20
@@ -478,15 +705,115 @@ impl World {
             prover,
             submitter,
             another_prover,
-            program_id,
+            program,
+            cases: cases.to_vec(),
             jobs: Vec::new(),
             from_block,
             elf_hits,
         };
-        for case in Case::ALL.into_iter().filter(|c| c.before_start()) {
+        for case in world.cases.clone().into_iter().filter(|c| c.before_start()) {
             world.submit(case).await;
         }
+        let skew = world.clock_skew().await;
+        assert!(
+            (skew + lag as i64).abs() < 30,
+            "the fork's clock is {skew} s off the wall clock, not -{lag} s, after evm_setTime"
+        );
         world
+    }
+
+    /// Call `contract` as its `owner()`, which anvil impersonates.
+    async fn call_as_owner(&self, contract: Address, data: Vec<u8>, what: &str) {
+        let owner = owner_of(&self.provider, contract).await;
+        set_balance(&self.provider, owner, HEMI).await;
+        let receipt = tokio::time::timeout(SETUP_TX_TIMEOUT, async {
+            self.provider
+                .send_transaction(
+                    TransactionRequest::default()
+                        .from(owner)
+                        .to(contract)
+                        .input(Bytes::from(data).into()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{what}: {e}"))
+                .get_receipt()
+                .await
+                .unwrap_or_else(|e| panic!("{what}: no receipt: {e}"))
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}: not mined within {SETUP_TX_TIMEOUT:?}"));
+        assert!(receipt.status(), "{what} reverted");
+    }
+
+    async fn set_router_paused(&self, paused: bool) {
+        let selector = if paused { "pause()" } else { "unpause()" };
+        self.call_as_owner(
+            DEPLOYMENT.router,
+            keccak256(selector).0[..4].to_vec(),
+            &format!("router {selector}"),
+        )
+        .await;
+    }
+
+    async fn disable_risc0_adapter(&self) {
+        let mut data = keccak256("disableAdapter(bytes32)").0[..4].to_vec();
+        data.extend_from_slice(risc_zero_groth16_v1_id().as_slice());
+        self.call_as_owner(
+            DEPLOYMENT.registry,
+            data,
+            "disableAdapter(risczero.groth16.v1)",
+        )
+        .await;
+    }
+
+    /// The latest block's timestamp minus the wall clock, in seconds.
+    async fn clock_skew(&self) -> i64 {
+        let block = self
+            .provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .await
+            .unwrap()
+            .expect("the latest block");
+        block.header.timestamp as i64 - unix_now() as i64
+    }
+
+    /// A job's status and prover on the fork.
+    async fn job_state(&self, id: B256) -> (u8, Address) {
+        let v = IHemiProveAux::new(DEPLOYMENT.router, &self.provider)
+            .getJobStatusView(id)
+            .call()
+            .await
+            .expect("getJobStatusView");
+        (v.status, v.prover)
+    }
+
+    /// Each job's status and prover on the fork, and the prover's stake, for a failure report.
+    async fn describe_state(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for job in &self.jobs {
+            let (status, prover) = self.job_state(job.id).await;
+            out.push(format!(
+                "{:?} {}: status {status} prover {prover}",
+                job.case,
+                short_id(job.id)
+            ));
+        }
+        let st = self.stake().await;
+        out.push(format!(
+            "prover stake: {} HEMI total, {} HEMI locked",
+            hemi(st.totalStaked),
+            hemi(st.lockedCollateral)
+        ));
+        out.push(format!("fork clock skew: {} s", self.clock_skew().await));
+        out
+    }
+
+    async fn stake(&self) -> zkminer_contracts::bindings::ProverStake {
+        IHemiProveStaking::new(DEPLOYMENT.staking, &self.provider)
+            .getProverStake(self.prover.address())
+            .call()
+            .await
+            .expect("read the prover's stake")
     }
 
     async fn submit(&mut self, case: Case) {
@@ -495,7 +822,7 @@ impl World {
             core.submitJob(
                 descriptor(
                     case,
-                    self.program_id,
+                    &self.program,
                     self.prover.address(),
                     self.another_prover
                 ),
@@ -518,29 +845,13 @@ impl World {
 
     /// Submit the jobs held back for the live monitor, once the miner's monitor runs.
     async fn submit_after_start(&mut self, miner: &mut Miner) {
-        let started = Instant::now();
-        while !miner
-            .lines()
-            .iter()
-            .any(|l| l.contains("Job monitor started"))
-        {
-            assert!(
-                !miner.exited(),
-                "the miner exited before its job monitor started"
-            );
-            assert!(
-                started.elapsed() < Duration::from_secs(120),
-                "the miner's job monitor did not start within 120 s"
-            );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        for case in Case::ALL.into_iter().filter(|c| !c.before_start()) {
+        assert!(
+            wait_for_line(miner, "Job monitor started", Duration::from_secs(120)).await,
+            "the miner's job monitor did not start within 120 s"
+        );
+        for case in self.cases.clone().into_iter().filter(|c| !c.before_start()) {
             self.submit(case).await;
         }
-    }
-
-    fn job(&self, case: Case) -> B256 {
-        self.jobs.iter().find(|j| j.case == case).unwrap().id
     }
 
     async fn prover_nonce(&self) -> u64 {
@@ -550,8 +861,8 @@ impl World {
             .unwrap()
     }
 
-    /// Jobs with a log of `E` on the fork since setup began.
-    async fn jobs_with_event<E: SolEvent>(&self) -> Vec<B256> {
+    /// The router's `E` logs since setup began: each with its job (topic 1), block and transaction.
+    async fn logs<E: SolEvent>(&self) -> Vec<(B256, Logged<E>)> {
         let filter = Filter::new()
             .address(DEPLOYMENT.router)
             .event_signature(E::SIGNATURE_HASH)
@@ -560,9 +871,20 @@ impl World {
             .get_logs(&filter)
             .await
             .unwrap()
-            .iter()
-            .filter_map(|l| l.topics().get(1).copied())
+            .into_iter()
+            .filter_map(|l| {
+                let job = *l.topics().get(1)?;
+                let block = l.block_number?;
+                let tx = l.transaction_hash?;
+                let event = l.log_decode::<E>().ok()?.inner.data;
+                Some((job, Logged { block, tx, event }))
+            })
             .collect()
+    }
+
+    /// The jobs with an `E` log since setup began.
+    async fn jobs_with<E: SolEvent>(&self) -> Vec<B256> {
+        self.logs::<E>().await.into_iter().map(|(j, _)| j).collect()
     }
 
     /// The miner's config: the fork, the 743111 contracts, and fast polling.
@@ -572,6 +894,8 @@ impl World {
         c.chain.chain_id = DEPLOYMENT.chain_id;
         c.chain.scan_from_block = Some(self.from_block);
         c.chain.monitor_poll_secs = Some(2);
+        // A local node has no rate limit to stay under.
+        c.chain.max_requests_per_sec = Some(50);
         c.contracts.hemi_prove = DEPLOYMENT.router.to_string();
         c.contracts.hemi_prove_staking = DEPLOYMENT.staking.to_string();
         c.contracts.hemi_prove_registry = DEPLOYMENT.registry.to_string();
@@ -600,39 +924,110 @@ impl World {
     }
 }
 
-fn descriptor(case: Case, program_id: B256, prover: Address, another: Address) -> JobDescriptor {
+async fn set_balance(provider: &DynProvider, a: Address, wei: u128) {
+    let _: serde_json::Value = provider
+        .raw_request("anvil_setBalance".into(), (a, U256::from(wei)))
+        .await
+        .expect("anvil_setBalance");
+}
+
+/// A contract's `owner()`.
+async fn owner_of(provider: &DynProvider, contract: Address) -> Address {
+    let word = provider
+        .call(
+            TransactionRequest::default()
+                .to(contract)
+                .input(Bytes::from(keccak256("owner()").0[..4].to_vec()).into()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("owner() of {contract}: {e}"));
+    assert_eq!(word.len(), 32, "owner() of {contract} returned {word}");
+    Address::from_word(B256::from_slice(&word))
+}
+
+/// Register `id` in the ProgramRegistry (permissionless) with one HTTP storage URI.
+async fn register_program(
+    provider: &DynProvider,
+    from: Address,
+    id: B256,
+    name: &str,
+    url: &str,
+    content_hash: B256,
+) {
+    let registry = IProgramRegistry::new(DEPLOYMENT.program_registry, provider);
+    assert!(
+        !registry
+            .isRegistered(id)
+            .call()
+            .await
+            .expect("isRegistered"),
+        "program {id} ({name}) is already registered at the fork block, with storage URIs this \
+         test does not serve: move FORK_BLOCK to before its registration, or test another program"
+    );
+    mined!(
+        registry
+            .registerProgram(
+                id,
+                risc_zero_groth16_v1_id(),
+                B256::ZERO,
+                ResourceEstimate {
+                    estimatedCycles: 0,
+                    peakMemoryBytes: 0,
+                    estimatedWallTimeS: 0,
+                },
+                name.into(),
+                String::new(),
+                String::new(),
+                vec![StorageURI {
+                    storageType: 2, // HTTP
+                    uri: url.into(),
+                    contentHash: content_hash,
+                }],
+            )
+            .from(from),
+        format!("register {name}")
+    );
+}
+
+fn descriptor(case: Case, program: &Program, prover: Address, another: Address) -> JobDescriptor {
     let psid = risc_zero_groth16_v1_id();
-    let journal = guest_journal();
+    let (program_id, journal) = (case.program_id(program), &program.journal);
     let slot0 = |word: u32| {
         let mut f = B256::ZERO;
         f.0[..4].copy_from_slice(&word.to_be_bytes());
         f
     };
+    // One FIELDS range: offset 0, length 8.
+    let first_8 = slot0(8);
     let (assigned, expected, fields) = match case {
         Case::Full => (
             Address::ZERO,
-            full_hash(psid, program_id, &journal),
+            full_hash(psid, program_id, journal),
             B256::ZERO,
         ),
-        Case::Fields => {
-            // One range: offset 0, length 8.
-            let f = slot0(8);
-            (Address::ZERO, fields_hash(&journal, f), f)
-        }
-        Case::FullWrongJournal => {
-            let wrong = (fib(FIB_N) + 1).to_le_bytes();
-            (
-                Address::ZERO,
-                full_hash(psid, program_id, &wrong),
-                B256::ZERO,
-            )
-        }
+        Case::Fields => (Address::ZERO, fields_hash(journal, first_8), first_8),
+        Case::FullWrongJournal => (
+            Address::ZERO,
+            full_hash(psid, program_id, &program.wrong_journal()),
+            B256::ZERO,
+        ),
+        Case::FieldsWrongJournal => (
+            Address::ZERO,
+            fields_hash(&program.wrong_journal(), first_8),
+            first_8,
+        ),
         Case::NoneForUs => (prover, B256::ZERO, B256::ZERO),
         Case::NoneForAnother => (another, B256::ZERO, B256::ZERO),
         Case::PrefixMarker => (
             Address::ZERO,
-            full_hash(psid, program_id, &journal),
+            full_hash(psid, program_id, journal),
             slot0(0xffff_ffff),
+        ),
+        // Bound as the program would commit: only the ELF stops them.
+        Case::DecoyElf | Case::ElfUnreachable => (
+            Address::ZERO,
+            full_hash(psid, program_id, journal),
+            B256::ZERO,
         ),
     };
     JobDescriptor {
@@ -641,7 +1036,7 @@ fn descriptor(case: Case, program_id: B256, prover: Address, another: Address) -
         callbackContract: Address::ZERO,
         assignedProver: assigned,
         tag: keccak256(format!("zkminer localnet {case:?}")),
-        inputData: guest_input().into(),
+        inputData: program.input.clone().into(),
         callbackExtraData: Bytes::new(),
         extraVerifierData: Bytes::new(),
         expectedJournalHash: expected,
@@ -688,6 +1083,36 @@ fn no_bidding() -> CompetitiveBidConfig {
     }
 }
 
+/// `PATH` without the directories that hold a zkminer worker, so a miner finds only the workers
+/// its config names (and none of an installed release's).
+fn path_without_workers() -> String {
+    const SYSTEM: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+    let path = std::env::var("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .filter(|dir| {
+            let has_workers = std::fs::read_dir(dir).is_ok_and(|entries| {
+                entries.flatten().any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("zkminer-prove-")
+                })
+            });
+            // A system directory stays (the miner needs nvidia-smi, systemd-run, busctl): a worker
+            // installed there can still be found, so say so.
+            if has_workers && SYSTEM.iter().any(|s| dir == Path::new(s)) {
+                eprintln!(
+                    "localnet: {} holds zkminer workers; the miner may start them",
+                    dir.display()
+                );
+                return true;
+            }
+            !has_workers
+        })
+        .map(|d| d.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 /// A running `zkminer`, its log lines collected as they arrive; stopped on drop.
 struct Miner {
     child: Child,
@@ -695,26 +1120,53 @@ struct Miner {
 }
 
 impl Miner {
-    /// Start a copy of the `zkminer` binary in `dir` (its own directory is searched for workers,
-    /// so a copy finds only the ones the config names), with `dir` as its HOME.
-    fn start(dir: &Path, config: &Path, args: &[&str], env: &[(&str, String)]) -> Self {
+    /// Start `zkminer` from a link in `dir` (its own directory is searched for workers, so it finds
+    /// only the ones the config names), with `dir` as its HOME and a cleaned environment: none of
+    /// this shell's `ZKMINER_*` or `MOCK_*` settings, only `env`.
+    fn start(
+        dir: &Path,
+        config: &Path,
+        global: &[&str],
+        args: &[&str],
+        env: &[(&str, String)],
+    ) -> Self {
         let exe = dir.join("zkminer");
-        std::fs::copy(env!("CARGO_BIN_EXE_zkminer"), &exe).expect("copy the zkminer binary");
+        let _ = std::fs::remove_file(&exe);
+        if std::fs::hard_link(env!("CARGO_BIN_EXE_zkminer"), &exe).is_err() {
+            std::fs::copy(env!("CARGO_BIN_EXE_zkminer"), &exe).expect("copy the zkminer binary");
+        }
         let mut cmd = Command::new(&exe);
-        cmd.arg("--config")
+        cmd.args(global)
+            .arg("--config")
             .arg(config)
             .arg("run")
-            .args(args)
-            .env("HOME", dir)
-            // The guest is served from this machine.
+            .args(args);
+        for (k, _) in std::env::vars_os() {
+            let name = k.to_string_lossy();
+            if name.starts_with("ZKMINER_") || name.starts_with("MOCK_") {
+                cmd.env_remove(&k);
+            }
+        }
+        // risc0 finds its Groth16 key under ~/.risc0: keep the real one when HOME moves.
+        if std::env::var_os("RISC0_HOME").is_none() {
+            if let Some(home) = std::env::var_os("HOME") {
+                let risc0 = Path::new(&home).join(".risc0");
+                if risc0.is_dir() {
+                    cmd.env("RISC0_HOME", risc0);
+                }
+            }
+        }
+        cmd.env("HOME", dir)
+            .env("PATH", path_without_workers())
+            // The programs are served from this machine.
             .env("ZKMINER_ELF_ALLOW_PRIVATE_URLS", "1")
-            .env_remove("ZKMINER_PRIVATE_KEY")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (k, v) in env {
             cmd.env(k, v);
         }
+        die_with_parent(&mut cmd);
         let mut child = cmd.spawn().expect("start zkminer");
         let lines = Arc::new(Mutex::new(Vec::new()));
         let echo = env_flag("ZKMINER_LOCALNET_ECHO");
@@ -754,9 +1206,7 @@ impl Miner {
         if self.exited() {
             return true;
         }
-        let _ = Command::new("kill")
-            .args(["-INT", &self.child.id().to_string()])
-            .status();
+        signal(&self.child, libc::SIGINT);
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
             if self.exited() {
@@ -803,6 +1253,13 @@ fn watch_lines(lines: &[String], id: B256) -> Vec<String> {
         .collect()
 }
 
+/// Whether the brain dispatched a claim of `id` (its `CLAIM <job> (price …` line): the job got past
+/// every gate the brain applies.
+fn dispatched(lines: &[String], id: B256) -> bool {
+    let tag = format!("CLAIM {} (", short_id(id));
+    lines.iter().any(|l| l.contains(&tag))
+}
+
 /// Print the tail of the miner's log, for a failure.
 fn dump_tail(dir: &Path, lines: &[String]) {
     eprintln!(
@@ -814,36 +1271,43 @@ fn dump_tail(dir: &Path, lines: &[String]) {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs anvil, the release risc0 worker and the 743111 RPC; see the module docs"]
-async fn watch_only_reports_every_job() {
-    let dir = RunDir::new("watch");
-    let worker = risc0_worker();
-    let mut world = World::new(&dir.0, &worker).await;
-    let config = world.write_config(&dir.0, &worker, false);
-    let expect_claims = std::env::var("ZKMINER_LOCALNET_EXPECT_CLAIMS").as_deref() != Ok("0");
-    let nonce_before = world.prover_nonce().await;
-
-    let mut miner = Miner::start(
-        &dir.0,
-        &config,
-        &[
-            "--watch-only",
-            "--address",
-            &world.prover.address().to_string(),
-        ],
-        &[],
-    );
-    world.submit_after_start(&mut miner).await;
-
-    // Every case's verdict, and a would-claim for each claimable case.
+/// Wait until the miner has logged `needle` `times` times; false if it exits or `timeout` passes.
+async fn wait_for_lines(miner: &mut Miner, needle: &str, times: usize, timeout: Duration) -> bool {
     let started = Instant::now();
-    let missing = loop {
+    loop {
+        if miner.lines().iter().filter(|l| l.contains(needle)).count() >= times {
+            return true;
+        }
+        if miner.exited() || started.elapsed() > timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_for_line(miner: &mut Miner, needle: &str, timeout: Duration) -> bool {
+    wait_for_lines(miner, needle, 1, timeout).await
+}
+
+/// Wait for a watch-only miner's verdicts on every job, watch for [`SETTLE`] more, then stop it.
+/// As the staked prover, each claimable job must also be reported WOULD CLAIM (unless
+/// `ZKMINER_LOCALNET_EXPECT_CLAIMS=0`); nothing else, and nothing at all as an address with no
+/// stake, may be. Returns the failures and the log.
+async fn watch_and_check(
+    world: &World,
+    miner: &mut Miner,
+    staked: bool,
+) -> (Vec<String>, Vec<String>) {
+    let expect_claims =
+        staked && std::env::var("ZKMINER_LOCALNET_EXPECT_CLAIMS").as_deref() != Ok("0");
+    let started = Instant::now();
+    let mut failures = loop {
         let lines = miner.lines();
         let mut missing = Vec::new();
+        let mut inconclusive = Vec::new();
         for job in &world.jobs {
             let verdicts = watch_lines(&lines, job.id);
-            let want = job.case.inspector_verdict();
+            let want = job.case.inspector_verdict(staked);
             if !verdicts.iter().any(|v| v.contains(&want)) {
                 missing.push(format!("{:?}: a verdict containing {want:?}", job.case));
             }
@@ -853,59 +1317,131 @@ async fn watch_only_reports_every_job() {
             {
                 missing.push(format!("{:?}: WOULD CLAIM", job.case));
             }
+            if let Some(v) = verdicts.iter().find(|v| v.starts_with("no verdict after")) {
+                inconclusive.push(format!("{:?}: {v}", job.case));
+            }
         }
-        if missing.is_empty() || started.elapsed() > WATCH_TIMEOUT || miner.exited() {
+        if !inconclusive.is_empty() {
+            break inconclusive;
+        }
+        if missing.is_empty() {
+            tokio::time::sleep(SETTLE).await;
+            break Vec::new();
+        }
+        if started.elapsed() > WATCH_TIMEOUT || miner.exited() {
             break missing;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     };
-    let exited_early = miner.exited();
-    let stopped = miner.stop(Duration::from_secs(60));
-    let lines = miner.lines();
-
-    let mut failures = missing;
-    if exited_early {
+    if miner.exited() {
         failures.push("zkminer exited before every verdict was in".into());
     }
-    if !stopped {
+    if !miner.stop(Duration::from_secs(60)) {
         failures.push("zkminer did not exit within 60 s of SIGINT".into());
     }
+    let lines = miner.lines();
     for job in &world.jobs {
-        // Never a would-claim for a job the miner must refuse.
-        if !job.case.claimable()
-            && watch_lines(&lines, job.id)
-                .iter()
-                .any(|v| v.starts_with("WOULD CLAIM"))
-        {
+        let would_claim = watch_lines(&lines, job.id)
+            .iter()
+            .any(|v| v.starts_with("WOULD CLAIM"));
+        if would_claim && !(staked && job.case.claimable()) {
             failures.push(format!("{:?}: reported WOULD CLAIM", job.case));
         }
+        for v in watch_lines(&lines, job.id) {
+            eprintln!(
+                "localnet{}: {:?} {}: {v}",
+                if staked { "" } else { " (unstaked)" },
+                job.case,
+                short_id(job.id)
+            );
+        }
     }
-    // Watch-only sends nothing: the prover's nonce is where setup left it, no job was claimed, and
-    // the send guard never had anything to refuse.
+    if lines.iter().any(|l| l.contains("refusing to send")) {
+        failures.push("the send guard refused a send".into());
+    }
+    (failures, lines)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs anvil, the release risc0 worker and the 743111 RPC; see the module docs"]
+async fn watch_only_reports_every_job() {
+    let dir = RunDir::new("watch");
+    let worker = risc0_worker();
+    let program = Program::fibonacci(&worker, &dir.0);
+    let mut world = World::new(&dir.0, program, &Case::ALL, Clock::Wall).await;
+    let config = world.write_config(&dir.0, &worker, false);
+    let nonce_before = world.prover_nonce().await;
+
+    // As the staked prover.
+    let mut miner = Miner::start(
+        &dir.0,
+        &config,
+        &[],
+        &[
+            "--watch-only",
+            "--address",
+            &world.prover.address().to_string(),
+        ],
+        &[],
+    );
+    world.submit_after_start(&mut miner).await;
+    let (mut failures, mut lines) = watch_and_check(&world, &mut miner, true).await;
+    // The program came from its registry URI, and the decoy was refused for its image id, not for
+    // some other failure.
+    if world.elf_hits.load(Ordering::SeqCst) == 0 {
+        failures.push("the guest was never downloaded from its registry URI".into());
+    }
+    if !lines
+        .iter()
+        .any(|l| l.contains("does not match job programId"))
+    {
+        failures.push("the decoy ELF was never refused for its image id".into());
+    }
+
+    // As an address with no stake: the quote is refused for want of stake, and nothing would be
+    // claimed.
+    let unstaked_home = dir.0.join("unstaked");
+    std::fs::create_dir_all(unstaked_home.join(".zkminer")).unwrap();
+    let mut unstaked = Miner::start(
+        &unstaked_home,
+        &config,
+        &[],
+        &[
+            "--watch-only",
+            "--address",
+            &Address::repeat_byte(0x77).to_string(),
+        ],
+        &[],
+    );
+    let (unstaked_failures, unstaked_lines) = watch_and_check(&world, &mut unstaked, false).await;
+    failures.extend(
+        unstaked_failures
+            .into_iter()
+            .map(|f| format!("unstaked: {f}")),
+    );
+
+    // Watch-only sends nothing. Setup sends with eth_sendTransaction (anvil signs), so any
+    // eth_sendRawTransaction the node saw came from a miner (its send guard must stop even its
+    // throwaway key's). The prover's nonce and the claims are checked too, for completeness.
+    let raw_sends = std::fs::read_to_string(dir.0.join("anvil.log"))
+        .unwrap_or_default()
+        .matches("eth_sendRawTransaction")
+        .count();
+    if raw_sends > 0 {
+        failures.push(format!("the node received {raw_sends} raw transaction(s)"));
+    }
     let nonce_after = world.prover_nonce().await;
     if nonce_after != nonce_before {
         failures.push(format!(
             "the prover's nonce moved from {nonce_before} to {nonce_after}"
         ));
     }
-    let claimed = world.jobs_with_event::<IHemiProveCore::JobClaimed>().await;
+    let claimed = world.jobs_with::<IHemiProveCore::JobClaimed>().await;
     if !claimed.is_empty() {
         failures.push(format!("JobClaimed on the fork for {claimed:?}"));
     }
-    if lines.iter().any(|l| l.contains("refusing to send")) {
-        failures.push("the send guard refused a send".into());
-    }
-    // The guest came from its registry URI.
-    if world.elf_hits.load(Ordering::SeqCst) == 0 {
-        failures.push("the guest was never downloaded from its registry URI".into());
-    }
-
-    for job in &world.jobs {
-        for v in watch_lines(&lines, job.id) {
-            eprintln!("localnet: {:?} {}: {v}", job.case, short_id(job.id));
-        }
-    }
     if !failures.is_empty() {
+        lines.extend(unstaked_lines);
         dump_tail(&dir.0, &lines);
         panic!(
             "watch-only localnet run failed (run directory {}):\n  {}",
@@ -916,11 +1452,166 @@ async fn watch_only_reports_every_job() {
     dir.finish();
 }
 
+/// The environment for a miner on the replayed receipt fixture.
+fn replay_env() -> Vec<(&'static str, String)> {
+    vec![
+        ("MOCK_BACKEND", "risc0".to_string()),
+        ("MOCK_JOURNAL_HEX", alloy::hex::encode(FIXTURE_JOURNAL)),
+        // A worker returns the bare proof, and the miner prefixes the selector.
+        ("MOCK_SEAL_HEX", FIXTURE_SEAL_HEX[8..].to_string()),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs anvil, the mock worker and the 743111 RPC; see the module docs"]
+async fn fulfils_with_a_replayed_receipt() {
+    let dir = RunDir::new("replay");
+    let worker = mock_worker();
+    let mut world = World::new(&dir.0, Program::fixture(), &Case::REPLAYABLE, Clock::Wall).await;
+    let config = world.write_config(&dir.0, &worker, false);
+    mine_and_check(&mut world, &dir, &config, replay_env(), REPLAY_TIMEOUT).await;
+    dir.finish();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs anvil, the mock worker and the 743111 RPC; see the module docs"]
+async fn holds_its_lock_through_a_pause() {
+    let dir = RunDir::new("pause-locked");
+    let worker = mock_worker();
+    let world = World::new(&dir.0, Program::fixture(), &[Case::Full], Clock::Wall).await;
+    let config = world.write_config(&dir.0, &worker, false);
+    let job = world.jobs[0].id;
+    // A proof that takes a while, so the router can pause while the lock is held.
+    let mut env = replay_env();
+    env.push(("MOCK_PROVE_DELAY_SECS", "20".to_string()));
+    let mut miner = start_mining(&world, &dir, &config, env, false);
+
+    let mut failures = Vec::new();
+    let started = Instant::now();
+    while world
+        .jobs_with::<IHemiProveCore::JobClaimed>()
+        .await
+        .is_empty()
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(180) && !miner.exited(),
+            "the job was never claimed"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    world.set_router_paused(true).await;
+    // The proof finishes while paused; its fulfil must wait, and the lock must be kept.
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let (status, prover) = world.job_state(job).await;
+    if status != zkminer_chain::jobs::JOB_STATUS_LOCKED || prover != world.prover.address() {
+        failures.push(format!(
+            "during the pause the job reads status {status} prover {prover}, not locked by us"
+        ));
+    }
+    world.set_router_paused(false).await;
+    let (fulfilled, exited_early) = wait_fulfilled(&world, &mut miner, REPLAY_TIMEOUT).await;
+    tokio::time::sleep(SETTLE).await;
+    let stopped = miner.stop(Duration::from_secs(120));
+    failures.extend(check_settlement(&world, &fulfilled, exited_early, stopped).await);
+    finish_or_report(world, dir, miner, failures).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs anvil, the mock worker and the 743111 RPC; see the module docs"]
+async fn holds_off_while_the_router_is_paused() {
+    let dir = RunDir::new("pause");
+    let worker = mock_worker();
+    // Submitted before the pause (a paused router refuses submits too).
+    let world = World::new(
+        &dir.0,
+        Program::fixture(),
+        &[Case::Full, Case::FullWrongJournal],
+        Clock::Wall,
+    )
+    .await;
+    let config = world.write_config(&dir.0, &worker, false);
+    world.set_router_paused(true).await;
+    let nonce_before = world.prover_nonce().await;
+    let mut miner = start_mining(&world, &dir, &config, replay_env(), false);
+
+    // The miner's own gate holds the claim: it reports the pause, dispatches no claim, and sends
+    // nothing (a claim it tried would be refused anyway, so only that proves the gate).
+    let mut failures = Vec::new();
+    if !wait_for_line(
+        &mut miner,
+        "PAUSED: the router or Registry is paused",
+        Duration::from_secs(120),
+    )
+    .await
+    {
+        failures.push("the miner never reported the pause".to_string());
+    }
+    tokio::time::sleep(SETTLE).await;
+    if world.jobs.iter().any(|j| dispatched(&miner.lines(), j.id)) {
+        failures.push("a claim was dispatched while the router was paused".into());
+    }
+    if world.prover_nonce().await != nonce_before {
+        failures.push("the prover sent a transaction while the router was paused".into());
+    }
+    // Lifted: the claimable job is claimed and fulfilled.
+    world.set_router_paused(false).await;
+    let (fulfilled, exited_early) = wait_fulfilled(&world, &mut miner, REPLAY_TIMEOUT).await;
+    tokio::time::sleep(SETTLE).await;
+    let stopped = miner.stop(Duration::from_secs(120));
+    failures.extend(check_settlement(&world, &fulfilled, exited_early, stopped).await);
+    finish_or_report(world, dir, miner, failures).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs anvil, the mock worker and the 743111 RPC; see the module docs"]
+async fn refuses_to_claim_while_its_adapter_is_disabled() {
+    let dir = RunDir::new("disabled");
+    let worker = mock_worker();
+    let world = World::new(&dir.0, Program::fixture(), &[Case::Full], Clock::Wall).await;
+    let config = world.write_config(&dir.0, &worker, false);
+    world.disable_risc0_adapter().await;
+    // The brain's own skip of this job (a debug line), not just the startup check's report: it
+    // proves the brain evaluated the job and held it.
+    let needle = format!(
+        "Skipping {}: risczero.groth16.v1 is not verified claimable right now",
+        short_id(world.jobs[0].id)
+    );
+    no_claims_after(world, dir, &config, &needle, 1, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs anvil, the mock worker and the 743111 RPC; see the module docs"]
+async fn refuses_to_claim_on_a_skewed_clock() {
+    let dir = RunDir::new("skew");
+    let worker = mock_worker();
+    // The chain an hour behind this host: every lock would look about to expire, and be released.
+    let world = World::new(
+        &dir.0,
+        Program::fixture(),
+        &[Case::Full],
+        Clock::Lagging(3_600),
+    )
+    .await;
+    let config = world.write_config(&dir.0, &worker, false);
+    // The gate reports at once and then each minute: two reports prove it held for that minute.
+    no_claims_after(
+        world,
+        dir,
+        &config,
+        "s ahead of the chain's (more than",
+        2,
+        false,
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a GPU, anvil, the release risc0 worker and ZKMINER_LOCALNET_MINE=1"]
 async fn mines_the_claimable_jobs() {
     if !env_flag("ZKMINER_LOCALNET_MINE") {
-        eprintln!("localnet: skipping the mining test; set ZKMINER_LOCALNET_MINE=1 to run it");
+        eprintln!(
+            "localnet: SKIPPED the mining test (it did not run); set ZKMINER_LOCALNET_MINE=1 to run it"
+        );
         return;
     }
     let timeout = Duration::from_secs(
@@ -931,69 +1622,216 @@ async fn mines_the_claimable_jobs() {
     );
     let dir = RunDir::new("mine");
     let worker = risc0_worker();
-    let mut world = World::new(&dir.0, &worker).await;
+    let program = Program::fibonacci(&worker, &dir.0);
+    let mut world = World::new(&dir.0, program, &Case::ALL, Clock::Wall).await;
     let config = world.write_config(&dir.0, &worker, true);
-    let key = format!("{}", world.prover.to_bytes());
+    mine_and_check(&mut world, &dir, &config, Vec::new(), timeout).await;
+    dir.finish();
+}
 
-    let mut miner = Miner::start(
-        &dir.0,
-        &config,
-        &["--headless"],
-        &[("ZKMINER_PRIVATE_KEY", key)],
-    );
-    world.submit_after_start(&mut miner).await;
+/// `zkminer run` with the prover's key.
+fn start_mining(
+    world: &World,
+    dir: &RunDir,
+    config: &Path,
+    mut env: Vec<(&'static str, String)>,
+    verbose: bool,
+) -> Miner {
+    env.push((
+        "ZKMINER_PRIVATE_KEY",
+        format!("{}", world.prover.to_bytes()),
+    ));
+    let global: &[&str] = if verbose { &["-v"] } else { &[] };
+    Miner::start(&dir.0, config, global, &["--headless"], &env)
+}
 
-    let want: Vec<B256> = Case::ALL
+/// Wait until every claimable job is fulfilled, the miner exits, or `timeout` passes. Returns the
+/// fulfilled jobs and whether the miner exited on its own.
+async fn wait_fulfilled(world: &World, miner: &mut Miner, timeout: Duration) -> (Vec<B256>, bool) {
+    let want: Vec<B256> = world
+        .jobs
         .iter()
-        .filter(|c| c.claimable())
-        .map(|c| world.job(*c))
+        .filter(|j| j.case.claimable())
+        .map(|j| j.id)
         .collect();
     let started = Instant::now();
-    let fulfilled = loop {
-        let fulfilled = world
-            .jobs_with_event::<IHemiProveFulfill::JobFulfilled>()
-            .await;
-        if want.iter().all(|id| fulfilled.contains(id))
-            || started.elapsed() > timeout
-            || miner.exited()
-        {
-            break fulfilled;
+    loop {
+        let fulfilled = world.jobs_with::<IHemiProveFulfill::JobFulfilled>().await;
+        let exited = miner.exited();
+        if want.iter().all(|id| fulfilled.contains(id)) || started.elapsed() > timeout || exited {
+            return (fulfilled, exited);
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    };
-    let exited_early = miner.exited();
-    let stopped = miner.stop(Duration::from_secs(120));
-    let lines = miner.lines();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
 
+/// After a mining run: exactly the claimable jobs fulfilled, each by us, with the program's journal
+/// and claimed in an earlier transaction (the seal is never broadcast before the lock); none of the
+/// others claimed and every one of them still Open; no collateral left locked; the stake whole; a
+/// clean exit.
+async fn check_settlement(
+    world: &World,
+    fulfilled: &[B256],
+    exited_early: bool,
+    stopped: bool,
+) -> Vec<String> {
     let mut failures = Vec::new();
     if exited_early {
-        failures.push("zkminer exited before the jobs were fulfilled".to_string());
+        failures.push("zkminer exited on its own".to_string());
     }
     if !stopped {
         failures.push("zkminer did not drain and exit within 120 s of SIGINT".into());
     }
-    let claimed = world.jobs_with_event::<IHemiProveCore::JobClaimed>().await;
+    let claims = world.logs::<IHemiProveCore::JobClaimed>().await;
+    let fulfils = world.logs::<IHemiProveFulfill::JobFulfilled>().await;
     for job in &world.jobs {
-        let (c, f) = (claimed.contains(&job.id), fulfilled.contains(&job.id));
+        let claim = claims.iter().find(|(j, _)| *j == job.id).map(|(_, l)| l);
+        let fulfil = fulfils.iter().find(|(j, _)| *j == job.id).map(|(_, l)| l);
+        let (status, prover) = world.job_state(job.id).await;
         eprintln!(
-            "localnet: {:?} {}: claimed={c} fulfilled={f}",
+            "localnet: {:?} {}: claimed={} fulfilled={} status={status}",
             job.case,
-            short_id(job.id)
+            short_id(job.id),
+            claim.is_some(),
+            fulfilled.contains(&job.id)
         );
-        if job.case.claimable() && !f {
-            failures.push(format!("{:?}: not fulfilled", job.case));
-        }
-        if !job.case.claimable() && c {
-            failures.push(format!("{:?}: claimed, but must never be", job.case));
+        if job.case.claimable() {
+            match (claim, fulfil) {
+                (Some(c), Some(f)) => {
+                    if c.tx == f.tx || c.block >= f.block {
+                        failures.push(format!(
+                            "{:?}: fulfilled in block {} by tx {}, not after a lock mined before it \
+                             (claim block {}, tx {})",
+                            job.case, f.block, f.tx, c.block, c.tx
+                        ));
+                    }
+                    if c.event.prover != world.prover.address()
+                        || f.event.prover != world.prover.address()
+                    {
+                        failures.push(format!(
+                            "{:?}: claimed or fulfilled by another prover",
+                            job.case
+                        ));
+                    }
+                    if f.event.publicValues.as_ref() != world.program.journal.as_slice() {
+                        failures.push(format!(
+                            "{:?}: fulfilled with journal {}, not the program's",
+                            job.case, f.event.publicValues
+                        ));
+                    }
+                }
+                (None, _) => failures.push(format!("{:?}: never claimed", job.case)),
+                (Some(_), None) => failures.push(format!("{:?}: not fulfilled", job.case)),
+            }
+            if status != zkminer_chain::jobs::JOB_STATUS_FULFILLED {
+                failures.push(format!(
+                    "{:?}: ends with status {status}, not Fulfilled",
+                    job.case
+                ));
+            }
+        } else {
+            if claim.is_some() {
+                failures.push(format!("{:?}: claimed, but must never be", job.case));
+            }
+            if status != zkminer_chain::jobs::JOB_STATUS_OPEN || prover != Address::ZERO {
+                failures.push(format!(
+                    "{:?}: ends with status {status} prover {prover}, not Open",
+                    job.case
+                ));
+            }
         }
     }
-    if !failures.is_empty() {
-        dump_tail(&dir.0, &lines);
-        panic!(
-            "mining localnet run failed (run directory {}):\n  {}",
-            dir.0.display(),
-            failures.join("\n  ")
-        );
+    let stake = world.stake().await;
+    if stake.lockedCollateral != 0 {
+        failures.push(format!(
+            "{} HEMI of collateral still locked",
+            hemi(stake.lockedCollateral)
+        ));
     }
+    if stake.totalStaked != PROVER_STAKE {
+        failures.push(format!(
+            "the stake is {} HEMI, not the {} HEMI staked",
+            hemi(stake.totalStaked),
+            hemi(PROVER_STAKE)
+        ));
+    }
+    failures
+}
+
+/// Run `zkminer run` with the prover's key until every claimable job is fulfilled or `timeout`
+/// passes, watch for [`SETTLE`] more, then drain it with SIGINT and require [`check_settlement`].
+async fn mine_and_check(
+    world: &mut World,
+    dir: &RunDir,
+    config: &Path,
+    env: Vec<(&'static str, String)>,
+    timeout: Duration,
+) {
+    let mut miner = start_mining(world, dir, config, env, false);
+    world.submit_after_start(&mut miner).await;
+    let (fulfilled, exited_early) = wait_fulfilled(world, &mut miner, timeout).await;
+    tokio::time::sleep(SETTLE).await;
+    let stopped = miner.stop(Duration::from_secs(120));
+    let failures = check_settlement(world, &fulfilled, exited_early, stopped).await;
+    report(world, dir, &miner, &failures).await;
+}
+
+/// A mining miner must log `needle` `times` times (the gate that holds it, at debug verbosity if
+/// `verbose`), dispatch no claim and send nothing.
+async fn no_claims_after(
+    world: World,
+    dir: RunDir,
+    config: &Path,
+    needle: &str,
+    times: usize,
+    verbose: bool,
+) {
+    let nonce_before = world.prover_nonce().await;
+    let mut miner = start_mining(&world, &dir, config, replay_env(), verbose);
+    let mut failures = Vec::new();
+    if !wait_for_lines(&mut miner, needle, times, Duration::from_secs(180)).await {
+        failures.push(format!("the miner did not log {needle:?} {times} time(s)"));
+    }
+    tokio::time::sleep(SETTLE).await;
+    if world.jobs.iter().any(|j| dispatched(&miner.lines(), j.id)) {
+        failures.push("a claim was dispatched".into());
+    }
+    if !miner.stop(Duration::from_secs(60)) {
+        failures.push("zkminer did not exit within 60 s of SIGINT".into());
+    }
+    let nonce_after = world.prover_nonce().await;
+    if nonce_after != nonce_before {
+        failures.push(format!(
+            "the prover sent {} transaction(s)",
+            nonce_after - nonce_before
+        ));
+    }
+    let claimed = world.jobs_with::<IHemiProveCore::JobClaimed>().await;
+    if !claimed.is_empty() {
+        failures.push(format!("claimed: {claimed:?}"));
+    }
+    finish_or_report(world, dir, miner, failures).await;
+}
+
+/// Panic with the failures, the miner's log tail and the fork's state, if there are failures.
+async fn report(world: &World, dir: &RunDir, miner: &Miner, failures: &[String]) {
+    if failures.is_empty() {
+        return;
+    }
+    dump_tail(&dir.0, &miner.lines());
+    for l in world.describe_state().await {
+        eprintln!("localnet state: {l}");
+    }
+    panic!(
+        "localnet run failed (run directory {}):\n  {}",
+        dir.0.display(),
+        failures.join("\n  ")
+    );
+}
+
+async fn finish_or_report(world: World, dir: RunDir, miner: Miner, failures: Vec<String>) {
+    report(&world, &dir, &miner, &failures).await;
+    drop(miner);
+    drop(world);
     dir.finish();
 }

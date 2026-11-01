@@ -32,6 +32,10 @@ dirs = { workspace = true }
 # binary (and the RISC0 prover path) builds without the SP1 native toolchain.
 sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d", default-features = false, features = ["blocking"], optional = true }
 
+[dev-dependencies]
+# The localnet test: signals and parent-death signals for the processes it starts.
+libc = "0.2"
+
 [features]
 default = []
 # Enables the `zkminer sp1-demo` command (requires the SP1 build toolchain).
