@@ -79,6 +79,10 @@ fn main() {
         )
         .init();
 
+    // Load (or create) the `sys_rand` key now, outside any job: a failure inside a job's panic
+    // containment would be blamed on that job's program.
+    sys_rand_key();
+
     if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
         std::process::exit(1);
@@ -595,6 +599,92 @@ fn with_rss_self_guard<T>(limit_bytes: Option<u64>, f: impl FnOnce() -> T) -> T 
     out
 }
 
+/// The seed for the guest's `sys_rand` on one (ELF, input).
+///
+/// Unseeded, risc0 answers `sys_rand` with fresh host entropy on every execution, so a guest can
+/// branch on its random bytes: measure clean before the claim and fail the proof after it, which
+/// costs us the release penalty. The pre-claim measurement and every proving attempt use this seed
+/// instead, so they run the guest identically, even in different workers. It is keyed with this
+/// host's secret key, so the bytes stay unpredictable to everyone else, as the guest's randomness
+/// should be: risc0 also draws the entropy that keeps a receipt's post-state digest from revealing
+/// private inputs from it.
+fn sys_rand_seed(key: &[u8; 32], elf: &[u8], input_data: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(b"zkminer/risc0/sys_rand/v1");
+    mac.update(&Sha256::digest(elf));
+    mac.update(&Sha256::digest(input_data));
+    mac.finalize().into_bytes().into()
+}
+
+/// This host's `sys_rand` key, loaded once per process from `~/.zkminer/risc0-sys-rand.key` (and
+/// created there on first use), so every risc0 worker on the host derives the same seeds.
+///
+/// If the file can't be used, the worker keys its seeds for this process alone: its measurements
+/// and proofs still agree with each other, but a job measured by another worker can diverge again.
+fn sys_rand_key() -> [u8; 32] {
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    *KEY.get_or_init(|| {
+        let path = dirs::home_dir().map(|home| home.join(".zkminer").join("risc0-sys-rand.key"));
+        let loaded = match &path {
+            Some(path) => load_or_create_key(path),
+            None => Err(anyhow::anyhow!("no home directory")),
+        };
+        loaded.unwrap_or_else(|e| {
+            tracing::warn!(
+                "sys_rand key unavailable ({e:#}): seeding with a key for this process only, so a \
+                 job measured by another worker can diverge at prove"
+            );
+            let mut key = [0u8; 32];
+            getrandom::fill(&mut key).expect("no OS randomness for the sys_rand key");
+            key
+        })
+    })
+}
+
+/// Read the 32-byte key at `path`, first creating it with fresh OS randomness if it doesn't exist.
+///
+/// A new key is written to a private temporary file and then hard-linked into place, so workers
+/// starting together agree: one link wins and the rest read the winner's complete file.
+fn load_or_create_key(path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    if !path.exists() {
+        let dir = path.parent().context("key path has no directory")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).map_err(|e| anyhow::anyhow!("OS randomness: {e}"))?;
+
+        static TMP: AtomicU64 = AtomicU64::new(0);
+        let tmp = dir.join(format!(
+            ".risc0-sys-rand.key.{}.{}",
+            std::process::id(),
+            TMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let written = opts.open(&tmp).and_then(|mut f| {
+            f.write_all(&key)?;
+            f.sync_all()
+        });
+        let linked = written.and_then(|()| std::fs::hard_link(&tmp, path));
+        let _ = std::fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+        }
+    }
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| anyhow::anyhow!("{} holds {} bytes, not 32", path.display(), bytes.len()))
+}
+
 fn run_execute(
     elf: &[u8],
     input_data: &[u8],
@@ -610,6 +700,7 @@ fn run_execute(
     if !input_data.is_empty() {
         env_builder.write_slice(input_data);
     }
+    env_builder.random_seed(sys_rand_seed(&sys_rand_key(), elf, input_data));
     if let Some(limit) = execute_session_cycle_limit() {
         env_builder.session_limit(Some(limit));
     }
@@ -642,9 +733,10 @@ fn run_execute(
     // `SessionInfo::cycles()` is the total cycle count, matching what proving reports.
     let cycles = session.cycles();
     // The journal the guest committed here is byte-identical to the one the later proof
-    // would carry (both are a deterministic function of (ELF, input), and the elf_hash gate makes
-    // measure-ELF == prove-ELF), so its length lets the host pre-screen a program whose journal alone
-    // would blow the fulfillJob payload cap — before committing collateral and a full proof to it.
+    // would carry (both are a deterministic function of (ELF, input) — `sys_rand` included, via the
+    // shared seed — and the image-id check makes measure-ELF == prove-ELF), so its length lets the
+    // host pre-screen a program whose journal alone would blow the fulfillJob payload cap — before
+    // committing collateral and a full proof to it.
     let journal_len = session.journal.bytes.len() as u64;
     Ok((cycles, journal_len, started.elapsed().as_secs_f64()))
 }
@@ -708,6 +800,8 @@ fn run_proof(
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
     // Bind the ELF to the job's programId ONCE, before the retry loop spends any GPU on it.
     verify_program_id(elf, program_id)?;
+    // The seed the pre-claim measurement used, so every attempt runs the guest exactly as it did.
+    let seed = sys_rand_seed(&sys_rand_key(), elf, input_data);
     // Retry-on-invalid mitigation for the rare (~1.5%) nondeterministic GPU
     // timing race on RTX 5090 / Blackwell (sm_120) — an intra-kernel race
     // produces an internally-invalid segment STARK, surfaced as
@@ -721,7 +815,7 @@ fn run_proof(
     const MAX_ATTEMPTS: usize = 4;
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match run_proof_once(elf, input_data, po2) {
+        match run_proof_once(elf, input_data, po2, seed) {
             Ok(result) => {
                 if attempt > 1 {
                     tracing::warn!(
@@ -763,6 +857,7 @@ fn run_proof_once(
     elf: &[u8],
     input_data: &[u8],
     po2: Option<u8>,
+    seed: [u8; 32],
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
     use risc0_zkvm::ProverOpts;
 
@@ -781,6 +876,7 @@ fn run_proof_once(
 
     let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
     env_builder.write_slice(input_data);
+    env_builder.random_seed(seed);
     if let Some(po2) = po2 {
         if !(13..=24).contains(&po2) {
             anyhow::bail!("po2 value {po2} out of valid range 13..=24");
@@ -1268,5 +1364,57 @@ mod program_id_tests {
         // A different programId (bit flipped) must be refused.
         pid[0] ^= 0x01;
         assert!(verify_program_id(FIBONACCI_ELF, Some(pid)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sys_rand_tests {
+    use super::*;
+
+    #[test]
+    fn seed_is_fixed_by_key_elf_and_input() {
+        let key = [1u8; 32];
+        let seed = sys_rand_seed(&key, b"elf", b"input");
+        assert_eq!(sys_rand_seed(&key, b"elf", b"input"), seed);
+        assert_ne!(sys_rand_seed(&[2u8; 32], b"elf", b"input"), seed);
+        assert_ne!(sys_rand_seed(&key, b"elf2", b"input"), seed);
+        assert_ne!(sys_rand_seed(&key, b"elf", b"input2"), seed);
+        // The ELF and the input are hashed apart: moving bytes from one to the other changes it.
+        assert_ne!(sys_rand_seed(&key, b"elfi", b"nput"), seed);
+    }
+
+    #[test]
+    fn key_file_is_created_once_and_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("key");
+        let keys: Vec<[u8; 32]> = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| load_or_create_key(&path).unwrap()))
+                .collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert!(keys.iter().all(|k| *k == keys[0]));
+        assert_eq!(load_or_create_key(&path).unwrap(), keys[0]);
+        assert_eq!(std::fs::read(&path).unwrap(), keys[0]);
+        // No temporary file is left behind.
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn a_key_file_of_the_wrong_size_is_refused_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, [0u8; 31]).unwrap();
+        assert!(load_or_create_key(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), [0u8; 31]);
     }
 }
