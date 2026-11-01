@@ -1,4 +1,135 @@
-# Controlled benchmark status: blocked by host-memory admission
+# Controlled CPU/Metal Fibonacci comparison — completed 2026-11-01
+
+The recovered memory headroom allowed the full fixed-setting campaign to finish:
+**12 genuine complete Groth16 proofs accepted by the unchanged verifier**, 36
+negative-verifier rejections, 24 actual native tests passed, zero failed/ignored.
+One complete CPU warmup and one Metal warmup are excluded from the five measured
+pairs. No retries, selective exclusions or unattempted slots occurred in this
+campaign. The earlier admission failure remains archived separately below.
+
+Campaign `f57fcc0ff71d4d6391605cb761c0a1a6` ran 11:08:29–11:45:44 EST on
+2026-11-01 (2234.736s, 37.246 minutes). Miner acceptance HEAD was
+`a3342fb80ec2fcfba909f921e381c6636fefb731`; engine stayed
+`0d5b41e8e44876c1e8b5a8a671aabc154e33106c`, descended from original pin
+`f8dcbdf8124a3f1528146bb01d539c55545cbb3d`. The independently built verifier
+remains at that original pin with its unchanged binary/source seal.
+
+| Seconds: median [minimum–maximum], n=5 per mode | CPU | Metal |
+|---|---:|---:|
+| Execution + segment proving | 2.731 [2.723–2.843] | 2.791 [2.723–2.922] |
+| Recursion/compression | 7.475 [7.425–7.553] | 7.464 [7.386–7.677] |
+| Identity + emulated wrapping | 155.313 [154.425–155.916] | 155.547 [154.974–156.830] |
+| Complete worker body | 165.582 [164.774–166.101] | 165.823 [165.439–166.970] |
+| Supervisor prove call | 165.741 [165.504–166.457] | 166.361 [165.768–167.421] |
+
+This fixture showed **no observed Metal speedup**. Metal's worker-body median
+was 0.242s (0.146%) higher; the median of the five within-pair percentage changes
+was +0.291%. These are different descriptive summaries, not significance claims.
+The execution-plus-segment median was 0.060s higher with Metal. Sample ranges
+overlap, and background activity prevents treating small differences as a clean
+causal estimate. No larger-workload, throughput, energy or profitability claim.
+
+| Measured pair | CPU worker seconds | Metal worker seconds | Metal change within pair |
+|---|---:|---:|---:|
+| 1 | 164.901 | 165.439 | +0.327% |
+| 2 | 165.582 | 166.064 | +0.291% |
+| 3 | 165.709 | 165.823 | +0.069% |
+| 4 | 166.101 | 165.450 | -0.392% |
+| 5 | 164.774 | 166.970 | +1.333% |
+
+Identity plus emulated wrapping accounted for about 93.8% of the worker body.
+Rounded production stderr reports median identity-p254 diagnostics of 33.826s
+CPU / 34.148s Metal, and shrink/wrap of 121.498s / 121.333s (about 73% of the
+body). Those labels include preparation/helper overhead and have 0.1ms rounding;
+they are not newly isolated arithmetic timers. Final SDK verification medians
+were 1.784ms / 1.762ms; the external unchanged verifier, including process launch,
+positive acceptance and three negative checks, took 26.619ms / 35.602ms.
+
+## Fixed settings and timing boundaries
+
+Both modes used the **same sealed Metal-capable executable** (`2c3bf297…`) with
+explicit `cpu` or forced `metal`. The separate CPU-only binary (`97588b915…`)
+was preserved and its build seal rechecked; it was not substituted or rebuilt.
+Guest packed-program hash `27e25b9504cdcc17419ba22a5025d79dc45167fbbc7d44d4910036d413684793`,
+input hash `447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700`,
+image and expected journal match in every trial. Fibonacci(20) executed 3,316
+user / 32,768 total cycles in one segment. The configured segment cap was po2 18;
+the actual segment reported po2 15. Groth16 seal format, randomness and keys stayed
+unchanged; randomized proof bytes were not required to match.
+
+Settings: six Rayon threads, one active proof, 512 KiB logical Metal staging,
+6 CPU / 32 GiB dedicated Colima VM, pinned local linux/amd64 QEMU helper capped
+at 6 CPUs / 24 GiB with network disabled. Helper digest remains
+`sha256:a4f80ce2e0b8e2bb7637a93c37136a6776ac00ec843a3fdf1c67b1d5ffea64ee`.
+This is not native ARM Groth16 wrapping. The original default VM stayed running.
+
+Order was CPU/Metal warmups, then five CPU→Metal pairs. It was fixed alternating
+order, not randomized/counterbalanced or per-mode tuning. A fresh WorkerPool was
+created each trial. Readiness, mode preflight (including Metal probe controls)
+and valid/invalid execution checks preceded the timed proof. CPU proofs report
+zero GPU proving commands; preflight controls are outside the proof-stage timers.
+Each Metal proof records 194 completed segment Poseidon2 Merkle-fold dispatches:
+970 measured / 1,164 including warmup. All other declared stages remained CPU.
+
+Startup/discovery medians were 108.205ms CPU / 213.873ms Metal; total setup,
+including readiness/execution checks, was 3.129s / 3.228s. This measures fresh
+worker startup with warmed host/runtime/helper caches, not a cold OS boot or a
+persistent warm proving process. All 12 proof requests used their initial
+validation-worker PID; every trial had a distinct PID/start identity. The generic
+timing labels still allow for policy-driven replacement in future runs.
+`prove_call_ms` includes admission/replacement/IPC; its residual over worker time
+must not be called pure startup. Execution and segment proving remain combined.
+Worker total excludes external verifier time and final evidence-file writes.
+
+## Resources, interference and evidence
+
+Measured native request peak RSS median/range: CPU
+1,965,981,696 [1,965,817,856–1,967,505,408] bytes; Metal
+1,975,861,248 [1,975,320,576–1,976,188,928] bytes. These are approximately 1.831–1.840
+GiB and are periodic RSS samples, not exact allocation high-water marks. They
+exclude helper/VM and unmeasured Metal driver allocations. Logical Metal staging
+peaked at 524,288 bytes per segment; that is not a measured GPU memory peak.
+Production host-available samples across all requests ranged 25.122–42.469 GiB.
+No guard or reserve was relaxed; fresh-worker trials do not establish long-lived
+allocation stability.
+
+All 240 telemetry snapshots reported AC power, Foundation nominal thermal state
+and low-power=false. Those API values may also mean unknown; `pmset` had no
+recorded warnings, which is not a temperature or no-throttling measurement.
+fseventsd appeared in all snapshots at 95.8–125.4% decaying `ps` CPU, with browser,
+indexing, security and other activity also recorded. No wattage/energy data or
+isolated driver-allocation measurements were collected. No background process
+was stopped to improve the results, and no noisy sample was discarded.
+
+Memory reporting correction: earlier conversational readiness checks used a
+conservative `vm_stat` proxy that omitted its separately printed speculative
+pages. The SDK documents that Mach `free_count` already includes those pages.
+Thus those quick checks understated the production policy reading; they were
+not exact admission observations. A local SDK counter check confirmed the
+mapping and is saved in `evidence/benchmark-memory-counter-check.json`.
+The production guard, source-bound resource records and original historical
+observations were not modified. Use the native resource records above for this
+campaign's authoritative memory evidence.
+
+Machine-readable results: `evidence/benchmark-comparison.json/.csv` and companion
+`benchmark-comparison-acceptance.json/.csv`. The collector revalidated 12 source-
+bound runs, 336 acceptance artifact hashes and 29 benchmark archive hashes;
+six one-ULP timing serialization differences are recorded under the existing
+narrow rule, with all cryptographic identities and counters exact. The 13
+reporting guards passed again against this campaign's records and count as zero
+proofs (`benchmark-comparison-controls.json`). Raw artifacts remain under
+`target/macos/benchmarks/f57fcc0ff71d4d6391605cb761c0a1a6` and its twelve
+`target/macos/worker-runs/<id>` directories. No remaining workers/containers were
+found; the dedicated VM was stopped after collection.
+
+Next concrete measurement: apply the same warmup/five-pair methodology to the
+already validated hashing and multi-segment fixtures before selecting another
+Metal optimization. Physical-memory pressure recovery, GPU hardware faults,
+benchmark/calibration IPC, broader non-Mac runtime and contract/network acceptance
+remain separate, unrun gates. No new production code or dependency change was
+needed for this completed comparison.
+
+## Earlier attempt: host-memory admission refusal
 
 The first fixed-setting campaign did not reach measured trials. One CPU warmup
 produced an independently accepted complete Groth16 proof; Metal warmup was
@@ -123,12 +254,13 @@ startup rejected by the original free-only memory guard. The deliberate
 restart verified. Earlier compilation/platform-test failures are listed in
 VALIDATION.md. None is discarded to improve averages.
 
-For the next formal benchmark, first run extended stability, then define an
-identical supported guest/input/po2 and resource envelope for CPU and an actually
-validated hybrid mode. Warm up and collect at least five complete alternating
+The early benchmark plan called for extended stability and an identical
+supported guest/input/po2 and resource envelope for CPU and a validated hybrid mode. Warm up and collect at least five complete alternating
 runs per mode; record cold start, failures, actual stages, thermal/background
 load and independently verified outputs. The isolated hybrid harness and subsequent native-worker milestone below pass
-complete proof acceptance; extended stability and controlled measurements remain open.
+complete proof acceptance. The later twenty-request run and controlled Fibonacci
+comparison are now complete as recorded above; these early timings remain
+correctness observations and are not pooled into that comparison.
 
 
 ## First integrated hybrid correctness runs (2026-10-31)

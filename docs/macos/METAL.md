@@ -14,8 +14,10 @@ native-worker integration described below. The bounded native forced-Metal
 proof/lifecycle milestone has passed: three consecutive proofs, controlled
 cancellation and watchdog cleanup, a verified restart proof, and shutdown.
 The current-revision CPU/auto matrix also passed: seven complete proofs across
-four source-bound runs, comprising five Metal and two CPU proofs. Full Gate 3
-remains open for extended stability and controlled measurements. See
+four source-bound runs, comprising five Metal and two CPU proofs. Subsequent
+workload/repeat coverage and a fixed-setting Fibonacci CPU/Metal comparison are
+complete, as detailed below. Full Gate 3 remains open for broader resource and
+workload characterization; production readiness is not established. See
 [VALIDATION.md](VALIDATION.md) and [HANDOFF.md](HANDOFF.md) for executed outcomes.
 
 ## Toolchain provisioning
@@ -429,6 +431,51 @@ refusal is expected failure evidence and is not counted as a proof. Raw reports,
 receipts, verification records and per-request resource observations remain under
 `target/macos/worker-runs/<run-id>`.
 
+## Fixed-setting CPU/Metal comparison
+
+Campaign `f57fcc0ff71d4d6391605cb761c0a1a6` completed twelve independently
+verified Groth16 proofs with 36 negative-verifier rejections and zero failed or
+unattempted trials. Two complete warmups were retained and excluded from the
+comparison; five alternating CPU/Metal pairs were measured. The same sealed
+Metal-capable worker executable ran both modes, with the same Fibonacci(20)
+ELF/input, requested po2 18, six Rayon threads, 512 KiB fold staging, a helper VM
+with six CPUs and 32 GiB, and a 24 GiB helper cap. Each proof used one
+32,768-cycle segment.
+Each Metal proof completed 194 GPU commands; each CPU proof completed zero.
+The engine, pin, production worker and unchanged verifier were preserved.
+
+| Metric | CPU median (range), seconds | Metal median (range), seconds |
+|---|---:|---:|
+| Execution plus all segment proving | 2.731 (2.723–2.843) | 2.791 (2.723–2.922) |
+| Worker request body, including final Groth16 | 165.582 (164.774–166.101) | 165.823 (165.439–166.970) |
+
+These median timings did not show a Metal speedup for this small workload.
+Execution/segment timing includes witness work, all CPU segment operations and
+per-request backend initialization; it is not isolated kernel timing. Identity
+plus emulated Groth16 wrapping dominated the complete request. The paired
+CPU/Metal timing-ratio medians were 0.9846 for execution/segment proving and
+0.9971 for the worker request body. These are descriptive five-pair observations,
+not a significance or causal claim, and do not predict larger-job performance.
+
+Each trial used a fresh WorkerPool with setup and verification timed separately.
+OS/runtime/helper caches were not flushed, and validation workers could recycle
+before proving; this does not measure cold boot or a persistent warm process.
+All 240 Foundation thermal observations reported nominal, which can also mean
+unknown/unsupported. Coarse power state and background-load samples were retained;
+existing applications and the default VM remained active. No wattage, energy or
+isolated driver allocation was measured; absence of throttling is not established.
+
+[Comparison JSON](evidence/benchmark-comparison.json),
+[measurements CSV](evidence/benchmark-comparison.csv) and
+[report controls](evidence/benchmark-comparison-controls.json) preserve the
+source/build identities and checks. All thirteen report controls passed; they
+are separate from the twelve real proofs and generate no cryptographic evidence.
+The earlier campaign `f8b460c76d594ae88e6430ab29e1aa27` remains retained as a
+failed attempt: one verified CPU warmup, an actual admission refusal for the
+Metal warmup, and ten unattempted measured trials. It was not merged into the
+completed comparison or silently retried. See [BENCHMARKS.md](BENCHMARKS.md) for
+full metrics and [SETUP.md](SETUP.md) for reproduction commands.
+
 ## Remaining scope
 
 The native worker has passed bounded forced-Metal lifecycle acceptance, the
@@ -437,15 +484,15 @@ refusal/recovery, the 4 KiB staging boundary, and twenty consecutive WorkerPool
 requests under normal recycling. Recursion, identity and wrapping retain their
 current CPU/helper implementations.
 
-Full Gate 3 remains open for controlled complete-job comparisons and further
-resource characterization. The 20-request repeat target is met, but long-lived
-single-process retention, calibrated production memory sizing and GPU fault
-recovery remain unvalidated. No speedup, unattended-use or profitability claim
-is made. Controlled timing claims require a separate cold-start record, warmup
-and at least five measured complete runs per mode with identical engine,
-ELF/input, po2, proof format and thread/resource limits. Report counts, median,
-range and failures, plus thermal/power observations where available and
-background-load limitations.
+The fixed-setting Fibonacci comparison and 20-request repeat target are met.
+Full Gate 3 remains open for broader workload and resource characterization.
+Long-lived single-process retention, calibrated production memory sizing and
+GPU fault recovery remain unvalidated. No broad speedup, unattended-use or
+profitability claim is made. Further comparisons should preserve separate
+startup observations, complete warmups, at least five measured runs per mode
+with matched engine/ELF/input/po2/proof/resource settings, all failures, and
+thermal/background-load limitations. The completed small-fixture comparison
+does not establish the performance of larger segments or other workloads.
 
 SHA coverage does not establish every precompile. Physical host-pressure and
 resident-limit failures, driver-level allocation/fault behavior, exact contract

@@ -147,9 +147,11 @@ Run `f8ff5abb2cef4a19bb02e24fbcb318d0` contains four unchanged-verifier-accepted
 Groth16 proofs with 194 completed Metal commands each. The CPU-build auto
 fallback and Metal-build forced-CPU/auto cases also passed. Across four
 source-bound runs, seven complete proofs (five Metal, two CPU) passed independent
-verification and 21 negative checks. Full Gate 3 remains open for extended
-stability and controlled measurements. See [VALIDATION.md](VALIDATION.md) for
-actual outcomes, separately from the standalone hybrid harness.
+verification and 21 negative checks. Subsequent native workload/repeat checks
+and a fixed-setting Fibonacci CPU/Metal comparison are also complete. Full
+Gate 3 remains open for broader resource and workload characterization; these
+results do not establish production readiness. See [VALIDATION.md](VALIDATION.md)
+for actual outcomes, separately from the standalone hybrid harness.
 
 ```sh
 ENGINE_DIR=/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0
@@ -255,10 +257,11 @@ trend. The stage cap is logical fold staging, excluding
 fixed kernel constants and driver overhead. Metal's recommended working-set
 size is a performance recommendation, not an entitlement to allocate that much.
 
-Keep the accepted 20-request operational repeat check and controlled benchmarks
-as separate checks. Performance comparisons require a cold-start record, warm-up and at
-least five complete measured runs per mode with identical engine, guest/input,
-po2, proof kind and thread/resource settings. Report median/range, failures and
+Keep the accepted 20-request operational repeat check separate from the completed
+fixed-setting Fibonacci CPU/Metal comparison below. Further comparisons require
+startup measurements, warmup and at least five complete measured runs per mode
+with identical engine, guest/input, po2, proof kind and thread/resource settings.
+Report median/range, failures and
 thermal/background-load limitations. The completed mode/lifecycle milestone
 used Fibonacci. The additional SHA/admission-recovery, five-segment and 4 KiB
 staging runs below have also passed. The twenty-request run also completed with
@@ -332,8 +335,20 @@ unchanged through collection. A failed campaign is collected with its failures
 and unattempted trials; it has no complete comparison statistics. The first
 campaign, `f8b460c76d594ae88e6430ab29e1aa27`, retained one verified CPU warmup,
 a Metal warmup refused by actual memory admission, and ten unattempted measured
-trials. It does not establish a CPU/Metal speed comparison. See
-[BENCHMARKS.md](BENCHMARKS.md) for current results and interpretation.
+trials. It does not establish a CPU/Metal speed comparison.
+
+The separate campaign `f57fcc0ff71d4d6391605cb761c0a1a6` completed all twelve
+proofs: two retained warmups and five measured CPU/Metal pairs, with zero failures
+and 36 negative-verifier rejections. Every Metal proof recorded 194 completed GPU
+commands; CPU proofs recorded zero. The collected
+[comparison JSON](evidence/benchmark-comparison.json) and
+[measurements CSV](evidence/benchmark-comparison.csv) preserve the fixed settings,
+stage/request timings, coarse telemetry and resource observations. Thirteen
+report-validation controls also passed; those controls generated no proofs.
+Worker request-body medians were 165.582 seconds for CPU and 165.823 seconds for
+Metal. This small Fibonacci comparison showed no median Metal speedup and does
+not establish performance for other workloads, energy savings or production
+readiness. [BENCHMARKS.md](BENCHMARKS.md) gives ranges and interpretation.
 
 ## Additional workload and resource checks
 
@@ -400,8 +415,9 @@ not twenty proofs in one long-lived worker. Request-body times had a 164.845-sec
 median and 157.222–166.442-second range; these are acceptance observations, not a
 controlled comparison. RSS excludes helper/VM memory and unmeasured driver
 allocations. This establishes bounded repeat/recovery evidence under the current
-policy, not leak-free retention, physical host-pressure recovery, resident-limit
-kill behavior or the controlled benchmark gate.
+policy, not leak-free retention, physical host-pressure recovery or resident-limit
+kill behavior. The fixed-setting comparison above is separate evidence; broader
+benchmark and resource coverage remains open.
 
 ## Stop / remove
 

@@ -581,3 +581,77 @@ owned PID checks showed no leftovers, `colima stop hemi-macos-cpu` completed.
 `colima list --json` confirmed dedicated Stopped, original default Running.
 Separate diffs: `target/macos/benchmark-miner.patch` from `244a3a1` and empty
 `target/macos/benchmark-engine.patch`. `git diff --check` passed.
+
+
+## Completed controlled comparison (2026-11-01)
+
+Host headroom recovered, and the full frozen campaign was rerun from miner
+`a3342fb80ec2fcfba909f921e381c6636fefb731`, with unchanged engine `0d5b41e8…`,
+CPU/Metal/verifier binaries and dependency pins. No production code changes.
+Campaign `f57fcc0ff71d4d6391605cb761c0a1a6` completed 12/12 genuine Groth16 proofs
+(two warmups plus five alternating measured pairs), 36 unchanged-verifier tamper
+rejections, and 24 native tests passed / 0 failed / 0 ignored. No timeout, retry,
+admission failure or unattempted slot occurred. The previous failed campaign
+remains in `benchmark-attempt-1*` and is not pooled into these statistics.
+
+Commands actually executed after sourcing `scripts/macos/env.sh`:
+
+```sh
+colima start hemi-macos-cpu --cpu 6 --memory 32 --disk 80 --activate=false --ssh-config=false --template=false --mount /Users/dbur/dev/zk-miner/target/macos:w --vz-rosetta
+python3 -B scripts/macos/benchmark-worker.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --context colima-hemi-macos-cpu --samples 5
+python3 -B scripts/macos/summarize-benchmark.py --benchmark target/macos/benchmarks/f57fcc0ff71d4d6391605cb761c0a1a6 --output docs/macos/evidence/benchmark-comparison.json --csv docs/macos/evidence/benchmark-comparison.csv
+python3 -B scripts/macos/test-benchmark-summary-controls.py --benchmark target/macos/benchmarks/f57fcc0ff71d4d6391605cb761c0a1a6 --output docs/macos/evidence/benchmark-comparison-controls.json
+docker --context colima-hemi-macos-cpu ps -a --format '{{.Names}}'
+colima stop hemi-macos-cpu
+```
+
+The exact twelve child commands, build commands, immutable settings, source hashes
+and full runner logs are recorded in the campaign plan/trial ledger and aggregate.
+Each child explicitly ran the real ignored prerequisite tests via `--ignored
+--nocapture --test-threads=1`; zero tests were skipped in their results. The 13
+reporting guards passed against this new campaign and count as zero proof tests.
+Every successful proof has the expected image, input, journal, segment/cycle stats,
+256-byte Groth16 seal, independent verification and all three tamper rejections.
+Metal executed 194 declared GPU commands per proof (970 measured / 1,164 total);
+CPU proofs report no Metal stage. No CPU fallback was substituted for Metal.
+
+| Phase | Mode | Sample | Run |
+|---|---|---:|---|
+| warmup | cpu | 0 | `b6c24a414d924cf08a7849c104fcf796` |
+| warmup | metal | 0 | `f4bdaa744bf743aa9baca3eae782a20f` |
+| measured | cpu | 1 | `a453c5b947b44ba6bd81c37d43e146b1` |
+| measured | metal | 1 | `0a5153d093d644ad924af2039de61679` |
+| measured | cpu | 2 | `cc2c45ce278745d9bcb12a565d1cbdd6` |
+| measured | metal | 2 | `6211939bd55245639a5b63c5581de90a` |
+| measured | cpu | 3 | `b42f75b123bd436e9fc817ee1ce92152` |
+| measured | metal | 3 | `6ce67a6b36c645aaaf3d089e691a005f` |
+| measured | cpu | 4 | `66298ac457ab481a86b2dd2ed650d828` |
+| measured | metal | 4 | `4d66e70064e249b4b9d72cf934406f44` |
+| measured | cpu | 5 | `69d0a38fed684292a6d0eacf5bfa6b91` |
+| measured | metal | 5 | `6d56d3f4a4034d03b88abc0d4977e041` |
+
+BENCHMARKS.md gives the timing table and interpretation: no observed speedup on
+this small fixture; worker medians CPU165.582s / Metal165.823s. Controlled settings
+and complete proofs do not remove background-load or small-sample uncertainty.
+The external evidence audit rechecked 336 acceptance files plus 29 benchmark
+archive files, the planned source inputs, binary/metadata/lock seals, all timings
+and counts. Six one-ULP diagnostic timing serialization differences remain
+explicitly recorded under the existing rule; no raw evidence was rewritten.
+
+A post-run SDK counter check (`xcrun clang -Wall -Wextra -Werror
+/private/tmp/hemi-memory-check.c -o /private/tmp/hemi-memory-check`, then native
+counters / `vm_stat` / native counters) explained lower ad hoc memory readings:
+Mach free_count includes speculative pages, while the quick vm_stat formula
+omitted the separately printed speculative count. The exact check source,
+compile argv and observations are in `benchmark-memory-counter-check.json`.
+This corrects reporting only; production admission, resource observations and
+worker binaries were not changed. The authoritative campaign minimum available
+memory was 25.122 GiB; the quick conversational values were conservative proxies.
+
+No leftover helper containers or proving workers were observed. Dedicated VM
+stopped; default VM remained running. Separate continuation diffs are
+`target/macos/benchmark-comparison-miner.patch` from `a3342fb` and empty
+`target/macos/benchmark-comparison-engine.patch`. Larger-workload performance,
+physical-memory/RSS-kill/GPU fault recovery, benchmark/calibration IPC, non-Mac
+runtime, exact contract adapter and network acceptance remain unrun here.
+No installation, wallet/network job, transaction or push occurred.

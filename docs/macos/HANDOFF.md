@@ -3,11 +3,55 @@
 Updated 2026-11-01. CPU Gates 1/2 and the bounded native hybrid worker milestone
 passed. Expanded workloads and twenty consecutive supervised-worker requests
 also passed. Segment Poseidon2 Merkle folds run on Metal; complete Groth16
-outputs pass the unchanged pinned verifier. Full Gate 3 remains open for
-controlled performance measurements and additional fault/memory coverage.
+outputs pass the unchanged pinned verifier. The controlled Fibonacci comparison is now complete; broader workload
+performance and fault/memory coverage remain open. No production-readiness claim.
 No push, privileged installation, wallet access, job claim or transaction.
 
-## Current controlled-benchmark continuation (incomplete)
+## Current completed controlled benchmark
+
+Campaign `f57fcc0ff71d4d6391605cb761c0a1a6` completed on 2026-11-01 in
+2234.736s (37.246 minutes): 12 genuine complete Groth16 proofs, 36 negative
+verifier rejections, 24 native tests passed, zero failed/ignored or retries.
+Two warmups are excluded; all five measured CPU/Metal pairs are retained.
+The immutable plan/accepted miner HEAD is `a3342fb80ec2fcfba909f921e381c6636fefb731`;
+the containing results commit changes only documentation/evidence. Engine,
+production worker/protocol code, pins and sealed CPU/Metal/verifier binaries
+remain unchanged. Earlier failed attempt `f8b460…` is retained separately.
+
+Same sealed Metal-capable binary, explicit CPU/Metal modes, Fibonacci(20), po2
+cap 18, six threads, 512 KiB staging and the same local emulated Groth16 helper.
+Measured worker-body median/range seconds: CPU 165.582 [164.774–166.101], Metal
+165.823 [165.439–166.970]. Execution+segment: CPU 2.731 [2.723–2.843], Metal 2.791
+[2.723–2.922]. No observed speedup for this fixture. Identity plus wrapping is
+about 93.8% of the body; this does not establish performance on larger workloads.
+Every Metal proof recorded 194 actual GPU commands (1,164 total); CPU proving
+recorded none. Fresh worker startup is timed separately; no persistent warm-
+worker or cold-boot claim. No application was closed or guard reduced.
+
+Evidence: `docs/macos/evidence/benchmark-comparison.json/.csv`, companion
+`-acceptance.json/.csv`, and `benchmark-comparison-controls.json` (13 reporting
+guards passed, zero proofs). Raw runs are bound in the campaign archive and
+BENCHMARKS.md reports sample counts, ranges, paired ratios and limitations.
+A separate review recomputed results and checked 365 archived artifact hashes,
+142 planned source hashes, worker/verifier seals and all 36 negative records.
+
+Memory nuance: the earlier ad hoc `vm_stat` readiness numbers below omitted
+speculative pages, so they were conservative proxies, not exact production
+policy readings. `benchmark-memory-counter-check.json` verifies the SDK counter
+mapping. Production guard/resource records were correct and unchanged; their
+observed available range was 25.122–42.469 GiB during this campaign. All 240
+thermal snapshots were nominal/AC, with the documented unknown-state caveat;
+background fseventsd and other activity remained. No energy/GPU-allocation peak
+or broad statistical significance claim is made.
+
+No workers/containers remained after acceptance. The dedicated VM is stopped;
+the original default VM remains running. No privileged installation, push,
+wallet access, job claim or transaction occurred. Next: benchmark the already
+validated hash and multi-segment fixtures under the same fixed protocol before
+choosing another acceleration stage. Broader resource/fault and deployment gates
+remain open; see VALIDATION.md for exact commands and unrun checks.
+
+## Earlier benchmark attempt and readiness checks
 
 Readiness recheck on 2026-11-01: policy-estimated available memory was
 29.324 GiB with the dedicated VM stopped and 27.596 GiB after restarting it
@@ -25,8 +69,8 @@ No code, pins, CPU binaries or resource guards changed; no push or installation.
 Instrumentation/runner/thermal helper are locally committed at `461965e` on
 `codex/hemi-macos-metal`; the following collector/evidence/documentation commit
 records this attempt. Production workers, engine and CPU path remain unchanged.
-The full controlled comparison is **not complete**: host memory admission refused
-Metal warmup before proving. Do not infer a CPU/Metal speedup from this attempt.
+The first campaign **did not complete**: host memory admission refused Metal
+warmup before proving. Do not infer a CPU/Metal speedup from that attempt.
 
 Campaign `f8b460c76d594ae88e6430ab29e1aa27` planned one complete warmup per mode,
 then five alternating complete trials per mode. It uses the same sealed
@@ -63,8 +107,8 @@ peak was measured. Available-memory readings stayed around 21.8–21.9 GiB after
 the refusal. The user was asked to free roughly 4–8 GiB from unused applications;
 no application was closed and no admission guard or resource limit was reduced.
 
-Next concrete action: after host headroom is available, restart the dedicated
-VM if stopped and rerun the entire documented campaign, retaining attempt 1.
+Recovery procedure used for the successful campaign: after headroom recovered,
+restart the dedicated VM and rerun the entire campaign, retaining attempt 1.
 Do not resume at the failed Metal trial or count the old warmup as a measured
 sample. The dedicated VM was stopped after confirming no containers or trial workers
 remained; the original default VM is still running. Both worker binaries and
@@ -225,8 +269,9 @@ The verifier target is separate, built from original Git pin without local
 patches/proving features. Raw runs, seals and logs are under
 `target/macos/worker-runs/<id>`; aggregate evidence is `docs/macos/evidence/native-worker-validation.json` and
 `native-worker-measurements.csv`, with executed commands in VALIDATION.md.
-The current separate miner diff is `target/macos/benchmark-miner.patch` from
-stability checkpoint `244a3a1`; `target/macos/benchmark-engine.patch` is empty.
+The current separate miner diff is `target/macos/benchmark-comparison-miner.patch`
+from `a3342fb`; `target/macos/benchmark-comparison-engine.patch` is empty. The
+earlier tooling diff remains `target/macos/benchmark-miner.patch` from `244a3a1`.
 The earlier stability diff remains `target/macos/worker-stability-miner.patch`. Previous engine patches remain under
 docs/macos/evidence. Source changes require rebuilding sealed artifacts.
 
@@ -239,12 +284,13 @@ Pinned helper image digest:
 
 ## Next work and limits
 
-Next concrete step: obtain sufficient host-memory headroom and rerun the entire
-controlled CPU/Metal campaign with warmup plus five measured complete runs per
-mode. The first attempt was retained as failed before any measured trial. Benchmark/calibration IPC
+Next concrete step: extend controlled comparisons to the already validated hash
+and multi-segment workloads. The Fibonacci campaign is complete; its earlier
+admission failure remains archived separately. Benchmark/calibration IPC
 acceptance remains separate. The completed twenty-request run retained normal
 recycling; longer same-process and physical-memory-pressure recovery coverage
-remain open. Current correctness timings are not performance benchmarks.
+remain open. Earlier correctness-run timings remain separate from the completed
+fixed-setting Fibonacci benchmark above.
 
 GPU hardware-fault recovery, driver allocation peaks/growth trends and full
 Linux/CUDA/ROCm runtime regression remain unrun. Optional offline Linux CUDA

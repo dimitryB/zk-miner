@@ -15,7 +15,9 @@ Its four proofs each recorded 194 Metal completions and passed the unchanged
 verifier and negative checks. CPU-build auto fallback, Metal-build forced CPU,
 and Metal-build auto selection also passed: seven complete proofs across four
 source-bound runs (five Metal, two CPU), with 21 negative-verifier rejections.
-Full Gate 3 remains open for extended stability and controlled measurements.
+Subsequent twenty-request acceptance and a fixed-setting five-pair Fibonacci
+CPU/Metal comparison completed. Broader workload/resource characterization and
+full production readiness remain open; see BENCHMARKS.md for measured limits.
 Exact results and failures belong in [VALIDATION.md](VALIDATION.md) and
 [HANDOFF.md](HANDOFF.md).
 
@@ -203,10 +205,12 @@ Metal compiler works without manual installation; offline `xcrun metal` and full
 Xcode remain absent. Any future privileged provisioning requires approval.
 
 The twenty-request operational repeat target is met under normal recycling.
-Full Gate 3 still needs controlled complete-job comparisons and further resource
-characterization; long-lived single-process retention remains unvalidated.
-Comparative measurements require cold-start disclosure, warmup and at least five
-complete measured runs per mode with matched settings. SHA, five-segment,
+The fixed-setting Fibonacci comparison completed with two warmups and five
+measured complete runs per mode: 12 accepted Groth16 proofs and 36 tamper
+rejections, with no observed Metal speedup. Startup timing is separate; each
+trial uses a fresh worker, not a cold OS boot or a persistent warm process.
+Larger-workload comparisons and further resource characterization remain open;
+long-lived single-process retention remains unvalidated. SHA, five-segment,
 logical-admission and minimum-staging coverage now has real native proofs.
 Broader precompile coverage, physical host-pressure/resident-limit failure,
 GPU-fault/driver-allocation observations, exact contract-adapter validation and
