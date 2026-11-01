@@ -164,9 +164,7 @@ impl JobMonitor {
         } else {
             self.backfill_blocks
         };
-        let mut last_block = head
-            .saturating_sub(backfill)
-            .max(self.client.scan_from_block.min(head));
+        let mut last_block = scanned_through_at_start(head, backfill, self.client.scan_from_block);
         // The head at startup: JobClaimed events at or below this block
         // are HISTORICAL and must not prune (see the suppression in the log loop).
         let startup_head = head;
@@ -174,7 +172,7 @@ impl JobMonitor {
         tracing::info!(
             "Job monitor started, polling every {:?} from block {} (head {}, backfill {} blocks)",
             self.poll_interval,
-            last_block,
+            last_block + 1,
             head,
             head - last_block,
         );
@@ -456,10 +454,30 @@ fn parse_job_submitted_log(log: &Log) -> Option<MonitorEvent> {
     })
 }
 
+/// The block the monitor treats as already scanned when it starts: each poll scans from the block
+/// after it. `backfill` blocks back from `head`, but never below `scan_from_block`, the first block
+/// to scan (the deployment's first block), and never above `head`.
+fn scanned_through_at_start(head: u64, backfill: u64, scan_from_block: u64) -> u64 {
+    head.saturating_sub(backfill)
+        .max(scan_from_block.saturating_sub(1).min(head))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::{keccak256, Bytes, LogData};
+
+    #[test]
+    fn the_first_block_scanned_is_scan_from_block_itself() {
+        // A long backfill stops at the deployment's first block, which is still scanned.
+        assert_eq!(scanned_through_at_start(10_000, u64::MAX, 7_000), 6_999);
+        // A short backfill starts above it.
+        assert_eq!(scanned_through_at_start(10_000, 500, 7_000), 9_500);
+        // No floor: the backfill alone.
+        assert_eq!(scanned_through_at_start(10_000, 500, 0), 9_500);
+        // A floor above the head (a node behind the deployment) scans nothing yet.
+        assert_eq!(scanned_through_at_start(5_000, 500, 7_000), 5_000);
+    }
 
     fn mk_log(topics: Vec<B256>, data: Vec<u8>) -> Log {
         Log {
