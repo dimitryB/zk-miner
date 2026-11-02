@@ -19,6 +19,55 @@ use zkminer_prover_protocol::{WorkerCommand, WorkerResponse, PROTOCOL_VERSION};
 
 const KEY: &str = "risc0:generic";
 
+#[test]
+#[ignore = "real native worker workload-limit controls; no proof success is claimed"]
+fn native_workload_limit_controls() {
+    use zkminer_prover_protocol::ErrorKind;
+    let binary = required("ZKMINER_MACOS_WORKER");
+    let evidence = required("ZKMINER_MACOS_EVIDENCE_DIR");
+    fs::create_dir(&evidence).unwrap();
+    let elf = fs::read(required("ZKMINER_MACOS_PROGRAM")).unwrap();
+    let mut cases = Vec::new();
+    for value in ["0", "67108865", "-1", "invalid", "18446744073709551615"] {
+        let overrides = HashMap::from([("ZKMINER_RISC0_MAX_GUEST_CYCLES".into(), value.into())]);
+        let error = match WorkerHandle::spawn("risc0", &binary, &overrides) {
+            Ok(_) => panic!("invalid session limit admitted"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("ZKMINER_RISC0_MAX_GUEST_CYCLES"), "{error}");
+        cases.push(json!({"limit":value,"outcome":"startup_rejected"}));
+    }
+    let overrides = HashMap::from([("ZKMINER_RISC0_MAX_GUEST_CYCLES".into(), "1000".into())]);
+    let mut worker = WorkerHandle::spawn("risc0", &binary, &overrides).unwrap();
+    let input = fs::read(required("ZKMINER_MACOS_INPUT")).unwrap();
+    worker.send(&WorkerCommand::Execute { request_id:1, elf:elf.clone(), input_data:input.clone() }).unwrap();
+    match worker.recv().unwrap() {
+        WorkerResponse::Error { kind:ErrorKind::InvalidInput, message, .. } => assert!(message.contains("Session limit exceeded")),
+        other => panic!("expected execution cycle-limit rejection, got {other:?}"),
+    }
+    cases.push(json!({"operation":"execute","outcome":"guest_cycle_limit_rejected"}));
+    for (id, po2) in [(2, 13), (3, 21), (4, 20)] {
+        worker.send(&WorkerCommand::Prove {request_id:id,elf:elf.clone(),input_data:input.clone(),po2:Some(po2)}).unwrap();
+        loop {
+            match worker.recv().unwrap() {
+                WorkerResponse::Progress {request_id,..} => assert_eq!(request_id,id),
+                WorkerResponse::Error {request_id,kind:ErrorKind::InvalidInput,message} => {
+                    assert_eq!(request_id,id);
+                    assert!(message.contains(if po2 == 20 {"Session limit exceeded"} else {"po2 value"}), "{message}");
+                    break;
+                }
+                other => panic!("expected proof input rejection, got {other:?}"),
+            }
+        }
+        cases.push(json!({"operation":"prove","po2":po2,"outcome":"input_rejected"}));
+    }
+    drop(worker);
+    assert!(helpers().is_empty());
+    fs::write(evidence.join("complete.json"), serde_json::to_vec_pretty(&json!({
+        "status":"workload_limit_controls_passed","verified_proofs":0,"cases":cases,"shutdown":true,
+    })).unwrap()).unwrap();
+}
+
 fn required(name: &str) -> PathBuf {
     PathBuf::from(
         std::env::var_os(name)
@@ -33,6 +82,12 @@ fn observed_mode() -> String {
 }
 fn worker_kind() -> String {
     std::env::var("ZKMINER_MACOS_WORKER_KIND").unwrap_or_else(|_| "cpu".into())
+}
+fn proof_timeout() -> Duration {
+    let seconds = std::env::var("ZKMINER_MACOS_PROOF_TIMEOUT_SECS")
+        .unwrap_or_else(|_| "600".into()).parse().unwrap();
+    assert!((30..=3600).contains(&seconds));
+    Duration::from_secs(seconds)
 }
 struct Workload {
     name: String,
@@ -95,8 +150,8 @@ impl Workload {
             )
         };
         assert!(
-            (14..=18).contains(&po2),
-            "acceptance po2 must be in 14..=18"
+            (14..=20).contains(&po2),
+            "acceptance po2 must be in 14..=20"
         );
         assert!(
             (1..=256).contains(&min_segments),
@@ -127,6 +182,99 @@ fn elapsed_ms(started: Instant) -> f64 {
 fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
+
+/// Serial proofs in separately configured warm workers; no thread environment
+/// is mutated after a worker starts. Testing hooks reuse real WorkerPool admission.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "requires sealed native worker, original verifier, and explicit fixtures"]
+fn native_thread_comparison() {
+    let program = required("ZKMINER_MACOS_PROGRAM");
+    let elf = fs::read(&program).unwrap();
+    let workload = Workload::from_environment(&elf);
+    let evidence = required("ZKMINER_MACOS_EVIDENCE_DIR");
+    fs::create_dir(&evidence).unwrap();
+    let input = evidence.join("input.bin");
+    fs::write(&input, &workload.input).unwrap();
+    let settings: Vec<(usize, usize)> = std::env::var("ZKMINER_MACOS_THREAD_CASES")
+        .unwrap()
+        .split(',')
+        .map(|s| {
+            let (a, b) = s.split_once(':').unwrap();
+            (a.parse().unwrap(), b.parse().unwrap())
+        })
+        .collect();
+    assert!((2..=3).contains(&settings.len()));
+    assert!(settings
+        .iter()
+        .all(|(a, b)| (1..=18).contains(a) && (1..=18).contains(b)));
+    let samples: usize = std::env::var("ZKMINER_MACOS_THREAD_SAMPLES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=5).contains(&samples));
+    let mut pools = Vec::new();
+    for &(rayon, go) in &settings {
+        let mut pool = WorkerPool::new(HashMap::new(), vec![], Some(Duration::from_secs(600)));
+        let overrides = HashMap::from([
+            ("ZKMINER_RISC0_CPU_THREADS".to_owned(), rayon.to_string()),
+            ("RISC0_GROTH16_NATIVE_THREADS".to_owned(), go.to_string()),
+        ]);
+        pool.insert_test_worker(KEY, "risc0", required("ZKMINER_MACOS_WORKER"), overrides)
+            .unwrap();
+        pools.push(pool);
+    }
+    let mut rows = Vec::new();
+    for round in 0..=samples {
+        let mut order: Vec<_> = (0..settings.len()).collect();
+        if round % 2 == 1 {
+            order.reverse();
+        }
+        for index in order {
+            let before = sidecar_paths();
+            let (result, mut resources) = measured_prove(&pools[index], &elf, &workload);
+            let directory = evidence.join(format!("round-{round}-case-{index}"));
+            let outcome = result.unwrap();
+            let (_, record) = require_sidecar(&before);
+            assert_eq!(record["rayon_threads"], settings[index].0);
+            assert_eq!(record["gomaxprocs"], settings[index].1);
+            assert_eq!(record["helper_arch"], "darwin/arm64");
+            let external = verify(
+                &required("ZKMINER_MACOS_VERIFIER"),
+                &program,
+                &input,
+                &directory,
+                outcome,
+                &record,
+                &workload,
+            );
+            finish_resources(&directory, &record, &mut resources);
+            let timing = save_proof_timing(&directory, &record, &resources, external);
+            let thermal = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/macos/benchmark-tools/thermal");
+            let thermal = Command::new(thermal)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+            let row = json!({"round":round,"warmup":round==0,"case":index,"rayon_threads":settings[index].0,
+                "gomaxprocs":settings[index].1,"worker":record,"resources":resources,"timings":timing,"thermal":thermal});
+            ledger(&evidence, &row);
+            rows.push(row);
+        }
+    }
+    for mut pool in pools {
+        pool.shutdown_all();
+    }
+    assert!(helpers().is_empty());
+    fs::write(
+        evidence.join("complete.json"),
+        serde_json::to_vec_pretty(&json!({"status":"complete_independently_verified",
+        "samples_per_case":samples,"settings":settings,"rows":rows}))
+        .unwrap(),
+    )
+    .unwrap();
+}
 fn bounded_output(command: &mut Command) -> String {
     let (status, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
         command,
@@ -143,7 +291,23 @@ fn bounded_output(command: &mut Command) -> String {
     );
     stdout
 }
+fn native_helpers() -> Vec<String> {
+    let executable = required("ZKMINER_RISC0_NATIVE_DIR").join("prover");
+    let executable = executable.to_str().unwrap();
+    bounded_output(Command::new("ps").args(["-axo", "args="]))
+        .lines()
+        .filter(|line| line.trim_start().starts_with(executable))
+        .map(str::to_owned)
+        .collect()
+}
 fn helpers() -> Vec<String> {
+    if worker_kind() == "native" {
+        let prefix = format!("zkminer-macos-{}-", std::process::id());
+        return native_helpers()
+            .into_iter()
+            .filter(|line| line.contains(&prefix))
+            .collect();
+    }
     bounded_output(Command::new("docker").args([
         "--context",
         &std::env::var("ZKMINER_RISC0_DOCKER_CONTEXT").unwrap(),
@@ -159,6 +323,9 @@ fn helpers() -> Vec<String> {
     .collect()
 }
 fn helper_running(name: &str) -> bool {
+    if worker_kind() == "native" {
+        return native_helpers().iter().any(|line| line.contains(name));
+    }
     assert!(
         name.starts_with(&format!("zkminer-macos-{}-", std::process::id())),
         "not this test's helper"
@@ -234,6 +401,12 @@ fn validate_stage(record: &Value, workload: &Workload) {
         );
     }
     let count = positive(&record["stats"], "segments");
+    let minimum: u64 = std::env::var("ZKMINER_MACOS_MIN_GUEST_CYCLES")
+        .unwrap_or_else(|_| "1".into()).parse().unwrap();
+    assert!(positive(&record["stats"], "user_cycles") >= minimum);
+    assert_eq!(record["stats"]["total_cycles"].as_u64().unwrap(),
+        ["user_cycles", "paging_cycles", "reserved_cycles"].iter()
+            .map(|k| record["stats"][k].as_u64().unwrap()).sum::<u64>());
     assert!(
         count >= workload.min_segments,
         "workload did not cover the required segment count"
@@ -294,6 +467,7 @@ fn rss_observation(pid: u32, expected_start: Option<u64>, started: Instant, phas
         sample["host_memory_unavailable_reason"] =
             json!("production host memory observation unavailable; unknown values are null");
     }
+    sample["native_memory"] = zkminer_prover::memory::native_memory_observation(pid);
     let identity = zkminer_prover::memory::pid_starttime(pid);
     if pid == 0 || identity.is_none() {
         sample["unavailable_reason"] = json!("no live worker start identity");
@@ -383,7 +557,7 @@ fn measured_prove(
             elf,
             &workload.input,
             Some(workload.po2),
-            Some(Duration::from_secs(600)),
+            Some(proof_timeout()),
             None,
         );
         let prove_call_ms = elapsed_ms(prove_started);
@@ -497,7 +671,7 @@ fn admission_pressure(pool: &WorkerPool, elf: &[u8], workload: &Workload, eviden
         zkminer_prover::memory::mem_total_bytes().expect("cannot observe real host total memory");
     let available = zkminer_prover::memory::mem_available_bytes()
         .expect("cannot observe real host available memory");
-    let reserve = zkminer_prover::memory::DEFAULT_HOST_RESERVE_BYTES;
+    let reserve = zkminer_prover::memory::host_reserve_bytes();
     let needed = pool.expected_host_peak_at_po2("risc0", Some(workload.po2));
     assert!(
         available >= STEP + reserve,
@@ -604,6 +778,7 @@ fn verify(
     assert_eq!(proof.journal, workload.expected);
     assert_eq!(proof.seal.len(), 256);
     assert!(proof.cycles > 0);
+    assert_eq!(Some(proof.cycles), record["stats"]["total_cycles"].as_u64());
     assert_eq!(record["phase"], "complete");
     assert_eq!(record["proof_kind"], "groth16");
     assert_eq!(record["seal_sha256"], hash(&proof.seal));
@@ -786,7 +961,12 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         "lifecycle acceptance needs at least three complete repeat proofs"
     );
     let overrides = HashMap::from([(
-        "ZKMINER_RISC0_DOCKER_CONTEXT".into(),
+        if worker_kind() == "native" {
+            "ZKMINER_RISC0_NATIVE_DIR"
+        } else {
+            "ZKMINER_RISC0_DOCKER_CONTEXT"
+        }
+        .into(),
         "hemi-deliberately-missing-context".into(),
     )]);
     assert!(
@@ -825,7 +1005,7 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
     let mut pool = WorkerPool::new(
         HashMap::from([("risc0".into(), binary)]),
         vec![],
-        Some(Duration::from_secs(600)),
+        Some(proof_timeout()),
     );
     let pool_new_ms = elapsed_ms(phase_started);
     let phase_started = Instant::now();
@@ -845,16 +1025,14 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         .contains("helper"));
     let worker_warmup_ms = elapsed_ms(phase_started);
     let phase_started = Instant::now();
-    assert!(
-        pool.execute_cycles(
+    let executed_cycles = pool.execute_cycles(
             "risc0",
             &elf,
             &workload.input,
             Some(Duration::from_secs(30))
         )
-        .unwrap()
-            > 0
-    );
+        .unwrap();
+    assert!(executed_cycles > 0);
     let valid_execute_cycles_ms = elapsed_ms(phase_started);
     let phase_started = Instant::now();
     assert!(pool
@@ -881,6 +1059,7 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         "setup":{
             "pool_new_ms":pool_new_ms,"pool_discover_and_spawn_ms":pool_discover_and_spawn_ms,
             "worker_warmup_ms":worker_warmup_ms,"valid_execute_cycles_ms":valid_execute_cycles_ms,
+            "valid_execute_total_cycles":executed_cycles,
             "invalid_execute_cycles_ms":invalid_execute_cycles_ms,"total_ms":setup_total_ms,
             "spawned_worker_pid":spawned_worker_pid,"spawned_worker_start_time_us":spawned_worker_start,
             "worker_pid":setup_worker_pid,"worker_start_time_us":setup_worker_start,
@@ -905,10 +1084,33 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         !pressure || !lifecycle,
         "logical admission pressure requires proof-only acceptance"
     );
+    if let Some(path) = std::env::var_os("ZKMINER_MACOS_CALIBRATION") {
+        use zkminer_prover::benchmark::{BenchmarkSuite, DeviceBenchmark};
+        assert_eq!(worker_kind(), "native");
+        let bytes = fs::read(path).unwrap();
+        let profile: DeviceBenchmark = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(profile.device_id, "cpu");
+        assert_eq!(profile.prover_backend, "risc0");
+        let peak = profile.host_peak_bytes.filter(|n| *n > 0).unwrap();
+        let mut suite = BenchmarkSuite::default();
+        suite.host_peaks.insert("risc0".into(), peak);
+        suite.device_benchmarks.push(profile);
+        pool.set_expected_host_peaks(&suite);
+        let budget = pool.expected_host_peak_at_po2("risc0", Some(workload.po2));
+        assert_eq!(budget, suite.expected_host_peak_bytes("risc0"));
+        assert!(budget >= peak);
+        fs::write(evidence.join("calibration.json"), serde_json::to_vec_pretty(&json!({
+            "profile_sha256":hash(&bytes),"measured_peak_bytes":peak,
+            "expected_host_budget_bytes":budget,"requested_po2":workload.po2,
+        })).unwrap()).unwrap();
+    }
     if pressure {
         admission_pressure(&pool, &elf, &workload, &evidence);
     }
     let mut request_identities = BTreeSet::new();
+    let warmups: usize = std::env::var("ZKMINER_MACOS_WARMUP_COUNT")
+        .unwrap_or_else(|_| "0".into()).parse().unwrap();
+    assert!(warmups <= 1 && warmups < repeats);
     for index in 0..repeats {
         let before = sidecar_paths();
         ledger(
@@ -929,6 +1131,10 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         }
         let proof = result.unwrap();
         let (_, record) = require_sidecar(&before);
+        if workload.po2 == 20 {
+            assert_eq!(record["stats"]["total_cycles"], executed_cycles,
+                "execution sizing and proof cycle accounting disagree");
+        }
         assert!(
             request_identities.insert((
                 record["worker_pid"].as_u64().unwrap(),
@@ -958,7 +1164,7 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         );
         ledger(
             &evidence,
-            &json!({"case":format!("proof-{index}"),"status":"complete_independently_verified","worker":record,"resources":resources,"timings":timings}),
+            &json!({"case":format!("proof-{index}"),"status":"complete_independently_verified","warmup":index < warmups,"worker":record,"resources":resources,"timings":timings}),
         );
         assert!(helpers().is_empty(), "helper survived a successful proof");
     }
@@ -977,7 +1183,7 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
                     &elf,
                     &workload.input,
                     Some(workload.po2),
-                    Some(Duration::from_secs(600)),
+                    Some(proof_timeout()),
                     None,
                 )
             });
@@ -1022,8 +1228,9 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         let monitor = std::thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
                 if let Some((_, record)) = new_sidecar(&before) {
-                    if record["phase"] == "wrapping"
-                        && helper_running(record["helper_container"].as_str().unwrap())
+                    if worker_kind() == "native"
+                        || (record["phase"] == "wrapping"
+                            && helper_running(record["helper_container"].as_str().unwrap()))
                     {
                         *capture.lock().unwrap() = Some(record);
                     }
@@ -1032,7 +1239,13 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             }
         });
         let seconds: u64 = std::env::var("ZKMINER_MACOS_FAILURE_TIMEOUT_SECS")
-            .unwrap_or_else(|_| "70".into())
+            .unwrap_or_else(|_| {
+                if worker_kind() == "native" {
+                    "10".into()
+                } else {
+                    "70".into()
+                }
+            })
             .parse()
             .unwrap();
         assert!((1..=300).contains(&seconds));
@@ -1146,7 +1359,7 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
     .unwrap();
     fs::write(evidence.join("complete.json"), serde_json::to_vec_pretty(&json!({
         "status":"complete_independently_verified", "requested_mode":mode(),"observed_mode":observed_mode(),
-        "verified_proofs":repeats + usize::from(lifecycle), "helper_cancel":lifecycle,"helper_timeout":lifecycle,
+        "verified_proofs":repeats + usize::from(lifecycle), "helper_cancel":lifecycle,"helper_timeout":lifecycle && worker_kind() != "native","worker_timeout":lifecycle,
         "restart":lifecycle,"shutdown":true,"workload":workload.name,"po2":workload.po2,
         "min_segments":workload.min_segments,"expected_journal_hex":workload.expected_hex,
         "admission_pressure":pressure,"unique_completed_requests":request_identities.len(),

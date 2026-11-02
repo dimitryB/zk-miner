@@ -32,7 +32,8 @@ def main():
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--engine", required=True, type=Path)
     parser.add_argument("--revision", required=True, help="full reviewed engine commit SHA")
-    parser.add_argument("--mode", choices=["cpu", "metal"], default="cpu")
+    parser.add_argument("--mode", choices=["cpu", "metal", "native"], default="cpu")
+    parser.add_argument("--tests", action="store_true", help="run the selected worker unit tests before sealing")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     output = root / "target/macos"
@@ -58,11 +59,18 @@ def main():
     env["ZKMINER_RISC0_GUEST_DIR"] = str(output / "guest-build/riscv32im-risc0-zkvm-elf/release")
     feature = "macos" if args.mode == "cpu" else "macos-metal,risc0-zkvm/metal-hybrid"
     metadata_feature = "zkminer-prove-risc0/macos" if args.mode == "cpu" else "zkminer-prove-risc0/macos-metal,risc0-zkvm/metal-hybrid"
+    if args.mode == "native":
+        feature = "macos-native-wrap,risc0-groth16/native-groth16"
+        metadata_feature = "zkminer-prove-risc0/macos-native-wrap,risc0-groth16/native-groth16"
     snapshot(args.mode, engine, config, env)
     try:
         subprocess.run(["cargo", "+1.93.0", "build", "-p", "zkminer-prove-risc0", "--bin", "zkminer-prove-risc0",
             "--features", feature, "--release", "--config", str(config), "--target-dir", str(output / name)],
             cwd=root, env=env, check=True)
+        if args.tests:
+            subprocess.run(["cargo", "+1.93.0", "test", "-p", "zkminer-prove-risc0", "--bin", "zkminer-prove-risc0",
+                "--features", feature, "--release", "--config", str(config), "--target-dir", str(output / name)],
+                cwd=root, env=env, check=True)
         with artifacts["metadata"].open("w") as file:
             subprocess.run(["cargo", "+1.93.0", "metadata", "--locked", "--filter-platform", "aarch64-apple-darwin",
                 "--features", metadata_feature, "--config", str(config), "--format-version", "1"],

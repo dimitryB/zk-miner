@@ -28,6 +28,9 @@ struct Config {
     staging_bytes: usize,
     evidence_dir: Option<PathBuf>,
     helper_container: String,
+    cpu_threads: usize,
+    go_threads: usize,
+    limits: zkminer_prover_protocol::macos::Risc0Limits,
 }
 static CONFIG: OnceLock<Config> = OnceLock::new();
 fn config() -> &'static Config {
@@ -145,7 +148,48 @@ fn output(command: &mut Command) -> Result<String> {
     Ok(stdout.trim().to_owned())
 }
 
+fn thread_count(value: Option<String>, default: usize) -> Result<usize> {
+    let n = value
+        .map(|s| s.parse())
+        .unwrap_or(Ok(default))
+        .context("invalid macOS thread count")?;
+    ensure!(
+        (1..=18).contains(&n),
+        "macOS thread count must be in 1..=18"
+    );
+    Ok(n)
+}
+
 pub fn preflight() -> Result<()> {
+    let limits = zkminer_prover_protocol::macos::Risc0Limits::from_environment(
+        cfg!(feature = "macos-native-wrap"),
+    ).map_err(anyhow::Error::msg)?;
+    let cpu_threads = thread_count(
+        std::env::var("ZKMINER_RISC0_CPU_THREADS")
+            .ok()
+            .or_else(|| std::env::var("RAYON_NUM_THREADS").ok()),
+        if cfg!(feature = "macos-native-wrap") {
+            18
+        } else {
+            6
+        },
+    )?;
+    let go_threads = thread_count(
+        std::env::var("RISC0_GROTH16_NATIVE_THREADS").ok(),
+        if cfg!(feature = "macos-native-wrap") {
+            18
+        } else {
+            6
+        },
+    )?;
+    std::env::set_var("RAYON_NUM_THREADS", cpu_threads.to_string());
+    #[cfg(feature = "macos-native-wrap")]
+    std::env::set_var("RISC0_GROTH16_NATIVE_THREADS", go_threads.to_string());
+    #[cfg(feature = "macos-native-wrap")]
+    ensure!(
+        risc0_groth16::prove::native::rayon_threads() == cpu_threads,
+        "Rayon thread pool was initialized with different settings"
+    );
     for key in [
         "RISC0_DEV_MODE",
         "RISC0_SKIP_VERIFY",
@@ -178,43 +222,64 @@ pub fn preflight() -> Result<()> {
         (4096..=16 * 1024 * 1024).contains(&staging_bytes),
         "Metal staging budget must be 4096..=16777216 bytes"
     );
-    let context = std::env::var("ZKMINER_RISC0_DOCKER_CONTEXT")
-        .context("set a dedicated local Docker context")?;
-    let endpoint = output(Command::new("docker").args([
-        "context",
-        "inspect",
-        &context,
-        "--format",
-        "{{.Endpoints.docker.Host}}",
-    ]))?;
-    ensure!(
-        endpoint.starts_with("unix://"),
-        "only a local Docker socket is supported"
-    );
-    let digest = output(Command::new("docker").args([
-        "--context",
-        &context,
-        "image",
-        "inspect",
-        IMAGE,
-        "--format",
-        "{{json .RepoDigests}}",
-    ]))?;
-    ensure!(
-        digest.contains(DIGEST),
-        "the pinned Groth16 helper image is missing or has a different digest"
-    );
-    let name = std::env::var("RISC0_GROTH16_CONTAINER_NAME")
-        .context("start the worker through WorkerHandle for helper ownership")?;
-    ensure!(
-        name.starts_with("zkminer-macos-"),
-        "invalid supervisor helper identity"
-    );
-    let dir = PathBuf::from(
-        std::env::var_os("RISC0_WORK_DIR")
-            .context("supervisor must supply a shared work directory")?,
-    );
-    ensure!(dir.is_dir(), "shared helper work directory does not exist");
+    #[cfg(feature = "macos-native-wrap")]
+    let (context, name) = {
+        ensure!(
+            std::env::var("ZKMINER_RISC0_WRAP").as_deref() == Ok("native"),
+            "native worker requires ZKMINER_RISC0_WRAP=native"
+        );
+        risc0_groth16::prove::native::preflight()?;
+        (
+            String::new(),
+            std::env::var("RISC0_GROTH16_CONTAINER_NAME")
+                .context("native worker requires supervisor lease")?,
+        )
+    };
+    #[cfg(not(feature = "macos-native-wrap"))]
+    let (context, name) = {
+        ensure!(
+            std::env::var("ZKMINER_RISC0_WRAP").as_deref() != Ok("native"),
+            "this worker was built without native wrapping"
+        );
+        let context = std::env::var("ZKMINER_RISC0_DOCKER_CONTEXT")
+            .context("set a dedicated local Docker context")?;
+        let endpoint = output(Command::new("docker").args([
+            "context",
+            "inspect",
+            &context,
+            "--format",
+            "{{.Endpoints.docker.Host}}",
+        ]))?;
+        ensure!(
+            endpoint.starts_with("unix://"),
+            "only a local Docker socket is supported"
+        );
+        let digest = output(Command::new("docker").args([
+            "--context",
+            &context,
+            "image",
+            "inspect",
+            IMAGE,
+            "--format",
+            "{{json .RepoDigests}}",
+        ]))?;
+        ensure!(
+            digest.contains(DIGEST),
+            "the pinned Groth16 helper image is missing or has a different digest"
+        );
+        let name = std::env::var("RISC0_GROTH16_CONTAINER_NAME")
+            .context("start the worker through WorkerHandle for helper ownership")?;
+        ensure!(
+            name.starts_with("zkminer-macos-"),
+            "invalid supervisor helper identity"
+        );
+        let _dir = PathBuf::from(
+            std::env::var_os("RISC0_WORK_DIR")
+                .context("supervisor must supply a shared work directory")?,
+        );
+        ensure!(_dir.is_dir(), "shared helper work directory does not exist");
+        (context, name)
+    };
     let available = if requested == "cpu" {
         Err(anyhow::anyhow!("CPU explicitly selected"))
     } else {
@@ -233,20 +298,24 @@ pub fn preflight() -> Result<()> {
         staging_bytes,
         evidence_dir,
         helper_container: name.clone(),
+        cpu_threads,
+        go_threads,
+        limits,
     };
     tracing::info!(
         "macos_mode {}",
         json!({"requested_mode":state.requested,"observed_mode":if metal {"metal"} else {"cpu"},
         "fallback_reason":state.fallback,"probe":state.probe,"staging_limit_bytes":staging_bytes,
-        "other_native_stages":"cpu","groth16":"local_linux_amd64_helper"})
+        "other_native_stages":"cpu","groth16":if cfg!(feature = "macos-native-wrap") { "native_darwin_arm64_helper" } else { "local_linux_amd64_helper" }})
     );
     CONFIG
         .set(state)
         .map_err(|_| anyhow::anyhow!("macOS mode already initialized"))?;
-    std::env::set_var("DOCKER_CONTEXT", &context);
+    if !context.is_empty() {
+        std::env::set_var("DOCKER_CONTEXT", &context);
+    }
     std::env::set_var("RISC0_PROVER", "local");
     std::env::set_var("RISC0_EXECUTOR", "local");
-    std::env::set_var("RAYON_NUM_THREADS", "6");
 
     // macOS has no Linux PDEATHSIG. This thread exits the worker and cleans only
     // its leased helper if the parent disappears. The parent's lease handles a
@@ -259,10 +328,13 @@ pub fn preflight() -> Result<()> {
             if unsafe { libc::getppid() } != parent {
                 // Cleanup keeps its own deadline; the shorter startup probes must
                 // not truncate parent-death removal of an already-running helper.
-                let _ = zkminer_prover_protocol::proc::output_with_timeout(
-                    Command::new("docker").args(["--context", &context, "rm", "-f", &name]),
-                    Duration::from_secs(10), 64 * 1024,
-                );
+                if !context.is_empty() {
+                    let _ = zkminer_prover_protocol::proc::output_with_timeout(
+                        Command::new("docker").args(["--context", &context, "rm", "-f", &name]),
+                        Duration::from_secs(10),
+                        64 * 1024,
+                    );
+                }
                 std::process::exit(1);
             }
         })?;
@@ -270,17 +342,26 @@ pub fn preflight() -> Result<()> {
 }
 
 pub fn bound_env(builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>, po2: Option<u8>) -> Result<()> {
-    ensure!(
-        po2.is_none_or(|value| (14..=18).contains(&value)),
-        "po2 value out of valid range 14..=18 for macOS worker"
-    );
+    let limits = config().limits;
+    limits.validate_po2(po2).map_err(anyhow::Error::msg)?;
     builder
-        .segment_limit_po2(po2.unwrap_or(18) as u32)
-        .session_limit(Some(4 * 1024 * 1024));
+        .segment_limit_po2(po2.unwrap_or(limits.default_segment_po2) as u32)
+        .session_limit(Some(limits.max_guest_cycles));
     Ok(())
 }
 
+pub fn check_guest_cycles(cycles: u64) -> Result<()> {
+    config().limits.validate_guest_cycles(cycles).map_err(anyhow::Error::msg)
+}
+
 pub fn benchmarks() -> &'static [(&'static str, &'static [u8], &'static [u8], f64, bool)] {
+    if cfg!(feature = "macos-native-wrap") {
+        // Fixed arithmetic/hash fixtures each execute just over 10M guest cycles.
+        return &[
+            ("fibonacci", super::FIBONACCI_ELF, &[0x40, 0x42, 0x0f, 0], 1.0, false),
+            ("sha256-chain", super::SHA256_CHAIN_ELF, &[0xd6, 0x08, 0, 0], 1.0, true),
+        ];
+    }
     &[
         (
             "fibonacci",
@@ -336,8 +417,10 @@ fn prove_staged(
     let mut report = json!({"schema_version":1,"worker_pid":std::process::id(),"request_id":request_id,
         "operation":operation,"requested_mode":c.requested,"observed_mode":if c.metal {"metal"} else {"cpu"},
         "fallback_reason":c.fallback,"phase":"started","proof_kind":null,"image_id":null,
-        "elf_sha256":hash(elf),"input_sha256":hash(input),"po2":po2.unwrap_or(18),
-        "helper_container":c.helper_container,"helper_arch":"linux/amd64 (emulated)",
+        "elf_sha256":hash(elf),"input_sha256":hash(input),"po2":po2.unwrap_or(c.limits.default_segment_po2),
+        "helper_container":c.helper_container,"helper_arch":if cfg!(feature = "macos-native-wrap") { "darwin/arm64" } else { "linux/amd64 (emulated)" },
+        "rayon_threads":c.cpu_threads,"gomaxprocs":if cfg!(feature = "macos-native-wrap") { Some(c.go_threads) } else { None },
+        "max_guest_cycles":c.limits.max_guest_cycles,"minimum_segment_po2":14,
         "staging_limit_bytes":c.staging_bytes,"stage_ms":{},"error":null});
     write_report(&report, &filename)?;
     let result = (|| -> Result<Completed> {
@@ -350,13 +433,14 @@ fn prove_staged(
         let prover = prover();
         let started = Instant::now();
         let info = prover.prove_with_opts(env, elf, &ProverOpts::composite())?;
+        check_guest_cycles(info.stats.user_cycles)?;
         let segment_secs = started.elapsed().as_secs_f64();
         info.receipt
             .verify(image)
             .context("verify composite receipt")?;
         report["stats"] = serde_json::to_value(&info.stats)?;
         let mut observed = json!({"other_segment_operations":"cpu","recursion":"cpu",
-            "identity":"cpu","groth16":"local_linux_amd64_helper"});
+            "identity":"cpu","groth16":if cfg!(feature = "macos-native-wrap") { "native_darwin_arm64_helper" } else { "local_linux_amd64_helper" }});
         #[cfg(feature = "macos-metal")]
         if c.metal {
             let segments = prover.metal_stage_reports();
@@ -492,6 +576,20 @@ pub fn benchmark(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_configuration_is_bounded() {
+        for value in ["1", "6", "12", "18"] {
+            assert_eq!(
+                thread_count(Some(value.into()), 6).unwrap(),
+                value.parse::<usize>().unwrap()
+            );
+        }
+        for value in ["0", "19", "-1", "invalid"] {
+            assert!(thread_count(Some(value.into()), 6).is_err());
+        }
+        assert_eq!(thread_count(None, 6).unwrap(), 6);
+    }
 
     #[test]
     fn mode_selection_never_falls_back_for_forced_metal() {

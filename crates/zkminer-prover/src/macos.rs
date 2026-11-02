@@ -153,6 +153,126 @@ pub fn total_bytes() -> Option<u64> {
     (status == 0 && size == std::mem::size_of::<u64>()).then_some(value)
 }
 
+fn sysctl_u32(name: &std::ffi::CStr) -> Option<u32> {
+    let mut value = 0u32;
+    let mut size = std::mem::size_of_val(&value);
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut u32).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && size == 4).then_some(value)
+}
+
+// XNU kern_memorystatus: normal=1, warning=2, critical=4.
+pub fn pressure_level() -> Option<u32> {
+    sysctl_u32(c"kern.memorystatus_vm_pressure_level").filter(|n| [1, 2, 4].contains(n))
+}
+
+fn parse_reserve(value: Option<&str>) -> Option<u64> {
+    let gib = value.map(str::parse::<u64>).unwrap_or(Ok(16)).ok()?;
+    if !(8..=64).contains(&gib) {
+        return None;
+    }
+    gib.checked_mul(1024u64.pow(3))
+}
+
+pub fn reserve_bytes() -> u64 {
+    // Invalid configuration refuses admission rather than reducing protection.
+    parse_reserve(
+        std::env::var("ZKMINER_MACOS_HOST_RESERVE_GIB")
+            .ok()
+            .as_deref(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ProcessMemory {
+    pub rss_bytes: u64,
+    pub footprint_bytes: u64,
+    pub lifetime_peak_footprint_bytes: u64,
+}
+
+pub fn process_memory(pid: u32) -> Option<ProcessMemory> {
+    let mut value = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+    let rc = unsafe {
+        libc::proc_pid_rusage(pid as i32, libc::RUSAGE_INFO_V4, value.as_mut_ptr().cast())
+    };
+    if rc != 0 {
+        return None;
+    }
+    let value = unsafe { value.assume_init() };
+    Some(ProcessMemory {
+        rss_bytes: value.ri_resident_size,
+        footprint_bytes: value.ri_phys_footprint,
+        lifetime_peak_footprint_bytes: value.ri_lifetime_max_phys_footprint,
+    })
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct GroupMemory {
+    pub worker: ProcessMemory,
+    pub helper_rss_bytes: u64,
+    pub helper_footprint_bytes: u64,
+    pub helper_count: usize,
+}
+
+pub fn group_memory(pid: u32) -> Option<GroupMemory> {
+    let start = start_time(pid)?;
+    if !owned_group(pid, Some(start)) {
+        return None;
+    }
+    let mut result = GroupMemory {
+        worker: process_memory(pid)?,
+        helper_rss_bytes: 0,
+        helper_footprint_bytes: 0,
+        helper_count: 0,
+    };
+    for (member, _) in group_members(pid as i32)? {
+        let Some(memory) = process_memory(member as u32) else {
+            // A helper may finish between enumeration and its task observation.
+            if bsd_info(member as u32).is_none_or(|info| info.pbi_status == libc::SZOMB as u32) {
+                continue;
+            }
+            return None;
+        };
+        result.helper_count += 1;
+        result.helper_rss_bytes = result.helper_rss_bytes.checked_add(memory.rss_bytes)?;
+        result.helper_footprint_bytes = result
+            .helper_footprint_bytes
+            .checked_add(memory.footprint_bytes)?;
+    }
+    owned_group(pid, Some(start)).then_some(result)
+}
+
+pub fn observation(pid: u32) -> serde_json::Value {
+    serde_json::json!({"pressure_level":pressure_level(), "estimated_available_bytes":available_bytes(),
+        "admission_available_bytes":admission_available_bytes(), "reserve_bytes":reserve_bytes(),
+        "group":group_memory(pid), "guard_peak_footprint_bytes":peak_bytes(pid),
+        "footprint_method":"proc_pid_rusage RUSAGE_INFO_V4"})
+}
+
+pub fn admission_available_bytes() -> Option<u64> {
+    let available = available_bytes()?;
+    Some(if pressure_level()? == 1 { available } else { 0 })
+}
+
+fn safe_to_continue(
+    footprint: Option<u64>,
+    available: Option<u64>,
+    pressure: Option<u32>,
+    limit: u64,
+) -> bool {
+    footprint.is_some_and(|n| n <= limit)
+        && available.is_some_and(|n| n >= 8 * 1024u64.pow(3))
+        && matches!(pressure, Some(1 | 2))
+}
+
 pub fn available_bytes() -> Option<u64> {
     let mut value = std::mem::MaybeUninit::<libc::vm_statistics64>::uninit();
     let mut count = libc::HOST_VM_INFO64_COUNT;
@@ -185,13 +305,32 @@ pub fn available_bytes() -> Option<u64> {
     Some((stats.free_count as u64 + reclaim_estimate) * page_size as u64)
 }
 
+type PeakRegistry = std::sync::Mutex<HashMap<u32, (u64, Arc<AtomicU64>)>>;
+fn peaks() -> &'static PeakRegistry {
+    static PEAKS: std::sync::OnceLock<PeakRegistry> = std::sync::OnceLock::new();
+    PEAKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+pub fn peak_bytes(pid: u32) -> Option<u64> {
+    let (start, peak) = peaks().lock().ok()?.get(&pid)?.clone();
+    owned_group(pid, Some(start))
+        .then(|| peak.load(Ordering::Acquire))
+        .filter(|n| *n > 0)
+}
+
 pub struct MemoryGuard {
+    pid: u32,
+    started: u64,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MemoryGuard {
     pub fn new(pid: u32) -> Result<Self> {
+        Self::with_limit(pid, 32 * 1024u64.pow(3))
+    }
+
+    fn with_limit(pid: u32, limit: u64) -> Result<Self> {
         let started = start_time(pid).context("cannot establish worker process identity")?;
         ensure!(
             owned_group(pid, Some(started)),
@@ -203,25 +342,32 @@ impl MemoryGuard {
         );
         let stop = Arc::new(AtomicBool::new(false));
         let cancel = stop.clone();
+        let peak = Arc::new(AtomicU64::new(0));
+        let tracked_peak = peak.clone();
         let thread = std::thread::Builder::new().name("macos-memory-watch".into()).spawn(move || {
             while !cancel.load(Ordering::Acquire) {
                 if !owned_group(pid, Some(started)) { return; }
                 // A zombie may retain BSD identity after task info disappears.
                 // Its already-buffered handshake error must remain readable.
                 if bsd_info(pid).is_some_and(|info| info.pbi_status == libc::SZOMB as u32) { return; }
-                let rss = resident_bytes(pid);
+                let group = group_memory(pid);
+                let footprint = group.as_ref().and_then(|g| g.worker.footprint_bytes.checked_add(g.helper_footprint_bytes));
+                if let Some(bytes) = footprint { tracked_peak.fetch_max(bytes, Ordering::AcqRel); }
                 let available = available_bytes();
-                let safe = rss.is_some_and(|n| n <= 32 * 1024u64.pow(3))
-                    && available.is_some_and(|n| n >= 8 * 1024u64.pow(3));
+                let pressure = pressure_level();
+                let safe = safe_to_continue(footprint, available, pressure, limit);
                 if !safe {
-                    tracing::error!("macOS worker {pid}: RSS={rss:?}, estimated available={available:?}; resource observation unavailable or limit reached");
+                    tracing::error!("macOS worker {pid}: group={group:?}, available={available:?}, pressure={pressure:?}; resource observation unavailable or limit reached");
                     if owned_group(pid, Some(started)) { unsafe { libc::kill(-(pid as i32), libc::SIGKILL); } }
                     return;
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
         })?;
+        peaks().lock().unwrap().insert(pid, (started, peak));
         Ok(Self {
+            pid,
+            started,
             stop,
             thread: Some(thread),
         })
@@ -234,11 +380,18 @@ impl Drop for MemoryGuard {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        let mut registry = peaks().lock().unwrap();
+        if registry
+            .get(&self.pid)
+            .is_some_and(|(start, _)| *start == self.started)
+        {
+            registry.remove(&self.pid);
+        }
     }
 }
 
 pub struct HelperLease {
-    context: String,
+    context: Option<String>,
     name: String,
     directory: PathBuf,
 }
@@ -264,7 +417,21 @@ impl HelperLease {
                 .or_else(|| std::env::var(key).ok())
                 .with_context(|| format!("macOS worker requires {key}"))
         };
-        let context = setting("ZKMINER_RISC0_DOCKER_CONTEXT")?;
+        let native = overrides
+            .get("ZKMINER_RISC0_WRAP")
+            .cloned()
+            .or_else(|| std::env::var("ZKMINER_RISC0_WRAP").ok())
+            .as_deref()
+            == Some("native");
+        let context = if native {
+            command.env(
+                "RISC0_GROTH16_NATIVE_DIR",
+                setting("ZKMINER_RISC0_NATIVE_DIR")?,
+            );
+            None
+        } else {
+            Some(setting("ZKMINER_RISC0_DOCKER_CONTEXT")?)
+        };
         let base = PathBuf::from(setting("ZKMINER_RISC0_WORK_ROOT")?).canonicalize()?;
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let name = format!(
@@ -279,8 +446,10 @@ impl HelperLease {
         std::fs::create_dir(&directory)?;
         command
             .env("RISC0_GROTH16_CONTAINER_NAME", &name)
-            .env("RISC0_WORK_DIR", &directory)
-            .env("ZKMINER_RISC0_DOCKER_CONTEXT", &context);
+            .env("RISC0_WORK_DIR", &directory);
+        if let Some(context) = &context {
+            command.env("ZKMINER_RISC0_DOCKER_CONTEXT", context);
+        }
         Ok(Some(Self {
             context,
             name,
@@ -291,12 +460,14 @@ impl HelperLease {
 
 impl Drop for HelperLease {
     fn drop(&mut self) {
-        let status = zkminer_prover_protocol::proc::output_with_timeout(
-            Command::new("docker").args(["--context", &self.context, "rm", "-f", &self.name]),
-            Duration::from_secs(10),
-            16 * 1024,
-        );
-        tracing::debug!("owned helper {} cleanup: {}", self.name, status.describe());
+        if let Some(context) = &self.context {
+            let status = zkminer_prover_protocol::proc::output_with_timeout(
+                Command::new("docker").args(["--context", context, "rm", "-f", &self.name]),
+                Duration::from_secs(10),
+                16 * 1024,
+            );
+            tracing::debug!("owned helper {} cleanup: {}", self.name, status.describe());
+        }
         let _ = std::fs::remove_dir_all(&self.directory);
     }
 }
@@ -311,6 +482,8 @@ mod tests {
         assert!(total_bytes().unwrap() > 0);
         assert!(available_bytes().unwrap() <= total_bytes().unwrap());
         assert!(resident_bytes(std::process::id()).unwrap() > 0);
+        assert!(process_memory(std::process::id()).unwrap().footprint_bytes > 0);
+        assert!(pressure_level().is_some());
         assert!(!owned_group(
             std::process::id(),
             start_time(std::process::id())
@@ -329,6 +502,96 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!owned_group(pid, Some(time)));
+    }
+
+    #[test]
+    fn pressure_and_reserve_boundaries() {
+        let gib = 1024u64.pow(3);
+        assert_eq!(parse_reserve(None), Some(16 * gib));
+        assert_eq!(parse_reserve(Some("32")), Some(32 * gib));
+        for value in ["0", "7", "65", "no", "18446744073709551615"] {
+            assert_eq!(parse_reserve(Some(value)), None);
+        }
+        assert!(safe_to_continue(
+            Some(gib),
+            Some(20 * gib),
+            Some(1),
+            32 * gib
+        ));
+        assert!(safe_to_continue(
+            Some(gib),
+            Some(20 * gib),
+            Some(2),
+            32 * gib
+        ));
+        assert!(!safe_to_continue(
+            Some(gib),
+            Some(20 * gib),
+            Some(4),
+            32 * gib
+        ));
+        assert!(!safe_to_continue(Some(gib), Some(20 * gib), None, 32 * gib));
+        assert!(!safe_to_continue(
+            Some(33 * gib),
+            Some(20 * gib),
+            Some(1),
+            32 * gib
+        ));
+        assert!(!safe_to_continue(
+            Some(gib),
+            Some(7 * gib),
+            Some(1),
+            32 * gib
+        ));
+    }
+
+    #[test]
+    fn footprint_peak_is_scoped_to_the_live_guard() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let guard = MemoryGuard::new(pid).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while peak_bytes(pid).is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(peak_bytes(pid).unwrap() > 0);
+        drop(guard);
+        assert!(peak_bytes(pid).is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn bounded_allocation_stops_only_its_owned_group() {
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
+        let mut child = Command::new("python3")
+            .args(["-c", "import time; b=bytearray(64*1024**2); b[::4096]=bytes([1])*len(b[::4096]); print('ready',flush=True); time.sleep(30)"])
+            .stdout(Stdio::piped()).process_group(0).spawn().unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        assert!(group_memory(child.id()).unwrap().worker.footprint_bytes > 16 * 1024u64.pow(2));
+        let _guard = MemoryGuard::with_limit(child.id(), 16 * 1024u64.pow(2)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(!status.success());
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("footprint guard did not stop allocation");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

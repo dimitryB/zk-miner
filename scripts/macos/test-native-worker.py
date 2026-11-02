@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Exercise the native helper through the real supervised WorkerPool."""
+import argparse
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import uuid
+from proof_provenance import ROOT, sha, verify_build
+from worker_provenance import verify_build as verify_worker, paths
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--engine", type=Path, required=True)
+    parser.add_argument("--workload", choices=["fibonacci", "sha256-chain", "segment-boundary"], default="fibonacci")
+    parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--proof-only", action="store_true")
+    parser.add_argument("--rayon-threads", type=int, choices=range(1,19), default=18)
+    parser.add_argument("--go-threads", type=int, choices=range(1,19), default=18)
+    parser.add_argument("--admission-pressure", action="store_true")
+    parser.add_argument("--calibration", type=Path, help="load a measured DeviceBenchmark for native host-memory admission")
+    parser.add_argument("--limit-controls", action="store_true", help="run input rejection controls without completing a proof")
+    parser.add_argument("--thread-cases", help="comparison settings, e.g. 6:6,12:6,18:6")
+    parser.add_argument("--samples", type=int, choices=range(1,6), default=3)
+    parser.add_argument("--iterations", type=int, help="guest loop/hash count; boundary uses units of 1024 additions")
+    parser.add_argument("--po2", type=int, choices=range(14,21))
+    parser.add_argument("--session-limit", type=int, default=67_108_864, help="maximum guest cycles, 1..67108864")
+    parser.add_argument("--timeout-seconds", type=int, default=600, help="per-proof watchdog, 30..3600 seconds")
+    parser.add_argument("--min-guest-cycles", type=int, default=1)
+    parser.add_argument("--warmup", action="store_true", help="one extra complete proof before the measured repeats")
+    args = parser.parse_args()
+    if not 1 <= args.repeat <= 20 or (not args.proof_only and args.repeat < 3):
+        parser.error("use 1..20 repeats; lifecycle acceptance requires at least three")
+    if not 1 <= args.session_limit <= 67_108_864 or not 30 <= args.timeout_seconds <= 3600:
+        parser.error("invalid session limit or watchdog")
+    if not 1 <= args.min_guest_cycles <= args.session_limit:
+        parser.error("minimum guest cycles must fit session limit")
+    worker_manifest = verify_worker("native", args.engine)
+    verifier_manifest = verify_build("verifier")
+    spec = importlib.util.spec_from_file_location("worker_acceptance", Path(__file__).with_name("test-worker.py"))
+    acceptance = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(acceptance)
+    base = ROOT / "target/macos/native-wrap"
+    directory = base / "worker-runs" / uuid.uuid4().hex
+    directory.mkdir(parents=True)
+    for name in ("sidecars", "work", "bin"):
+        (directory / name).mkdir()
+    docker = directory / "bin/docker"
+    docker.write_text("#!/bin/sh\nexit 99\n")
+    docker.chmod(0o755)
+    data, expected, po2, segments = acceptance.workload(args.workload, args.iterations)
+    po2 = (16 if args.workload == "segment-boundary" else 20) if args.po2 is None else args.po2
+    (directory / "input.bin").write_bytes(data)
+    program = ROOT / "target/macos/guest-build/riscv32im-risc0-zkvm-elf/release" / (args.workload + ".bin")
+    env = dict(os.environ, ZKMINER_RISC0_WRAP="native", ZKMINER_RISC0_NATIVE_DIR=str(base / "assets"),
+               ZKMINER_RISC0_MODE="cpu", ZKMINER_RISC0_WORK_ROOT=str(directory / "work"),
+               ZKMINER_RISC0_EVIDENCE_DIR=str(directory / "sidecars"),
+               ZKMINER_MACOS_WORKER=str(paths("native")["binary"]), ZKMINER_MACOS_WORKER_KIND="native",
+               ZKMINER_MACOS_PROGRAM=str(program), ZKMINER_MACOS_VERIFIER=str(ROOT / "target/macos/verifier/release/hemi-macos-proof"),
+               ZKMINER_MACOS_WORKLOAD=args.workload, ZKMINER_MACOS_INPUT=str(directory / "input.bin"),
+               ZKMINER_MACOS_EXPECTED_JOURNAL_HEX=expected, ZKMINER_MACOS_PO2=str(po2),
+               ZKMINER_MACOS_MIN_SEGMENTS=str(segments), ZKMINER_MACOS_EXPECT_MODE="cpu",
+               ZKMINER_MACOS_EVIDENCE_DIR=str(directory / "acceptance"), ZKMINER_MACOS_REPEAT=str(args.repeat + int(args.warmup)),
+               ZKMINER_MACOS_WARMUP_COUNT=str(int(args.warmup)),
+               ZKMINER_MACOS_PROOF_TIMEOUT_SECS=str(args.timeout_seconds),
+               ZKMINER_MACOS_MIN_GUEST_CYCLES=str(args.min_guest_cycles),
+               ZKMINER_RISC0_MAX_GUEST_CYCLES=str(args.session_limit),
+               ZKMINER_MACOS_LIFECYCLE="0" if args.proof_only else "1",
+               ZKMINER_MACOS_FAILURE_TIMEOUT_SECS="10", RAYON_NUM_THREADS=str(args.rayon_threads),
+               ZKMINER_RISC0_CPU_THREADS=str(args.rayon_threads), RISC0_GROTH16_NATIVE_THREADS=str(args.go_threads),
+               ZKMINER_MACOS_ADMISSION_PRESSURE="1" if args.admission_pressure else "0",
+               PATH=str(directory / "bin") + os.pathsep + os.environ["PATH"])
+    if args.thread_cases:
+        env.update(ZKMINER_MACOS_THREAD_CASES=args.thread_cases, ZKMINER_MACOS_THREAD_SAMPLES=str(args.samples))
+    if args.calibration:
+        args.calibration = args.calibration.resolve(strict=True)
+        env["ZKMINER_MACOS_CALIBRATION"] = str(args.calibration)
+    report = {"status": "running", "worker_build": worker_manifest, "verifier_build": verifier_manifest,
+              "bundle": json.loads((base / "assets/manifest.json").read_text()), "workload": args.workload, "rayon_threads":args.rayon_threads, "gomaxprocs":args.go_threads,
+              "iterations":args.iterations,"po2":po2,"session_guest_cycle_limit":args.session_limit,
+              "proof_watchdog_seconds":args.timeout_seconds,"warmup_count":int(args.warmup),"measured_repeats":args.repeat,
+              "min_guest_cycles":args.min_guest_cycles,"program_sha256":sha(program),"input_sha256":sha(directory / "input.bin")}
+    if args.calibration:
+        report["calibration"] = {"path":str(args.calibration), "sha256":sha(args.calibration)}
+    print(directory, flush=True)
+    try:
+        binary, build = acceptance.build_acceptance(directory, env)
+        with (directory / "test.log").open("w") as log:
+            test = "native_workload_limit_controls" if args.limit_controls else "native_thread_comparison" if args.thread_cases else "native_worker_proofs_failure_restart_and_shutdown"
+            subprocess.run([str(binary), test, "--exact", "--ignored", "--nocapture"],
+                           env=env, stdout=log, stderr=subprocess.STDOUT, check=True,
+                           timeout=(args.repeat + int(args.warmup) + (4 if not args.proof_only else 0))*args.timeout_seconds + 600)
+        if verify_worker("native", args.engine) != worker_manifest:
+            raise RuntimeError("native worker build changed during acceptance")
+        if sha(binary) != build["binary_sha256"] or acceptance.test_sources() != build["source_inputs"]:
+            raise RuntimeError("WorkerPool acceptance sources changed during the run")
+        if args.calibration and sha(args.calibration) != report["calibration"]["sha256"]:
+            raise RuntimeError("admission calibration changed during acceptance")
+        report.update(status="passed", results=json.loads((directory / "acceptance/complete.json").read_text()))
+    except BaseException as error:
+        report.update(status="failed", error=str(error))
+        raise
+    finally:
+        (directory / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

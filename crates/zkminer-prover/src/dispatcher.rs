@@ -1463,7 +1463,7 @@ impl WorkerPool {
                             }
                         }
                         if let Some(budget) = crate::memory::worker_memory_ceiling_bytes(
-                            crate::memory::DEFAULT_HOST_RESERVE_BYTES,
+                            crate::memory::host_reserve_bytes(),
                         ) {
                             env.insert(
                                 zkminer_prover_protocol::types::HOST_MEM_BUDGET_ENV.into(),
@@ -3584,7 +3584,7 @@ impl WorkerPool {
             resident,
             available,
             total,
-            crate::memory::DEFAULT_HOST_RESERVE_BYTES,
+            crate::memory::host_reserve_bytes(),
         )
     }
 
@@ -3748,7 +3748,7 @@ impl WorkerPool {
             self.reserved_host_memory(),
             available,
             total,
-            crate::memory::DEFAULT_HOST_RESERVE_BYTES,
+            crate::memory::host_reserve_bytes(),
             &self.idle_host_holdings_except(backend),
             MIN_RECLAIMABLE_HOST,
         )?;
@@ -3809,7 +3809,7 @@ impl WorkerPool {
             // macOS has no cgroup/OOM-score backstop; unknown memory is not capacity.
             return !cfg!(target_os = "macos");
         };
-        let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
+        let reserve = crate::memory::host_reserve_bytes();
         // How many of this backend's proofs could be running at once if we take this one.
         let concurrent = outstanding.saturating_add(1).min(max_concurrent.max(1)) as u64;
         let committed = expected_peak.saturating_mul(concurrent);

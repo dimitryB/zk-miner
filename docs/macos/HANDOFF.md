@@ -1,5 +1,173 @@
 # macOS proving handoff
 
+## Current implementation direction
+
+The owner subsequently authorized committing steps 1–4 and proceeding with
+step 5, Poseidon2 lift/join recursion Metal. The engine checkpoint is
+`98d940d4b`; the exact measured CPU worker and original build manifests were
+preserved in `target/macos/native-wrap/step4-cpu-baseline` before committing.
+The measurement-time source hashes below remain historical evidence. Do not push.
+
+The owner approved [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) on
+2026-11-01 and requested implementation with all new changes left uncommitted.
+This supersedes the earlier next step of extending fold-only benchmarks.
+Target: 10 million guest cycles within 10 minutes (median of five complete warm
+proofs per fixed arithmetic/hash fixture), with 46 million cycles as a stretch
+test. Preserve independent verification and 20-request lifecycle acceptance.
+
+Native macOS helper milestone passed: six complete WorkerPool proofs (including
+hashing and five-segment jobs), three native rewraps, 27 tamper rejections, and
+three byte-identical witnesses. Worker helper cancellation, a ten-second
+watchdog, restart, shutdown, native witness cancellation, helper deadline,
+parent death, and artifact rejection passed. The Intel wrapping feature compiles;
+two macOS process/group tests passed. See [native evidence](evidence/native-wrap-validation.json).
+The initial Rust build needed project-local `protoc`; an intermediate worker
+build correctly refused a provenance seal while inputs were changing. The final
+worker was rebuilt and sealed after those changes; no failed proof was retried
+or excluded from the recorded acceptance runs.
+
+The native bundle is `target/macos/native-wrap/assets`; the worker is
+`target/macos/worker-native/release/zkminer-prove-risc0`. Use
+`ZKMINER_RISC0_WRAP=native` and the settings in [SETUP.md](SETUP.md). Native
+Fibonacci body times were 59.714 seconds first, then 44.712/45.763 seconds on the
+same worker; the five-segment proof took 129.774 seconds. These are the earlier
+six-thread correctness observations.
+
+Step 3 selected **18 Rayon / 18 Go threads**. The five-pair warm-worker comparison
+measured median bodies of 46.069 seconds at 6/6 and 22.421 seconds at 18/18
+(2.05×), with all twelve proofs and 36 tamper checks passing. Independent screens
+covered Rayon 6/12/18 with Go fixed at six, and Go 6/12/18 on the actual host.
+The final paired run used one sealed worker binary and alternated request order.
+
+Admission now observes owned worker/helper physical footprints, gates new work
+on normal kernel memory pressure, and uses a configurable 8..64-GiB reserve
+(default 16). The native unmeasured budget is 16 GiB, with guard-sampled group
+peaks feeding calibration. The 32-GiB watchdog ceiling and 8-GiB estimated
+headroom floor remain. Measured pairs peaked near 11.1 GiB combined footprint;
+the host stayed at normal pressure. See [tuning evidence](evidence/native-tuning-validation.json)
+and [consolidated engine diff](evidence/native-tuning-engine.patch).
+
+Cache-warm logical-reservation refusal and a verified recovery proof passed.
+The first queued follow-up attempt omitted `env.sh`, so Cargo was missing before
+any proof or test build; its failed result and cache record are preserved under
+`target/macos/native-wrap`. The corrected run is separate. One reserve parser
+unit test initially exposed an eager overflow; that was corrected before the
+final tests, worker build and paired campaign.
+
+Final 18/18 validation passed hashing, five-segment proving, three consecutive
+proofs, observed helper cancellation, a ten-second worker watchdog, a verified
+restart proof and shutdown. This milestone totals 31 complete worker proofs,
+18 rewraps and 147 tamper rejections, plus 20 Rust unit tests and eight invalid
+thread startup checks. The unchanged verifier binary and root lock were checked;
+no owned proof process remains. The dedicated VM is stopped and the original
+default VM remains running. All changes remain uncommitted/unpushed.
+
+Step 4 passed. Native workers default to a configurable 64-Mi guest-cycle
+ceiling (`ZKMINER_RISC0_MAX_GUEST_CYCLES`, bounded at 67,108,864) and po2 20,
+with local caps 14..20. Legacy Mac builds retain 4,194,304 cycles and po2 18,
+with caps 14..18. The shared RV32IM executor floors final padding at po2 14
+for proving caps. Fifty-one before/after boundary executions preserved claims,
+journals, guest cycles and paging, with padding charged only to reserved/total
+cycles. Four shared executor tests passed on both macOS and Linux ARM64; the
+Linux runtime test had networking disabled. Its build allowed only existing
+unused prover-field warnings in the execution-only feature subset.
+
+Native sizing now reports padded total cycles, matching proof output, while
+checking SDK guest counts separately against the ceiling. Claim admission
+rejects unknown/oversized work and unsupported overrides before claim, after
+permitting the existing background sizing path. Claims keep the selected Mac
+pipeline's calibrated default segment setting. Non-Mac worker inputs below
+po2 14 are rejected too. Measured fixed identity/wrap cost plus segment/recursion
+scaling informs native deadline evaluation and the watchdog. Native built-in
+benchmarks use the fixed 10M arithmetic/hash inputs. Configure
+`[prover] benchmark_timeout_secs = 1800` for the two-proof benchmark suite;
+the generic default is a 600-second per-suite cap.
+
+The completed serial campaign is
+`target/macos/native-wrap/workload-campaigns/2edca085145446d5a3e89270d6087a7a`.
+It passed nine input controls, tiny-tail and segment-boundary proofs, one excluded
+warmup plus five measured complete proofs per 10M fixture, one arithmetic 46M
+stretch, and twenty consecutive requests followed by cancellation, watchdog,
+verified restart and shutdown. Its 36 full proofs passed the unchanged verifier
+and 108 negative checks. Complete 10M medians were 483.927 seconds arithmetic
+and 476.853 seconds hashing. The 46M arithmetic result was 2,139.840 seconds
+complete (2,139.636 body), 1.5% above the model frozen before that holdout.
+Hashing at 46M was sized only. The campaign's peak sampled simultaneous group
+footprint was 12.6 GiB and sampled memory pressure stayed normal.
+
+The earlier po2-18 campaign `a90a508b35fc4e9d926e9582781284bf` was intentionally
+stopped after one verified 10M warmup: 731.067 seconds of body time. Its three
+verified proofs, nine negative checks, partially started next request, pending
+slots and interrupted result are retained separately, with `replan.json`.
+This is a single sizing screen, not a five-sample speed comparison. Sources,
+binaries and manifests are archived in `step4-po218-build`; the final campaign
+acceptance binary is preserved in `step4-po220-acceptance`. The final worker
+binary and unchanged verifier remain sealed; no worker rebuild followed timing.
+
+The final automatic po2 resolver keeps 20 for native mode and 18 for legacy
+mode. Its pure mode regression test passed. A separate short final acceptance
+passed on final supervisor sources: it loaded the measured CPU memory profile,
+confirmed refusal before dispatch under production reservations, released them
+to zero and verified a recovery proof at requested po2 19 (503,116 guest /
+589,824 padded cycles, two segments). Its one proof and three negative checks
+are separate from the measured campaign. The CLI check also passed. See [workload evidence](evidence/native-workloads-validation.json),
+[measured CSV](evidence/native-workloads-comparison.csv),
+[calibration](evidence/native-workloads-calibration.json) and
+[engine diff](evidence/native-workloads-engine.patch).
+
+Worker tests, protocol limits, 62 benchmark tests, shared executor regressions
+and CLI compilation passed. Earlier pre-proof setup failures (network lookup,
+dependency test workspace selection, default container toolchain and
+execution-only dead-code warnings) remain archived. No proof failure was retried.
+The root dependency lock and both repository HEADs remain unchanged. All changes
+remain uncommitted/unpushed. Step 5, Poseidon2 recursion Metal, has not started.
+
+Order: ARM64 wrapper feasibility, native macOS helper, native thread/memory
+tuning, larger workloads, Poseidon2 recursion Metal, then separate Poseidon254
+identity and RV32IM investment decisions. The ARM64 image is a feasibility
+step; production container integration is deliberately deferred. Current build
+and proof artifacts live under `target/macos/arm64-wrap-builds` and
+`target/macos/wrap-runs`. Existing benchmark and CPU/Metal binaries are retained.
+
+The first implementation fixes the helper Dockerfile's Circom build to use its
+existing lockfile. The build runner materializes the original checksum-pinned
+circuit LFS object in a snapshot and records native ARM64 image provenance.
+The measurement runner reuses archived identity inputs and the sealed unchanged
+verifier. ARM64 feasibility passed: four new wraps, 12 tamper rejections, and five
+control tests. Serial witness/gnark times were about 4.7/9.8–10.0 seconds; the
+original pipelined Fibonacci wrap took 11.312 seconds including Docker launch
+and exit. These are isolated wraps, not complete newly executed jobs. See
+[BENCHMARKS.md](BENCHMARKS.md) and its compact machine-readable evidence.
+
+Successful build: `target/macos/arm64-wrap-builds/fcafe2c4fbec45f0a81bb939254d09b7`.
+The finalized build script also passed using the cache in build
+`6ecc1f125fb54a9c9488a2e9aac6a78f`, with identical input hashes. Initial build
+attempts record missing Buildx, standalone-context selection, an unlocked Circom
+dependency requiring newer Cargo, and the unresolved circuit LFS pointer.
+The exact LFS object was recovered from its introducing upstream commit and
+checked against the Hemi pin's size and SHA-256. No circuit/key was substituted.
+
+Reproduce after starting the documented dedicated Colima profile:
+
+```sh
+python3 scripts/macos/build-arm64-wrap.py --engine /Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0 --buildx target/macos/bootstrap/buildx-v0.38.1/buildx-v0.38.1.darwin-arm64
+python3 scripts/macos/measure-wrap.py --build target/macos/arm64-wrap-builds/fcafe2c4fbec45f0a81bb939254d09b7 --source target/macos/runs/08b5cca54b024b9ca9d3400f41b23b1b --layout pipeline
+python3 scripts/macos/test-wrap-controls.py
+```
+
+Use the directory printed by a new build for its measurements. The build runner
+accepts an installed Docker Buildx plugin instead when `--buildx` is omitted.
+Local Buildx URL/hash provenance is in its adjacent `download.json`. Hashing and
+compilation should finish before controlled timing proofs. The native macOS
+helper has superseded this feasibility path; retain the image as a verified
+reference, without hardening it into the production worker.
+
+After acceptance, no containers remained in the dedicated profile; it was
+stopped. The original default VM remains running. All new miner and engine
+changes are uncommitted, and neither branch was pushed during this work.
+
+## Earlier completed milestones
+
 Updated 2026-11-01. CPU Gates 1/2 and the bounded native hybrid worker milestone
 passed. Expanded workloads and twenty consecutive supervised-worker requests
 also passed. Segment Poseidon2 Merkle folds run on Metal; complete Groth16
@@ -75,12 +243,12 @@ thermal snapshots were nominal/AC, with the documented unknown-state caveat;
 background fseventsd and other activity remained. No energy/GPU-allocation peak
 or broad statistical significance claim is made.
 
-No workers/containers remained after acceptance. The dedicated VM is stopped;
-the original default VM remains running. No privileged installation, push,
-wallet access, job claim or transaction occurred. Next: benchmark the already
-validated hash and multi-segment fixtures under the same fixed protocol before
-choosing another acceleration stage. Broader resource/fault and deployment gates
-remain open; see VALIDATION.md for exact commands and unrun checks.
+No workers/containers remained after that acceptance campaign. The dedicated VM
+was stopped and the original default VM remained running. No privileged
+installation, push, wallet access, job claim or transaction occurred during the
+campaign. Its proposed follow-up benchmarks are superseded by the implementation
+plan above. Broader resource/fault and deployment gates remain open; see
+VALIDATION.md for exact commands and unrun checks.
 
 ## Earlier benchmark attempt and readiness checks
 

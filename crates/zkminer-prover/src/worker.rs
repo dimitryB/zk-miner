@@ -601,7 +601,7 @@ impl WorkerHandle {
         // load-bearing for every pid-keyed path in this file.
         let pid_for_cap = spawn_guard.get().id();
         #[cfg(not(target_os = "macos"))]
-        match crate::memory::worker_memory_ceiling_bytes(crate::memory::DEFAULT_HOST_RESERVE_BYTES)
+        match crate::memory::worker_memory_ceiling_bytes(crate::memory::host_reserve_bytes())
         {
             Some(ceiling) => {
                 match crate::memory::cap_process_memory(pid_for_cap, backend, ceiling) {

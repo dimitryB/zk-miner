@@ -185,7 +185,8 @@ fn run_worker_loop() -> Result<()> {
                             // respawns this worker with a clean GPU context (a wedged/leaked
                             // context would otherwise fail every subsequent proof).
                             ErrorKind::ResourceExhausted
-                        } else if msg.contains("po2 value") || msg.contains("out of valid range") {
+                        } else if msg.contains("po2 value") || msg.contains("out of valid range")
+                            || msg.contains("Session limit exceeded") {
                             ErrorKind::InvalidInput
                         } else if msg.contains("serialize") || msg.contains("bincode") {
                             ErrorKind::Internal
@@ -366,7 +367,14 @@ fn run_execute(elf: &[u8], input_data: &[u8]) -> anyhow::Result<(u64, f64)> {
     let session = executor.execute(env, elf)
         .map_err(|e| anyhow::anyhow!("execute: {e}"))?;
 
-    // `SessionInfo::cycles()` is the total cycle count, matching what proving reports.
+    // The SDK's cycles() is guest-only. Native sizing returns padded proving
+    // cycles, matching ProofResult; retain the guest ceiling separately.
+    #[cfg(feature = "macos")]
+    let cycles = {
+        macos::check_guest_cycles(session.cycles())?;
+        session.segments.iter().map(|s| 1u64 << s.po2).sum()
+    };
+    #[cfg(not(feature = "macos"))]
     let cycles = session.cycles();
     Ok((cycles, started.elapsed().as_secs_f64()))
 }
@@ -498,8 +506,8 @@ fn run_proof_once(
     #[cfg(feature = "macos")]
     macos::bound_env(&mut env_builder, po2)?;
     if let Some(po2) = po2 {
-        if !(13..=24).contains(&po2) {
-            anyhow::bail!("po2 value {po2} out of valid range 13..=24");
+        if !(14..=24).contains(&po2) {
+            anyhow::bail!("po2 value {po2} out of valid range 14..=24");
         }
         tracing::info!("Setting segment_limit_po2 = {po2}");
         env_builder.segment_limit_po2(po2 as u32);

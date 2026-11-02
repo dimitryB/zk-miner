@@ -1,5 +1,188 @@
 # Reproduce the local CPU and experimental hybrid paths
 
+## Native macOS wrapping
+
+The native worker is built separately under `target/macos/worker-native`. It
+uses a Darwin ARM64 Go child and the shared in-process witness evaluator.
+Keep the CPU/Metal reference binaries in their existing directories.
+
+The original component archive and checksum-pinned zkey are cached under
+`target/macos/native-wrap/downloads`; the circuit R1CS is exported from the
+verified ARM64 build's `gnark` stage. `build-native-wrap.py` checks the archive,
+graph, circuit, and original proving-key identity, builds Go with `-mod=readonly`
+and project-local caches, then runs the converter on macOS. The runtime bundle
+contains `prover`, `stark_verify.cs`, `stark_verify_final.pk.dmp`, the witness
+graph, and a manifest binding their hashes. No trusted setup is regenerated.
+
+The component URL is
+`https://risc0-artifacts.s3.us-west-2.amazonaws.com/rzup/components/risc0-groth16/sha256/4b4f2b2fb8380369ed14f0dc48380a1bbcbc82c7d553f1888b47d0a9f8e72e4d`.
+Save it as `downloads/risc0-groth16-0.1.0.tar.xz`. The original zkey URL/checksum
+remain those in the engine Dockerfile. To export the cached native inputs, build
+that Dockerfile with `--target gnark --load`, create a stopped container from
+that stage, and copy `/usr/src/gnark/groth16/stark_verify.r1cs` and
+`/usr/src/gnark/groth16/stark_verify_final.zkey.gz`. Remove the stopped container.
+The successful stage image is `zkminer/groth16-native-inputs:feasibility` in
+context `colima-hemi-macos-cpu`; runtime proving does not need it.
+
+Use the existing Go compiler and task-local Rust toolchain. Witness-parser
+compilation also needs `protoc`; this session verified protobuf 36.2 ARM64 into
+`target/macos/bootstrap/protoc-36.2`. Its adjacent `download.json` records the
+official URL and SHA-256. No global installation is required.
+
+```sh
+source scripts/macos/env.sh
+export PROTOC=/Users/dbur/dev/zk-miner/target/macos/bootstrap/protoc-36.2/bin/protoc
+ENGINE_DIR=/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0
+python3 scripts/macos/build-native-wrap.py --engine "$ENGINE_DIR"
+python3 scripts/macos/build-worker.py --mode native --engine "$ENGINE_DIR" --config target/macos/local-engine.toml --revision 0d5b41e8e44876c1e8b5a8a671aabc154e33106c
+```
+
+The standalone witness/wrap acceptance tool uses the isolated manifest
+`tools/macos-native-wrap/Cargo.toml` and local engine config:
+
+```sh
+cargo +1.93.0 build --locked --release --manifest-path tools/macos-native-wrap/Cargo.toml --config target/macos/local-engine.toml --target-dir target/macos/native-wrap/rust
+python3 scripts/macos/test-native-wrap.py
+python3 scripts/macos/test-native-worker.py --engine "$ENGINE_DIR"
+python3 scripts/macos/test-native-worker.py --engine "$ENGINE_DIR" --workload sha256-chain --repeat 1 --proof-only
+python3 scripts/macos/test-native-worker.py --engine "$ENGINE_DIR" --workload segment-boundary --repeat 1 --proof-only
+```
+
+For normal supervisor launches, select the native worker binary and set
+`ZKMINER_RISC0_WRAP=native`, `ZKMINER_RISC0_NATIVE_DIR` to the absolute runtime
+bundle directory, and `ZKMINER_RISC0_WORK_ROOT` to an existing writable directory.
+The supervisor creates a request lease and passes `RISC0_GROTH16_NATIVE_DIR` and
+`RISC0_WORK_DIR` internally. No Docker context is required in this mode.
+Native builds default to 18 Rayon threads and Go concurrency 18. Set
+`ZKMINER_RISC0_CPU_THREADS` in `1..=18` to override Rayon; otherwise the worker
+uses `RAYON_NUM_THREADS`, then its native default. `env.sh` follows the same
+precedence. `RISC0_GROTH16_NATIVE_THREADS` sets Go concurrency in `1..=18`.
+Malformed or out-of-range thread settings fail startup. Legacy wrapping builds
+retain their six-thread fallback when launched without these environment values.
+`RISC0_GROTH16_NATIVE_TIMEOUT` sets a stage budget in `1..=1800` seconds
+(default 1800); the supervisor's watchdog covers synchronous witness generation.
+`ZKMINER_RISC0_MAX_GUEST_CYCLES` configures the session ceiling in `1..=67108864`.
+Native builds default to 67,108,864 guest cycles (64 Mi); legacy Mac wrapping
+builds retain their 4,194,304 default. The executor enforces the limit during
+execution, and completed guest counts are checked again. Invalid configuration
+fails startup. Native segment caps are po2 14..20, with selected default 20;
+legacy Mac wrapping builds retain 14..18 and default 18. The po2-18 large-job
+screen completed before increasing the segment bound. Po2 20 passed five measured
+warm proofs per 10M fixture and the twenty-request lifecycle gate.
+
+The shared executor pads a final segment to at least po2 14 when its configured
+cap is 14 or greater. Execution-only circuit tests can still select cap 13;
+the Mac proving worker rejects that setting. Padding preserves guest cycles,
+paging, the journal and the receipt claim, while increasing total/reserved
+cycles where needed. Native `ExecuteResult.cycles` now sums padded segment
+sizes, matching `ProofResult.cycles`; the SDK's `SessionInfo::cycles()` itself
+counts guest cycles and is checked separately against the session ceiling.
+
+Native preflight validates artifact hashes before the existing ten-second
+handshake deadline; graph preparation is lazy on the proof path. Native children
+inherit the owned worker group, exit if their parent disappears, and have an
+internal Go deadline. Output streams are discarded and proof JSON is bounded.
+The watchdog samples worker and owned helper physical footprints using
+`proc_pid_rusage` once per second, under a combined 32-GiB ceiling and an 8-GiB
+estimated host-headroom floor. It records worker/helper RSS separately. These
+are sampled observations, not a kernel-enforced allocation cap or an exact peak;
+shared charges can make the group sum conservative. Native mode uses no container
+lease. The original Docker path remains the default for earlier worker builds.
+
+Native RISC0 admission starts with a 16-GiB unmeasured proof budget; sampled
+group peaks then feed the existing calibration margin. Resident footprint of
+the owned worker group supplies the existing resident-memory credit. The host
+estimate remains free pages plus half the smaller of file-backed and inactive
+pages, with no separate credit for compression. It is not an allocation guarantee.
+`ZKMINER_MACOS_HOST_RESERVE_GIB` accepts 8..64 (default 16); invalid values refuse
+admission. Host estimates and process footprints are reported separately.
+
+New admission requires normal kernel memory pressure. Warning pressure blocks
+new proofs while allowing an in-flight proof within its other bounds; critical
+or unknown pressure stops the owned group. The sysctl returns dispatch pressure
+flags, rather than the kernel's internal enum; see Apple's
+[XNU conversion and sysctl implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_memorystatus_notify.c).
+API background: Apple's [memory-footprint guidance](https://developer.apple.com/videos/play/wwdc2022/10106/).
+See BENCHMARKS.md for measured outcomes and limitations.
+
+Reproduce the counterbalanced comparison and cache-warm admission recovery:
+
+```sh
+python3 scripts/macos/test-native-worker.py --engine "$ENGINE_DIR" --thread-cases 6:6,18:18 --samples 5 --proof-only
+python3 scripts/macos/tune-native-go.py
+python3 scripts/macos/test-native-admission.py --engine "$ENGINE_DIR"
+python3 scripts/macos/test-native-thread-controls.py
+```
+
+The Go screen reuses the archived fixed witness and reference proof named in
+its script; it excludes witness generation and includes child startup and key
+loading. The admission test reads the native proving key to warm filesystem
+cache, exercises actual production accounting reservations without allocating
+their logical size, then verifies a recovery proof. It does not induce global
+OS memory pressure. To reproduce earlier six-thread CPU/Metal campaigns, export
+`ZKMINER_RISC0_CPU_THREADS=6` before sourcing `env.sh`.
+
+Run the workload milestone with the same native bundle and unchanged verifier:
+
+```sh
+python3 scripts/macos/test-native-worker.py --engine "$ENGINE_DIR" --limit-controls --repeat 1 --proof-only
+python3 scripts/macos/test-native-worker.py --engine "$ENGINE_DIR" --workload segment-boundary --iterations 0 --po2 14 --repeat 1 --proof-only
+python3 scripts/macos/benchmark-native-workloads.py --engine "$ENGINE_DIR" --stretch
+```
+
+The serial campaign performs one excluded warmup and five measured proofs each
+for Fibonacci(1,000,000) and a 2,262-hash SHA-256 chain. These execute 10,003,116
+and 10,003,440 guest cycles respectively, at cap 20. Both have 10,485,760 padded
+cycles in ten segments. `--stretch` additionally
+selects Fibonacci(4,600,000), at 46,003,116 guest cycles. A 10,405-hash input is
+also selectable using `test-native-worker.py --workload sha256-chain
+--iterations 10405`; it executes 46,003,643 guest cycles. Inputs, packed programs,
+expected journals, sources, logs and complete-proof timings are bound in each
+run. These cycle counts come from execution; elapsed-time acceptance must come
+from completed proofs. The completed campaign measured medians of 483.927 seconds
+for arithmetic and 476.853 seconds for hashing, including independent verification.
+The single arithmetic stretch took 2,139.840 seconds. The campaign includes twenty consecutive small requests
+followed by cancellation, watchdog and restart checks. It runs one proof at a
+time, with Docker blocked in the proving path.
+
+`--timeout-seconds` bounds each proof in 30..3600 seconds; the campaign uses
+1800 for the 10M characterization and 3600 for the stretch. The usefulness
+criterion remains 600 seconds including independent verification, regardless
+of the larger characterization watchdog. `--session-limit` overrides the guest
+ceiling for a run; `--min-guest-cycles` rejects undersized fixtures.
+Collect a completed campaign and exercise calibrated admission separately:
+
+```sh
+python3 scripts/macos/collect-native-workloads.py target/macos/native-wrap/workload-campaigns/CAMPAIGN_ID
+python3 scripts/macos/test-native-worker.py --engine "$ENGINE_DIR" --workload fibonacci --iterations 50000 --po2 19 --repeat 1 --proof-only --admission-pressure --calibration docs/macos/evidence/native-workloads-calibration.json
+```
+
+The calibration is a measured `DeviceBenchmark`, passed through the production
+`WorkerPool::set_expected_host_peaks` path. The admission check holds logical
+reservations, confirms refusal before dispatch, releases them to zero, and
+verifies a recovery proof. It does not allocate the represented reservation.
+Use the collector's optional `--calibrated-admission RUN_DIR` to bind that result
+and `--acceptance-archive ARCHIVE_DIR` to bind a retained campaign acceptance
+binary. The completed campaign's binary is archived under
+`target/macos/native-wrap/step4-po220-acceptance`.
+
+Native built-in benchmarks now use these fixed 10M arithmetic/hash inputs.
+Their CPU device row retains measured segment/recursion and fixed identity/wrap
+times, with no invented separate GPU draw. The Mac claim evaluator includes
+the fixed component in deadline estimates; the proof watchdog uses the same
+measured cost with margin, falling back to the configured cap while uncalibrated.
+For the built-in two-proof native benchmark suite, set `[prover]`
+`benchmark_timeout_secs = 1800`; the generic default of 600 seconds is a
+per-suite cap, while each 10M proof is timed separately for the usefulness
+criterion. Keep one active proof per Mac.
+The cycle-scaled component includes lift/join cost at the measured segment cap.
+These estimates are workload-dependent, not guarantees. Mac claims require a
+known declared or executed cycle count within the configured ceiling, and only
+the native default po2 20 timing configuration is currently eligible; other overrides
+are rejected before claim. Unknown sizes can be measured by the existing sizing
+path before reconsideration. Local native tests can still select po2 14..20. Network
+claiming remains outside this acceptance workflow.
+
 This experimental path is local only. It does not require a wallet or a
 marketplace job. Use one proof at a time. Do not treat these instructions as
 approval to run `mine`, `init`, claim, stake or submit commands.

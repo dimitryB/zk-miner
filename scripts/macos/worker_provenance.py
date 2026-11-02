@@ -14,7 +14,7 @@ ENVIRONMENT = (
     "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "DEVELOPER_DIR", "TOOLCHAINS", "SDKROOT",
     "CC", "CXX", "CFLAGS", "CXXFLAGS", "AR", "RUSTC", "RUSTC_WRAPPER",
     "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_JOBS", "CARGO_HOME", "RUSTUP_HOME",
-    "RISC0_HOME", "ZKMINER_RISC0_GUEST_DIR",
+    "RISC0_HOME", "ZKMINER_RISC0_GUEST_DIR", "PROTOC",
 )
 
 
@@ -24,9 +24,9 @@ def sha(path):
 
 
 def profile(kind):
-    if kind not in ("cpu", "metal"):
+    if kind not in ("cpu", "metal", "native"):
         raise ValueError("worker build kind must be cpu or metal")
-    return "worker" if kind == "cpu" else "worker-metal"
+    return {"cpu": "worker", "metal": "worker-metal", "native": "worker-native"}[kind]
 
 
 def paths(kind):
@@ -44,8 +44,8 @@ def source_state(kind, engine, config):
     engine, config = Path(engine).resolve(), Path(config).resolve()
     def git(*args):
         return subprocess.check_output(["git", "-C", str(engine), *args])
-    if git("ls-files", "--others", "--exclude-standard", "-z"):
-        raise RuntimeError("stage new engine files before building so the engine diff records them")
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z").decode().split("\0")
+    untracked_hashes = {name: sha(engine / name) for name in untracked if name}
     files = [ROOT / "Cargo.toml", ROOT / "Cargo.lock",
              ROOT / "scripts/macos/build-worker.py", ROOT / "scripts/macos/worker_provenance.py",
              ROOT / "scripts/macos/local-engine.py", ROOT / "scripts/macos/check-source.py",
@@ -65,6 +65,7 @@ def source_state(kind, engine, config):
         "kind": kind, "pinned_engine_revision": PIN, "engine_path": str(engine),
         "engine_head": git("rev-parse", "HEAD").decode().strip(),
         "engine_working_diff_sha256": hashlib.sha256(git("diff", "HEAD", "--binary")).hexdigest(),
+        "engine_untracked_files": untracked_hashes,
         "config_path": str(config),
         "inputs": {str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path): sha(path)
                    for path in sorted(set(files))},
@@ -109,7 +110,7 @@ def verify_build(kind, engine, binary=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("kind", choices=["cpu", "metal"])
+    parser.add_argument("kind", choices=["cpu", "metal", "native"])
     parser.add_argument("--engine", type=Path, required=True)
     args = parser.parse_args()
     print(json.dumps(verify_build(args.kind, args.engine), indent=2))

@@ -1,4 +1,260 @@
-# Controlled CPU/Metal Fibonacci comparison — completed 2026-11-01
+# macOS proving measurements
+
+## Workload expansion completed 2026-11-01
+
+The native worker defaults to po2 20 and a configurable 64-Mi guest-cycle
+ceiling. Legacy Mac wrapping retains its po2-18 default. Final-segment padding
+has a po2-14 floor for supported proving caps, with unchanged claims/journals
+in 51 before/after executions and real tiny-tail proofs accepted by the unchanged
+verifier. Shared executor tests passed on macOS and Linux ARM64.
+
+The five measured warm arithmetic proofs have completed. Fibonacci(1,000,000)
+executes 10,003,116 guest / 10,485,760 total cycles in ten segments. Complete
+latency, including independent verification, was a median **483.927 seconds**
+[470.785–502.439], n=5, with one excluded first-process warmup. The warmup was
+493.118 seconds of worker body; these are not cold-boot measurements.
+
+The hashing set also passed five warm measurements. Its 2,262 hashes execute
+10,003,440 guest / 10,485,760 total cycles in ten segments. Complete latency
+was a median **476.853 seconds** [473.839–483.927], n=5, with one excluded
+first-process warmup (494.056 seconds of worker body). All twelve complete
+proofs across both sets, including warmups, passed the unchanged verifier and
+36 negative checks; there were no retries or excluded measured rows.
+
+| Seconds, median [minimum–maximum], n=5 each | Arithmetic | Hashing |
+|---|---:|---:|
+| Execution + segment proving | 396.674 [383.056–417.827] | 390.767 [386.540–392.632] |
+| Recursion | 67.897 [65.676–72.628] | 66.900 [65.832–77.850] |
+| Identity + wrapping | 17.798 [17.267–20.526] | 17.453 [17.277–19.221] |
+| Worker body | 483.075 [469.804–501.893] | 476.604 [473.160–483.748] |
+| Complete call + external verification | 483.927 [470.785–502.439] | 476.853 [473.839–483.927] |
+
+The prior po2-18 sizing screen completed one verified 10M proof in 731.067
+seconds of worker body: 403.655 segment, 302.261 recursion and 24.690 identity/
+wrap. Its remaining planned samples were intentionally cancelled to test larger
+segments; the next started request and failed/interrupted campaign result are
+retained with `replan.json`. This is a single first-process screen, not a paired
+speedup campaign. The final campaign fixes po2 20 and retains every sample.
+
+The timing model was frozen from these ten warm measurements before observing
+the stretch result: 22,691.360 padded cycles per STARK second plus 17.518 seconds
+fixed identity/wrap. It predicts 2,108.537 seconds of body time for the 46M
+arithmetic fixture, excluding fresh-process preparation. The forecast is saved
+in the campaign's `frozen-prediction.json`.
+
+The arithmetic stretch passed: 46,003,116 guest / 47,448,064 total cycles in
+46 segments, with 2,139.636 seconds of worker body and 2,139.840 seconds including
+the supervisor call and independent verification. This one fresh-process sample
+is 1.5% slower than the frozen warm-profile body forecast. Its segment phase was
+1,790.132 seconds, recursion 324.378 seconds, and identity/wrapping about 25 seconds.
+Peak sampled group footprint was 11.6 GiB; pressure remained normal. This is
+separate from the ten-minute target and is not a repeated stretch benchmark.
+
+The twenty-request lifecycle gate passed: twenty consecutive successful requests
+on one supervised worker, observed helper cancellation, the ten-second worker
+watchdog, a separately verified restart proof and shutdown. The completed
+campaign contains **36 verified full proofs and 108 negative verifier checks**,
+plus nine input-limit controls. No failed proof was retried and no measured row
+was removed. Both 10M medians meet the agreed ten-minute target. Across the
+campaign, sampled simultaneous group footprint peaked at 12.6 GiB and memory
+pressure stayed normal; this is a sampled bound, not an exact allocation peak.
+
+Evidence: [validation JSON](evidence/native-workloads-validation.json),
+[ten measured rows](evidence/native-workloads-comparison.csv),
+[exported CPU calibration](evidence/native-workloads-calibration.json), and
+[consolidated engine patch](evidence/native-workloads-engine.patch).
+A separate final supervisor check loaded the exported 12.6-GiB group peak,
+producing a 25.2-GiB admission budget with the existing safety factor. Holding
+87 GiB of logical reservations produced a typed refusal before dispatch;
+releasing them to zero allowed a verified recovery proof. Fibonacci(50,000)
+executed 503,116 guest / 589,824 padded cycles in two segments at requested cap
+19. That proof and its three negative checks passed on final supervisor sources
+with the same sealed worker/verifier. Its 60.126-second worker body is a single
+correctness observation. No represented reservation was physically allocated.
+
+The preliminary screen's three verified proofs and nine negative checks are
+retained separately from the completed campaign. Hashing at 46M was execution
+sized only. No Linux GPU proving or marketplace job acceptance was tested.
+
+Raw final campaign:
+`target/macos/native-wrap/workload-campaigns/2edca085145446d5a3e89270d6087a7a`.
+The retained screen is `a90a508b35fc4e9d926e9582781284bf` under the same directory.
+All changes remain uncommitted/unpushed.
+
+## Native thread tuning and admission completed 2026-11-01
+
+The native defaults are now **18 Rayon threads and Go concurrency 18**. A
+counterbalanced five-pair comparison on persistent workers measured a 2.05×
+worker-body speedup over 6/6. Each setting had one excluded warmup; all twelve
+complete proofs passed the unchanged independent verifier and all 36 tamper
+checks. Both settings used the same sealed native worker and runtime bundle,
+with one active proof at a time and no Docker helper.
+
+| Seconds: median [minimum–maximum], n=5 per setting | Rayon 6 / Go 6 | Rayon 18 / Go 18 |
+|---|---:|---:|
+| Execution + segment proving | 2.648 [2.620–2.721] | 1.199 [1.178–1.252] |
+| Recursion | 6.384 [6.262–6.502] | 3.455 [3.397–3.495] |
+| Identity + native wrapping | 36.964 [35.829–37.359] | 17.672 [17.149–17.810] |
+| Complete worker body | 46.069 [44.739–46.609] | 22.421 [21.794–22.504] |
+| Supervisor prove call | 46.217 [45.208–47.210] | 23.126 [22.136–23.137] |
+
+Worker-body timing includes final SDK verification; external verification and
+three negative checks are recorded separately. Supervisor timing includes
+admission and IPC. This is Fibonacci(20): 3,316 guest / 32,768 total cycles, one
+actual po2-15 segment under a po2-18 cap, with the same program/input hashes as
+the earlier controlled campaign. It does not establish the 10M-cycle target.
+Round order alternated, with no failed proofs, retries or removed measured rows.
+Recorded thermal state was nominal throughout; the platform probe can report
+nominal when information is unavailable. Background host activity remains a
+limitation; no frequency, energy or statistical-significance claim is made.
+
+Separate screens preceded the final comparison:
+
+| Screen | Setting | Measured samples | Median seconds |
+|---|---|---:|---:|
+| Complete worker, Go fixed at 6 | Rayon 6 | 3 | 45.427 |
+| Complete worker, Go fixed at 6 | Rayon 12 | 3 | 30.599 |
+| Complete worker, Go fixed at 6 | Rayon 18 | 3 | 25.714 |
+| Native gnark on a fixed witness | Go 6 | 5 | 7.944 |
+| Native gnark on a fixed witness | Go 12 | 5 | 5.268 |
+| Native gnark on a fixed witness | Go 18 | 5 | 4.571 |
+
+Each screen excluded one warmup per setting. The Rayon screen verified twelve
+complete proofs. The Go screen verified eighteen fresh wraps of one retained
+witness and includes child startup plus circuit/key/witness loading, while
+excluding witness generation. It measures the actual host Go child, with
+explicit `GOMAXPROCS`; it is not a VM-only measurement.
+
+For the measured pairs, peak sampled worker/helper footprints were 3.936/7.181
+GiB at 6/6 and 4.040/7.187 GiB at 18/18. Peak simultaneous combined observations
+were 11.107/11.104 GiB; the independent one-second watchdog captured a slightly
+higher 11.124-GiB peak at 18/18. The host's conservative available-memory estimate
+stayed above 33 GiB and sampled pressure stayed normal. Worker and helper maxima
+need not occur together. Host estimates are not added to process footprints.
+
+Admission now uses a 16-GiB initial native budget and measured group-peak
+calibration, with configurable host reserve (default 16 GiB). Warning pressure
+blocks admission; critical/unknown pressure stops the owned group. The existing
+conservative host-memory formula is retained. The group watchdog uses physical
+footprint rather than worker-only RSS for its 32-GiB ceiling. These sampled
+observations are not hard allocation limits or exact peaks.
+
+The cache-warm admission run read 2,255,766,633 bytes of the native key through
+a 4-MiB buffer, obtained a typed refusal before dispatch with real accounting
+reservations held, released them to zero, and independently verified a recovery
+proof. Its represented 97-GiB reservation was not physically allocated. Separate
+unit coverage allocated/touched 64 MiB in an owned group and verified the guard
+stopped that group under a 16-MiB test limit. No global OS pressure was forced;
+live warning/critical pressure transitions were not induced.
+
+Fresh-worker 18/18 correctness samples also passed: SHA-256 chain (47,348 guest /
+131,072 total cycles) in 36.979 seconds, and five segments (126,077 guest /
+294,912 total cycles) in 67.858 seconds. These single observations include cold
+worker preparation and are separate from the paired warm-worker comparison.
+The final 18/18 lifecycle run verified three consecutive proofs, cancelled a
+running helper, exercised the ten-second worker watchdog, verified a restart
+proof and checked shutdown. Across this milestone, 31 complete worker proofs,
+18 fixed-witness rewraps and 147 negative checks passed, alongside 20 Rust unit
+tests and eight invalid-thread startup checks. No proof failure was retried.
+One queued follow-up failed before the test build because `env.sh` had not been
+loaded and Cargo was missing; its failed result is retained separately from
+the corrected run. The verifier binary and root dependency lock are unchanged.
+
+Evidence: [native-tuning-validation.json](evidence/native-tuning-validation.json)
+with [measured pairs CSV](evidence/native-tuning-comparison.csv), and
+[consolidated engine patch](evidence/native-tuning-engine.patch). Raw screens:
+`target/macos/native-wrap/worker-runs/4e3bfe41cddd47e3a7993e0673ad999b`
+and `target/macos/native-wrap/go-tuning/b59364cac27e481ab9697bf5af867025`.
+The final paired run is
+`target/macos/native-wrap/worker-runs/1f51fe69dbf54339947f84a435200518`.
+All changes remain uncommitted. The subsequent workload milestone above closes
+the 10M-cycle and native 20-request gates.
+
+## Native macOS helper completed 2026-11-01
+
+The production worker now completes proofs using the shared Rust witness
+evaluator and a Darwin ARM64 Go prover. Six complete supervised proofs and three
+rewraps passed the unchanged verifier and 27 tamper checks. Witnesses for all
+three fixtures match the pinned C++ generator byte for byte; the Rust writer now
+emits the same WTNS version-2 header. The converter ran on macOS against the
+original proving key, whose decompressed hash matches the rzup component.
+
+| Complete worker body, seconds | Observed result |
+|---|---:|
+| Fibonacci, first proof | 59.714 |
+| Fibonacci, next two proofs on the same worker | 44.712 / 45.763 |
+| Fibonacci after cancellation and watchdog restart | 57.464 |
+| SHA-256 chain | 64.290 |
+| Five-segment fixture, 294,912 total cycles | 129.774 |
+
+These are correctness-run observations at six Rayon threads and Go concurrency
+six. Startup/preflight is separate; first-process proofs include witness-graph
+preparation. Background compilation overlapped some acceptance work. This is
+not the controlled five-pair performance campaign or the 10M-cycle acceptance.
+The dedicated helper VM was stopped and acceptance blocked the Docker executable;
+the original default VM was left untouched.
+
+The WorkerPool suite observed a running native helper before cancellation,
+checked its owned group disappeared, exercised a ten-second worker watchdog,
+then independently verified a restart proof and clean shutdown. Separate tests
+cancelled actual witness generation, rejected missing/corrupt bundles, and
+exercised the real Go child's deadline and parent-death guards while it waited
+on a FIFO. The macOS process/group tests passed (2 tests); the refactored Intel
+wrapping feature compile-check passed. CUDA/ROCm GPU runtime tests remain unrun.
+
+Sampled worker RSS peaks across the three consecutive Fibonacci proofs were
+3.949, 4.051, and 4.051 GiB. Those observations exclude helper RSS; the live
+watchdog conservatively includes owned group members under the existing 32-GiB
+ceiling. Three requests establish only this bounded cache behavior. Native
+20-request acceptance and physical-memory characterization remain ahead.
+
+Evidence: [native-wrap-validation.json](evidence/native-wrap-validation.json)
+and [complete engine diff](evidence/native-wrap-engine.patch). Reproduction and
+native environment settings are in [SETUP.md](SETUP.md). All implementation
+changes are uncommitted. Thread selection and admission results follow in the
+newer milestone above.
+
+## ARM64 wrapper feasibility completed 2026-11-01
+
+Four new Groth16 wraps of retained, previously verified identity-p254 inputs
+passed the unchanged-pin verifier and all 12 tamper checks. This campaign did
+not rerun guest execution, segment proving, recursion, or the production worker.
+Each archived reference seal was also reverified before its input was reused.
+
+| Workload and layout, one sample each | Witness seconds | Gnark including loading seconds | Host wrap call seconds |
+|---|---:|---:|---:|
+| Fibonacci, serial stages | 4.668 | 10.006 | 15.677 |
+| SHA-256 chain, serial stages | 4.656 | 9.821 | 14.553 |
+| Five-segment fixture, serial stages | 4.704 | 9.796 | 14.580 |
+| Fibonacci, original pipelined entrypoint | — | — | 11.312 |
+
+The helper runs natively as Linux ARM64 in the existing six-vCPU, 32-GiB VM,
+with six helper CPUs, `GOMAXPROCS=6`, a 24-GiB memory cap, and network disabled.
+Runtime `uname` reported `aarch64`; both executables have ELF machine 183
+(AArch64). This is native ARM64 wrapping inside a VM, not a native macOS helper.
+The serial stage clock is VM wall time; host call timing is monotonic and
+includes container launch/exit. Gnark includes constraint/key/witness loading.
+The original entrypoint overlaps witness generation and loading through a FIFO.
+These are feasibility samples, not a controlled five-pair speedup campaign or a
+whole-job performance result. The memory cap is not a measured peak.
+
+The successful build took 325.544 seconds after the Circom lockfile and missing
+LFS-source issues were resolved; a final-script cached rebuild took 1.206 seconds.
+The exact pinned circuit compiled to 5,676,573 non-linear constraints and
+5,635,930 witness elements. The ARM64 converter used the original checksum-pinned
+zkey. The only engine edit is `cargo install --locked` for pinned Circom.
+Buildx 0.38.1 was downloaded and hash-verified into the ignored local tools
+directory; no global installation was needed.
+
+Measured image:
+`sha256:75e360af5ce65deffeee8a8db0765e9fbbdbdb2d85bb5fe93d5eb6c43ca8e052`.
+Evidence: [arm64-wrap-feasibility.json](evidence/arm64-wrap-feasibility.json)
+and [engine diff](evidence/arm64-wrap-engine.patch). Raw build manifests,
+artifact hashes, logs, and receipts are under `target/macos/arm64-wrap-builds`
+and `target/macos/wrap-runs`. Next is the native macOS helper in
+[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md), before resource tuning.
+
+## Controlled CPU and Metal Fibonacci comparison completed 2026-11-01
 
 The recovered memory headroom allowed the full fixed-setting campaign to finish:
 **12 genuine complete Groth16 proofs accepted by the unchanged verifier**, 36

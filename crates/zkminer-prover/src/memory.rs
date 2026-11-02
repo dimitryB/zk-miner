@@ -90,7 +90,17 @@ pub fn mem_total_bytes() -> Option<u64> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn mem_available_bytes() -> Option<u64> { crate::macos::available_bytes() }
+pub fn mem_available_bytes() -> Option<u64> { crate::macos::admission_available_bytes() }
+
+pub fn host_reserve_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    { crate::macos::reserve_bytes() }
+    #[cfg(not(target_os = "macos"))]
+    { DEFAULT_HOST_RESERVE_BYTES }
+}
+
+#[cfg(target_os = "macos")]
+pub fn native_memory_observation(pid: u32) -> serde_json::Value { crate::macos::observation(pid) }
 
 #[cfg(target_os = "macos")]
 pub fn mem_total_bytes() -> Option<u64> { crate::macos::total_bytes() }
@@ -307,6 +317,8 @@ pub(crate) fn sanitize_unit(s: &str) -> String {
 ///   almost nothing, so the undercount is negligible — but it is also why `cap_process_memory`'s
 ///   ceiling is not retroactive.
 pub fn peak_memory_of_pid(pid: u32, expected_unit: Option<&str>) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    { let _ = expected_unit; return crate::macos::peak_bytes(pid); }
     let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     let rel = cg.lines().next()?.rsplit_once("::").map(|(_, p)| p)?.trim();
 
@@ -360,6 +372,11 @@ pub fn peak_memory_of_pid(pid: u32, expected_unit: Option<&str>) -> Option<u64> 
 /// we did not create describes something other than this worker.
 #[cfg(unix)]
 pub fn anon_memory_of_pid(pid: u32, expected_unit: Option<&str>) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = expected_unit;
+        return crate::macos::group_memory(pid).and_then(|g| g.worker.footprint_bytes.checked_add(g.helper_footprint_bytes));
+    }
     let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     let rel = cg.lines().next()?.rsplit_once("::").map(|(_, p)| p)?.trim();
     // Exact unit, for the reason given on `peak_memory_of_pid`.
@@ -691,6 +708,8 @@ pub fn plan_host_room(
 pub fn unmeasured_peak_for(backend: &str) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     match backend {
+        #[cfg(target_os = "macos")]
+        "risc0" if std::env::var("ZKMINER_RISC0_WRAP").as_deref() == Ok("native") => 16 * GIB,
         "risc0" | "openvm" => 6 * GIB,
         // `mock_worker` speaks the protocol and allocates nothing; `crates/zkminer-prover/src/bin/`
         // builds it and the integration tests register it as a backend. Charging it the
@@ -753,10 +772,10 @@ pub fn max_admissible_budget(total: u64) -> u64 {
     // i.e. `T >= 18 GiB` — so it reintroduced the permanent silent refusal it was written to remove,
     // for every host smaller than this one. Subtracting the reserve from both terms fixes it:
     // a 16 GiB box now bounds a budget at 9 GiB, which an idle 14.7 GiB of `MemAvailable` can admit.
-    let headroom = total.saturating_sub(DEFAULT_HOST_RESERVE_BYTES);
+    let headroom = total.saturating_sub(host_reserve_bytes());
     let bound = (total / 4 * 3)
-        .saturating_sub(DEFAULT_HOST_RESERVE_BYTES)
-        .min(headroom.saturating_sub(DEFAULT_HOST_RESERVE_BYTES));
+        .saturating_sub(host_reserve_bytes())
+        .min(headroom.saturating_sub(host_reserve_bytes()));
     // Never ZERO. A zero budget is not maximally safe, it is maximally unsafe: `can_admit`'s
     // committed term becomes `reserved + 0 + reserve <= total`, independent of the proof, so a host
     // too small to run anything would admit without limit. Floor it at the trust threshold, which is
@@ -953,7 +972,7 @@ pub fn classify_pressure(stall_pct: Option<f64>, available: u64, total: u64) -> 
     // trigger once `available` was already well below the 3 GiB that admission insists on, i.e. after
     // everything had been silently refused. On a kernel without PSI — the only case this backstop
     // exists for — that made layer 4 effectively dead.
-    let floor = (total / 10).max(DEFAULT_HOST_RESERVE_BYTES * 3 / 2);
+    let floor = (total / 10).max(host_reserve_bytes().saturating_mul(3) / 2);
     if let Some(p) = stall_pct {
         if p >= STALL_CRITICAL_PERCENT {
             return PressureState::Critical;
@@ -968,7 +987,7 @@ pub fn classify_pressure(stall_pct: Option<f64>, available: u64, total: u64) -> 
     // read as an absence of pressure, which is the direction that froze this box.
     // Critical at the reserve itself: below that, admission refuses everything anyway, so the host
     // is past braking and into losing time.
-    if available <= DEFAULT_HOST_RESERVE_BYTES.max(floor / 2) {
+    if available <= host_reserve_bytes().max(floor / 2) {
         PressureState::Critical
     } else if available <= floor {
         PressureState::Brake

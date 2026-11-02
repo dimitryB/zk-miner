@@ -24,6 +24,8 @@ macos = ["risc0-zkvm/disable-dev-mode", "dep:serde_json", "dep:sha2"]
 # Do not reference that local-only engine feature here: the unchanged Git pin
 # must still resolve for existing CPU/CUDA/ROCm builds.
 macos-metal = ["macos", "dep:risc0-zkp", "dep:metal"]
+# Build tooling also selects the local engine's native-groth16 feature.
+macos-native-wrap = ["macos"]
 cuda = ["risc0-zkvm/cuda", "risc0-groth16/cuda"]
 rocm = ["risc0-zkvm/rocm", "risc0-groth16/rocm"]
 

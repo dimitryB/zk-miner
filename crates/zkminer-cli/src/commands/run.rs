@@ -2844,6 +2844,12 @@ async fn miner_brain(
                     continue;
                 }
                 Some(backend) => {
+                    if backend == "risc0" && state.read().await.runtime_settings
+                        .po2_overrides.iter().any(|((_, b), &po2)|
+                            b == "risc0" && !(14..=24).contains(&po2)) {
+                        tracing::warn!("Skipping {} before claim: RISC0 compression requires po2 14..=24", short_id(jid));
+                        continue;
+                    }
                     // Snapshot the backend sources ONCE so `available` and `sim_mode`
                     // are computed from a single consistent view (a health flip between
                     // two separate calls could otherwise disagree).
@@ -3037,17 +3043,14 @@ async fn miner_brain(
             // Preference order: the submitter's declaration, then our own MEASUREMENT, then
             // the constant. A measured value beats the constant by ~8x in accuracy; the
             // declaration is preferred only because it is backed by the submitter's bond.
-            let estimated_cycles = if snapshot.expected_cycles > 0 {
-                snapshot.expected_cycles
-            } else if let Some(c) = measured_cycles
+            let known_cycles = if snapshot.expected_cycles > 0 {
+                Some(snapshot.expected_cycles)
+            } else { measured_cycles
                 .lock()
                 .ok()
                 .and_then(|m| m.get(&snapshot.descriptor_hash).copied())
-            {
-                c
-            } else {
-                FALLBACK_ESTIMATED_CYCLES
             };
+            let estimated_cycles = known_cycles.unwrap_or(FALLBACK_ESTIMATED_CYCLES);
 
             // Required collateral: compute from the auction formula.
             // Resolution order mirrors the contract (HemiProveBase._resolveCollateralBps):
@@ -3093,7 +3096,8 @@ async fn miner_brain(
                 min_collateral_amount, // [D6] governance floor, not adapter.min_stake
             );
 
-            let params = JobParams {
+            #[allow(unused_mut)]
+            let mut params = JobParams {
                 current_price: snapshot.current_price,
                 bonus_amount: snapshot.bonus_amount,
                 speed_premium: snapshot.speed_premium,
@@ -3121,6 +3125,17 @@ async fn miner_brain(
                 // `cost_params` through unmodified would charge the overhead term alone.
                 device_watts: None,
             };
+            #[cfg(target_os = "macos")]
+            if resolve_backend(snapshot.proof_system_id) == Some("risc0") {
+                if let Some(seconds) = benchmarks.device_benchmarks.iter()
+                    .filter(|d| d.device_id == "cpu")
+                    .filter_map(|d| d.measured_risc0_seconds(estimated_cycles))
+                    .max_by(f64::total_cmp) {
+                    // Fold fixed wrap into this job's effective rate for the
+                    // existing deadline/cost evaluator; do not amortize it away.
+                    params.throughput = estimated_cycles as f64 / seconds;
+                }
+            }
             let eval = evaluate_job(
                 &benchmarks,
                 &cost_params,
@@ -3240,6 +3255,30 @@ async fn miner_brain(
                     });
                 }
             }
+            #[cfg(target_os = "macos")]
+            if resolve_backend(snapshot.proof_system_id) == Some("risc0") {
+                let limits = zkminer_prover_protocol::macos::Risc0Limits::from_environment(
+                    std::env::var("ZKMINER_RISC0_WRAP").as_deref() == Ok("native"),
+                );
+                let compatible = limits.and_then(|limits| {
+                    limits.validate_claim(known_cycles.unwrap_or(0), None)?;
+                    Ok(limits)
+                });
+                let limits = match compatible {
+                    Ok(limits) => limits,
+                    Err(error) => {
+                        tracing::debug!("Skipping {} before claim: {error}", short_id(jid));
+                        continue;
+                    }
+                };
+                let settings = state.read().await;
+                if settings.runtime_settings.po2_overrides.iter().any(|((_, b), &po2)|
+                    b == "risc0" && (limits.validate_po2(Some(po2)).is_err() || po2 != limits.default_segment_po2)) {
+                    tracing::warn!("Skipping {} before claim: macOS claim timing requires the default segment setting", short_id(jid));
+                    continue;
+                }
+            }
+
             // A bypassed claim occupies a GPU without being committed to the model, so the
             // model then UNDER-reports that device and the planner would place a later job as
             // though the card were idle — void at depth 1, not just depth 2. Refuse to plan
@@ -4322,6 +4361,19 @@ async fn process_job_lifecycle(
             proving_timeout
         }
     };
+
+    // A GPU CPS floor is not a native CPU watchdog. Use measured fixed +
+    // cycle-scaled cost when available, otherwise retain the configured cap.
+    #[cfg(target_os = "macos")]
+    let effective_timeout = if backend == "risc0" {
+        let seconds = state.read().await.benchmark_results.as_ref()
+            .and_then(|suite| suite.device_benchmarks.iter()
+                .filter(|d| d.device_id == "cpu")
+                .filter_map(|d| d.measured_risc0_seconds(snapshot.expected_cycles))
+                .max_by(f64::total_cmp));
+        Duration::from_secs_f64(seconds.map(|s| (s * 4.0 + 30.0).max(90.0))
+            .unwrap_or(proving_timeout.as_secs_f64()).min(proving_timeout.as_secs_f64()))
+    } else { effective_timeout };
 
     // Which worker slot actually produced the proof (#16) — captured on success so
     // the miner log ties a job to the physical GPU that proved it.

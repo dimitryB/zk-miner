@@ -85,6 +85,13 @@ pub fn resolve_po2(
             // argmax would act on differences inside measurement noise, which measured
             // 5% SLOWER than the default on a 4090 — see `confident_po2_for_job`.
             if let Some(po2) = profile.confident_po2_for_job(estimated_cycles) {
+                #[cfg(target_os = "macos")]
+                if !macos_profile_po2_allowed(
+                    po2,
+                    std::env::var("ZKMINER_RISC0_WRAP").as_deref() == Ok("native"),
+                ) {
+                    return None; // Keep the selected Mac pipeline's segment setting.
+                }
                 return Some(po2);
             }
         }
@@ -92,6 +99,26 @@ pub fn resolve_po2(
 
     // Priority 3: Let the SDK choose
     None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_profile_po2_allowed(po2: u8, native: bool) -> bool {
+    po2 == if native {
+        zkminer_prover_protocol::macos::DEFAULT_NATIVE_SEGMENT_PO2
+    } else {
+        18
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    #[test]
+    fn calibration_keeps_each_mac_pipeline_at_its_measured_cap() {
+        for po2 in 13..=24 {
+            assert_eq!(super::macos_profile_po2_allowed(po2, true), po2 == 20);
+            assert_eq!(super::macos_profile_po2_allowed(po2, false), po2 == 18);
+        }
+    }
 }
 
 /// How a backend is available.

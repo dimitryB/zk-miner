@@ -22,21 +22,30 @@ ROOT = Path(__file__).resolve().parents[2]
 BASE = ROOT / "target/macos"
 
 
-def workload(name):
+def workload(name, iterations=None):
     """Expected public output is computed independently of all generated receipts."""
     if name == "fibonacci":
-        a, b = 0, 1
-        for _ in range(20):
-            a, b = b, a + b
-        return (20).to_bytes(4, "little"), a.to_bytes(8, "little").hex(), 18, 1
+        n = 20 if iterations is None else iterations
+        if not 0 <= n <= 10_000_000: raise ValueError("Fibonacci iterations must be 0..10000000")
+        mask = (1 << 64) - 1
+        def fib(k):
+            if not k: return 0, 1
+            a, b = fib(k // 2)
+            c, d = a * (2*b-a) & mask, (a*a+b*b) & mask
+            return (d, (c+d) & mask) if k & 1 else (c, d)
+        return n.to_bytes(4, "little"), fib(n)[0].to_bytes(8, "little").hex(), 18, 1
     if name == "sha256-chain":
         digest = bytes(32)
-        for i in range(10):
+        n = 10 if iterations is None else iterations
+        if not 0 <= n <= 20_000: raise ValueError("hash iterations must be 0..20000")
+        for i in range(n):
             digest = hashlib.sha256(digest + i.to_bytes(4, "little")).digest()
-        return (10).to_bytes(4, "little"), digest.hex(), 18, 1
+        return n.to_bytes(4, "little"), digest.hex(), 18, 1
     if name == "segment-boundary":
-        return ((1).to_bytes(4, "little") + (8).to_bytes(4, "little"),
-                (0x123456789ABCDEF0 + 8192).to_bytes(8, "little").hex(), 16, 5)
+        n = 8 if iterations is None else iterations
+        if not 0 <= n <= 4096: raise ValueError("boundary units must be 0..4096")
+        return ((1).to_bytes(4, "little") + n.to_bytes(4, "little"),
+                (0x123456789ABCDEF0 + n*1024).to_bytes(8, "little").hex(), 16, 5 if iterations is None else 1)
     raise ValueError("unknown workload")
 
 
@@ -54,6 +63,8 @@ def build_acceptance(attempt, env):
     before = test_sources()
     command = ["cargo", "+1.93.0", "test", "--locked", "-p", "zkminer-prover", "--test", "macos_worker",
                "--no-run", "--message-format=json", "--target-dir", str(BASE / "worker-acceptance-build")]
+    if env.get("ZKMINER_MACOS_THREAD_CASES"):
+        command += ["--features", "testing"]
     with (attempt / "test-build.jsonl").open("w") as out, (attempt / "test-build.stderr").open("w") as err:
         subprocess.run(command, cwd=ROOT, env=env, stdout=out, stderr=err, timeout=600, check=True)
     if test_sources() != before:

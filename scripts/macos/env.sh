@@ -10,4 +10,4 @@ export RUSTUP_HOME="$MACOS_MINER_DIR/target/macos/toolchain/rustup"
 export RISC0_HOME="$MACOS_MINER_DIR/target/macos/toolchain/risc0"
 export PATH="$CARGO_HOME/bin:$PATH"
 export CARGO_BUILD_JOBS=6
-export RAYON_NUM_THREADS=6
+export RAYON_NUM_THREADS="${ZKMINER_RISC0_CPU_THREADS:-${RAYON_NUM_THREADS:-18}}"
