@@ -14,7 +14,9 @@ from worker_provenance import verify_build as verify_worker, paths
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", type=Path, required=True)
-    parser.add_argument("--worker-kind", choices=["native", "native-recursion-metal"], default="native")
+    parser.add_argument("--worker-kind", choices=["native", "native-recursion-metal", "native-rv32im-metal"], default="native")
+    parser.add_argument("--segment-hal", choices=["cpu", "metal"], default="cpu")
+    parser.add_argument("--segment-check-cpu", action="store_true", help="compare every Metal constraint output with the CPU oracle on the same valid witness")
     parser.add_argument("--recursion-hal", choices=["cpu", "metal"], default="cpu")
     parser.add_argument("--recursion-cases", help="counterbalanced warm-worker comparison, e.g. cpu,metal")
     parser.add_argument("--workload", choices=["fibonacci", "sha256-chain", "segment-boundary"], default="fibonacci")
@@ -34,6 +36,9 @@ def main():
     parser.add_argument("--min-guest-cycles", type=int, default=1)
     parser.add_argument("--warmup", action="store_true", help="one extra complete proof before the measured repeats")
     args = parser.parse_args()
+    if args.segment_hal == "metal" and args.worker_kind != "native-rv32im-metal":
+        parser.error("segment Metal requires the native-rv32im-metal worker")
+    if args.segment_check_cpu and args.segment_hal != "metal":parser.error("CPU differential requires segment Metal")
     if args.recursion_cases:
         cases = args.recursion_cases.split(',')
         if args.worker_kind != "native-recursion-metal" or sorted(cases) != ["cpu", "metal"]:
@@ -67,10 +72,12 @@ def main():
                ZKMINER_RISC0_EVIDENCE_DIR=str(directory / "sidecars"),
                ZKMINER_MACOS_WORKER=str(paths(args.worker_kind)["binary"]), ZKMINER_MACOS_WORKER_KIND="native",
                RISC0_RECURSION_HAL=args.recursion_hal,
+               RISC0_SEGMENT_HAL=args.segment_hal,
+               RISC0_RV32IM_METAL_CHECK_CPU="1" if args.segment_check_cpu else "0",
                ZKMINER_MACOS_PROGRAM=str(program), ZKMINER_MACOS_VERIFIER=str(ROOT / "target/macos/verifier/release/hemi-macos-proof"),
                ZKMINER_MACOS_WORKLOAD=args.workload, ZKMINER_MACOS_INPUT=str(directory / "input.bin"),
                ZKMINER_MACOS_EXPECTED_JOURNAL_HEX=expected, ZKMINER_MACOS_PO2=str(po2),
-               ZKMINER_MACOS_MIN_SEGMENTS=str(segments), ZKMINER_MACOS_EXPECT_MODE="cpu",
+               ZKMINER_MACOS_MIN_SEGMENTS=str(segments), ZKMINER_MACOS_EXPECT_MODE=args.segment_hal,
                ZKMINER_MACOS_EVIDENCE_DIR=str(directory / "acceptance"), ZKMINER_MACOS_REPEAT=str(args.repeat + int(args.warmup)),
                ZKMINER_MACOS_WARMUP_COUNT=str(int(args.warmup)),
                ZKMINER_MACOS_PROOF_TIMEOUT_SECS=str(args.timeout_seconds),
@@ -93,7 +100,7 @@ def main():
               "iterations":args.iterations,"po2":po2,"session_guest_cycle_limit":args.session_limit,
               "proof_watchdog_seconds":args.timeout_seconds,"warmup_count":int(args.warmup),"measured_repeats":args.repeat,
               "min_guest_cycles":args.min_guest_cycles,"program_sha256":sha(program),"input_sha256":sha(directory / "input.bin")}
-    report.update(worker_kind=args.worker_kind, recursion_hal=args.recursion_hal, recursion_cases=args.recursion_cases)
+    report.update(worker_kind=args.worker_kind, segment_hal=args.segment_hal, segment_check_cpu=args.segment_check_cpu, recursion_hal=args.recursion_hal, recursion_cases=args.recursion_cases)
     if args.calibration:
         report["calibration"] = {"path":str(args.calibration), "sha256":sha(args.calibration)}
     print(directory, flush=True)

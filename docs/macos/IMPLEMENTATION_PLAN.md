@@ -1,9 +1,14 @@
 # Native macOS proving implementation plan
 
 Agreed 2026-11-01. The owner subsequently authorized committing completed
-steps 1–4 before proceeding with Poseidon2 lift/join recursion Metal. Do not push. The next priority is native Groth16 wrapping, followed immediately by a
-native macOS helper. Tune resources on that pipeline before expanding workloads
-or investing in broader Metal acceleration.
+steps 1–4 before proceeding with Poseidon2 lift/join recursion Metal. Native
+wrapping, resource tuning, workload expansion and the resident RV32IM integration
+have since passed their recorded validation. On 2026-11-02 the owner authorized
+committing and publishing all completed local work to the personal forks.
+Current engine checkpoint: `cef3559d6805769c5b33fb4040abe548e670e268`.
+Historical commit IDs remain in measurement records; see the
+[authorship map](evidence/authorship-rewrite.json) and
+[publication record](evidence/rv32im-publication.json).
 
 Progress on 2026-11-01: steps 1–4 passed. Step 3 selected 18 Rayon / 18 Go
 threads. Step 4 selected native po2 20, a configurable 64-Mi guest-cycle ceiling,
@@ -178,15 +183,42 @@ GPU dispatch counts alone are not a performance acceptance criterion.
 
 ## 6 Decide on the full RV32IM Metal port
 
-Compare measured results with the agreed 10-minute usefulness target. Proceed
-only if segment proving explains the remaining gap and the measured non-segment
-floor leaves a credible route to that target. Prioritize transforms, leaf
-hashing, constraint evaluation, witness generation, and accumulation according
-to the profile, reusing the shared-buffer infrastructure.
+The authorized resident worker integration now passes its full-proof validation:
+28 independently verified proofs, 84 tamper checks, real-witness CPU
+differentials, boundaries, explicit CPU selection and twenty-request lifecycle
+recovery. Both 10M workloads pass in single observations of 126.680/130.646
+seconds; completed-proof guarded group footprint peaked at 16.305 GiB. CPU-only
+and resident feature builds each pass their unit tests, and workload limits hold.
+The integration is included in this publication checkpoint. See
+[RV32IM_METAL_WORKER.md](RV32IM_METAL_WORKER.md).
+The next performance gate is a controlled comparison with step 5; do not infer
+the proposed whole-job 2× result from these single observations. Witness and
+accumulation remain CPU, with no cap/concurrency increase or 46M Metal claim.
 
-If the target already passes, treat a full RV32IM port as a separate scalability
-investment. If no credible route exists, retain the experimental local developer
-worker and stop expanding performance scope. Make no competitive-mining claim
+The subsequently authorized bounded evaluator prototype now passes through
+po2 20 with independent CPU differentials and buffer reuse. The isolated
+evaluator takes about 5.85 seconds on Metal versus 19.3–19.5 seconds on CPU,
+with a 13.1-GiB peak charged footprint. This supports the next shared-buffer
+circuit adapter gate, not full-port or whole-job throughput acceptance. Retain
+CPU witness/accumulation and the documented threadgroup/normalization fixes.
+See [RV32IM_METAL_PROTOTYPE.md](RV32IM_METAL_PROTOTYPE.md).
+
+Assessment completed after the step-5 checkpoints (miner `4cbfb3e`, engine
+`0515e0bde`). The original goal already passes. Two verified 10M diagnostics put
+about 51% of segment time in constraints, 31% in Merkle commitments and 11% in
+transforms; CPU witness/accumulation together are only 2–3%. Recommendation:
+a bounded evaluator/shared-buffer feasibility prototype before a full scalability
+investment, with GPU witness work deferred. A proposed 2× complete-throughput
+gate would need roughly 2.4× effective acceleration of the combined hot phases;
+this is conditional arithmetic, not measured Metal performance or a new agreed
+target. See [RV32IM_METAL_ASSESSMENT.md](RV32IM_METAL_ASSESSMENT.md). This
+assessment preceded the isolated prototype and subsequent integration above.
+
+Any follow-up port is a separate scalability investment because the agreed
+10-minute usefulness target already passes. First test the full-domain evaluator,
+then reuse shared buffers for transforms and commitments while retaining CPU
+witness generation and accumulation. Commit to a full port only after measured
+complete-proof improvement justifies the work. Make no competitive-mining claim
 from synthetic workloads.
 
 ## Validation and reporting
@@ -201,4 +233,6 @@ Run relevant non-Mac regression checks for changed feature/build paths and state
 which GPU runtime tests are unavailable. Keep current status and next actions in
 [HANDOFF.md](HANDOFF.md), measurements in [BENCHMARKS.md](BENCHMARKS.md), and raw
 large build/proof artifacts under `target/macos/`. Keep new implementation work
-local; the completed steps 1–4 checkpoint is committed at the owner’s request.
+local until explicitly authorized for publication. The owner has authorized
+publication of steps 1–6 and the validated resident worker integration to the
+personal fork branches; further implementation scope is unchanged.

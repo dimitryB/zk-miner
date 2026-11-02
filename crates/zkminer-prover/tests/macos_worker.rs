@@ -439,6 +439,23 @@ fn validate_stage(record: &Value, workload: &Workload) {
         "workload did not cover the required segment count"
     );
     let stage = &record["observed_stages"]["metal_stage"];
+    if record["segment_hal"] == "metal" {
+        assert_eq!(observed_mode(), "metal");
+        assert_eq!(record["observed_stages"]["segment"], "metal");
+        assert_eq!(record["observed_stages"]["other_segment_operations"], "metal_shared_buffers");
+        let rv = &record["observed_stages"]["rv32im_metal"];
+        assert_eq!(positive(rv, "completed_constraint_checks"), count);
+        assert_eq!(positive(rv, "cpu_witness_calls"), count);
+        assert_eq!(positive(rv, "cpu_accumulation_calls"), count);
+        assert_eq!(rv["cpu_differential_checks"], if std::env::var("RISC0_RV32IM_METAL_CHECK_CPU").as_deref() == Ok("1") { count } else { 0 });
+        assert!(positive(rv, "evaluation_points") >= count * (1 << 16));
+        assert!(positive(rv, "completed_dispatches") > count);
+        assert_eq!(rv["threads_per_threadgroup"], 32);
+        assert_eq!(rv["normalization"], "period_four_table");
+        for key in ["kernel_source_sha256", "hal_kernel_source_sha256"] { assert_eq!(rv[key].as_str().unwrap().len(), 64); }
+        assert!(stage.is_null(), "resident segment mode unexpectedly used the legacy fold-only path");
+        return;
+    }
     if observed_mode() == "cpu" {
         assert!(stage.is_null(), "CPU segment mode unexpectedly executed a Metal fold");
         return;

@@ -713,7 +713,11 @@ pub fn unmeasured_peak_for(backend: &str) -> u64 {
             // Recursion Metal's measured first-process group peak was 17.3 GiB.
             // Keep its initial budget above that peak; measured calibration
             // still applies the existing safety factor and host clamp.
-            if std::env::var("RISC0_RECURSION_HAL").as_deref() == Ok("metal") {
+            if std::env::var("RISC0_SEGMENT_HAL").as_deref() == Ok("metal") {
+                // Resident groups coexist with the evaluator's measured 8 GiB
+                // private backing. Keep admission conservative until calibrated.
+                24 * GIB
+            } else if std::env::var("RISC0_RECURSION_HAL").as_deref() == Ok("metal") {
                 20 * GIB
             } else {
                 16 * GIB

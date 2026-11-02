@@ -2,6 +2,107 @@
 
 ## Current implementation direction
 
+Resident RV32IM worker integration and full-proof validation are complete and
+recorded in this miner publication checkpoint. The engine commit is
+`cef3559d6805769c5b33fb4040abe548e670e268`. See
+[RV32IM_METAL_WORKER.md](RV32IM_METAL_WORKER.md),
+[validation JSON](evidence/rv32im-worker-validation.json),
+[proof CSV](evidence/rv32im-worker-proofs.csv) and
+[engine patch](evidence/rv32im-worker-engine.patch). The owner authorized
+committing and publishing the completed local work after correcting authorship.
+Both repositories use `dimitryB <5238240+dimitryB@users.noreply.github.com>`.
+Only the personal fork's `codex/hemi-macos-metal` branches are publication
+destinations; upstream/default branches are unchanged.
+
+Historical evidence retains its original commit IDs. The
+[authorship map](evidence/authorship-rewrite.json) maps step-5 miner `4cbfb3e`
+to `55b6d87` and engine `0515e0bde` to `1f6eb352d`, with identical source trees.
+The [publication record](evidence/rv32im-publication.json) records source/binary
+continuity through the engine commit and rebuilt seals. Reproduction uses the
+new committed engine SHA; do not replace IDs inside historical proof records.
+
+The explicit `macos-rv32im-metal` worker uses shared Metal buffers for RV32IM
+transforms/commitments/constraints and retains CPU witness/accumulation and
+native identity/Groth16. CPU segments remain the default. Runtime selection is
+`RISC0_SEGMENT_HAL=metal`, with `ZKMINER_RISC0_MODE=cpu` disabling the separate
+legacy fold-only selector and `RISC0_RECURSION_HAL=metal` retaining Metal
+lift/join. Keep thirty-two-thread evaluator groups, the four-entry normalization
+table, cap 20, one in-flight segment and all existing resource guards.
+
+The final candidate passed 28 complete proofs plus 84 negative verifier checks,
+including three real-witness CPU differentials, tiny-tail/boundary cases, CPU
+selection, two 10M workloads, twenty requests on one worker, observed-helper
+cancellation, worker watchdog, recovery and shutdown. The original verifier
+remains byte-identical. CPU-only and resident feature builds each pass five unit
+tests; workload-limit controls pass. Three preliminary proofs were excluded
+after correcting writable FFI buffer handling to pass raw pointers directly.
+
+The single 10M arithmetic/hash observations were 126.680/130.646 seconds, with
+maximum completed-proof guarded worker/helper footprint 16.305 GiB. The twenty
+tiny requests' idle footprint ranged 3.859–3.948 GiB (first 3.873, last 3.860).
+These establish the agreed usefulness goal and tested stability, not a controlled
+speedup or the proposed 2× scalability gate. A five-pair comparison against the
+committed step-5 baseline remains the next performance assessment. GPU witness,
+larger caps, overlap and 46M Metal proving remain unimplemented/unmeasured.
+
+Final worker SHA: `318676ce86d7f96f6dbff1ca111016e62d95095ffc65cb2a2ab7923b76635f04`.
+Campaign: `target/macos/rv32im-worker/campaigns/c76287bac2dc468396bf81ee6a91f8f6`.
+Archive: `target/macos/rv32im-worker/archive/final`. Worker/helper processes are
+gone; VM states are unchanged (default running, dedicated profile stopped).
+
+## Historical assessment and prototype checkpoints
+
+The owner authorized the bounded RV32IM evaluator prototype after the step-6
+assessment. Its feasibility gate now passes; see
+[RV32IM_METAL_PROTOTYPE.md](RV32IM_METAL_PROTOTYPE.md) and
+[collected evidence](evidence/rv32im-evaluator-prototype.json). Two po2-20
+synthetic datasets matched every CPU result, including reused buffers. GPU
+dispatch took about 5.85 seconds versus 19.3–19.5 seconds on CPU; peak charged
+footprint was 13.1 GiB. This is isolated evaluator performance, not a proof or
+whole-job speedup. The engine and step-5 worker remain unchanged.
+
+Retain thirty-two-thread groups and the equivalent four-entry normalization
+table. The 1,024-thread control failed with Metal out-of-memory; the original
+divergent per-cycle normalization mismatched at po2 14. Five earlier failures
+remain recorded alongside fourteen successful final-candidate commands.
+The normalization failure's compiler/driver mechanism is unconfirmed.
+Next: opt-in shared-buffer RV32IM adapter with CPU witness/accumulation, then
+complete-proof correctness, measured integrated memory and controlled latency.
+All new assessment/prototype work remains uncommitted; do not start a full
+witness port or claim the proposed whole-job 2× gate has passed.
+
+Step 5 is now committed: miner `4cbfb3e`, engine `0515e0bde`. The exact measured
+worker remained byte-identical after rebuilding/resealing at the new checkpoint.
+The owner authorized the step-6 assessment, which is complete and saved in
+[RV32IM_METAL_ASSESSMENT.md](RV32IM_METAL_ASSESSMENT.md). New assessment work
+remains uncommitted; nothing has been pushed. That assessment preceded the
+isolated prototype and subsequent worker integration recorded above.
+
+The original 10M/ten-minute goal already passes, so a full RV32IM port is a
+separate scalability investment. The two new verified verbose 10M diagnostics
+agree: segment time is approximately 51% constraints, 31% Merkle commitments,
+11% transforms and only 2–3% witness/accumulation. De-risk the full-domain Metal
+evaluator first, then integrate existing Metal transforms/hashing on shared
+buffers with CPU witness/accumulation. For a proposed 2× whole-job objective,
+the combined hot phases would need roughly 2.42–2.44× effective acceleration;
+that performance has not been demonstrated. Generic transforms/Merkle alone
+have an ideal whole-job ceiling near 1.6× on these observations.
+
+Raw diagnostics: `target/macos/step6-assessment/profile-runs/b2112a5f7787478598e5c894a16f0e91`.
+Both complete proofs passed the unchanged verifier and six negative checks.
+The diagnostic worker SHA remains `d157305ba0e0830671c6b8f6238dc68e59ae8a68dc3454865c2084c21bc347b9`.
+The source audit found no RV32IM Metal kernels, four CUDA evaluator chunks with
+20 functions, 6,332 declared scratch bytes per invocation (not a measured Metal
+allocation), and a 3.297-GiB largest evaluated DATA buffer at po2 20. Current
+committed groups/trees alone account for 6.902 GiB; measure real phase peaks
+rather than adding that to old process peaks. Retain cap 20, one in-flight
+segment and the existing memory/ownership guards for any future prototype.
+
+The assessment generator is `scripts/macos/assess-rv32im-metal.py`; its JSON and
+CSV are under `docs/macos/evidence/rv32im-metal-*`. It binds latest observations,
+current source hashes, diagnostic proofs, device limits and checkpoint
+continuity. Do not treat hypothetical speedup tables as measured performance.
+
 The owner subsequently authorized committing steps 1–4 and proceeding with
 step 5, Poseidon2 lift/join recursion Metal. The engine checkpoint is
 `98d940d4b`; the exact measured CPU worker and original build manifests were

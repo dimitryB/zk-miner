@@ -1,5 +1,69 @@
 # macOS proving measurements
 
+## Resident RV32IM worker validated 2026-11-02
+
+The candidate, uncommitted at measurement time, passed 28 complete proofs and 84 negative
+verifier checks. Twenty consecutive tiny requests completed on one worker,
+then cancellation, worker watchdog, restart/recovery proof and shutdown passed.
+Three complete proofs also compared all constraints with CPU on real witnesses.
+Explicit CPU selection, boundary/tiny-tail and workload-limit controls pass;
+CPU-only and resident worker feature builds each pass five unit tests.
+
+| Single 10M observation | Guest cycles | Segments | Complete request including external verification |
+|---|---:|---:|---:|
+| Arithmetic | 10,003,116 | 10 | 126.680 s |
+| Hashing | 10,003,440 | 10 | 130.646 s |
+
+The largest completed-proof guarded worker/helper footprint was 16.305 GiB.
+For the twenty tiny requests, idle worker footprint ranged 3.859–3.948 GiB;
+first/last were 3.873/3.860 GiB. Their median request latency was 19.212 seconds,
+with range 19.133–26.185 seconds including the first request. This is stability
+evidence on tiny jobs, not a 10M warm median or controlled speedup comparison.
+The 46M Metal stretch and proposed whole-job 2× gate remain unmeasured.
+
+See [integration report](RV32IM_METAL_WORKER.md),
+[validation JSON](evidence/rv32im-worker-validation.json) and
+[proof CSV](evidence/rv32im-worker-proofs.csv). Source and binary seals cover
+the measured engine changes; the independent verifier remains byte-identical
+to its original pinned build. Three preliminary proofs are excluded after the
+writable-FFI-pointer correction. No VM state changed and no test process remains.
+
+## Bounded RV32IM evaluator feasibility completed 2026-11-02
+
+Two complete po2-20 synthetic evaluator domains independently matched the CPU
+oracle, including output reset and reuse. Four GPU commands each produced
+16,777,216 matching field elements. Seed 19 took 5.847/5.853 seconds on Metal
+(first/reuse) versus 19.258 seconds on CPU; seed 23 took 5.845/5.848 versus
+19.469 seconds. Peak charged footprint was 13.070 GiB. These are isolated,
+fixed-order observations with synthetic field matrices, not whole-proof timings
+or controlled warm medians. Cold library/pipeline compilation of the final
+shader took 9.790/40.159 seconds; later processes used the driver cache.
+
+Seven final-candidate cases at po2 4/8/14/18/20 passed fourteen GPU commands.
+Five earlier failures remain recorded: missing operators, two maximum-threadgroup
+failures (one confirmed out-of-memory), and two original normalization mismatches.
+Retain thirty-two-thread groups and the independently checked four-entry
+normalization table. See [prototype](RV32IM_METAL_PROTOTYPE.md) and
+[bound evidence](evidence/rv32im-evaluator-prototype.json). All work is uncommitted;
+engine and verified step-5 worker inputs remain unchanged.
+
+## RV32IM port assessment completed
+
+Step-5 checkpoints are miner `4cbfb3e` and engine `0515e0bde`. Two additional
+10M verbose diagnostics, on the exact same worker binary, independently verified
+in 416.158 seconds (arithmetic) and 425.240 seconds (hashing), with six negative
+checks. These are attribution runs, not a new speedup comparison or warm median.
+
+The exclusive segment breakdown is approximately 51% constraint evaluation,
+31% Merkle commitments, 11% transforms, 2–3% witness/accumulation and 4.5% other
+protocol work. The original usefulness goal already passes. A full RV32IM port
+is a separate scalability investment; first de-risk the larger evaluator and
+shared-buffer integration. At assessment time no RV32IM Metal speedup had been
+measured and no worker integration had started. The subsequent isolated
+prototype is recorded above. See the [assessment](RV32IM_METAL_ASSESSMENT.md),
+[bound JSON](evidence/rv32im-metal-assessment.json) and
+[exclusive profile CSV](evidence/rv32im-metal-profile.csv).
+
 ## Poseidon2 lift/join recursion Metal completed 2026-11-01
 
 The opt-in native worker now proves Poseidon2 lift/join using shared Metal

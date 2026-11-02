@@ -24,10 +24,10 @@ def sha(path):
 
 
 def profile(kind):
-    if kind not in ("cpu", "metal", "native", "native-recursion-metal"):
+    if kind not in ("cpu", "metal", "native", "native-recursion-metal", "native-rv32im-metal"):
         raise ValueError("worker build kind must be cpu or metal")
     return {"cpu": "worker", "metal": "worker-metal", "native": "worker-native",
-            "native-recursion-metal": "worker-native-recursion-metal"}[kind]
+            "native-recursion-metal": "worker-native-recursion-metal", "native-rv32im-metal":"worker-native-rv32im-metal"}[kind]
 
 
 def paths(kind):
@@ -111,7 +111,7 @@ def verify_build(kind, engine, binary=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("kind", choices=["cpu", "metal", "native", "native-recursion-metal"])
+    parser.add_argument("kind", choices=["cpu", "metal", "native", "native-recursion-metal", "native-rv32im-metal"])
     parser.add_argument("--engine", type=Path, required=True)
     args = parser.parse_args()
     print(json.dumps(verify_build(args.kind, args.engine), indent=2))

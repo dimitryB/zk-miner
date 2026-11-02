@@ -1,4 +1,10 @@
-# Reproduce the local CPU and experimental hybrid paths
+# Reproduce macOS proving paths
+
+For the resident RV32IM Metal worker, use the current
+[integration and validation guide](RV32IM_METAL_WORKER.md). Its published engine
+checkpoint is `cef3559d6805769c5b33fb4040abe548e670e268`. Historical CPU/hybrid
+measurements below retain their original commit references; the
+[authorship map](evidence/authorship-rewrite.json) records their rewritten IDs.
 
 ## Native macOS wrapping
 
@@ -33,8 +39,9 @@ official URL and SHA-256. No global installation is required.
 source scripts/macos/env.sh
 export PROTOC=/Users/dbur/dev/zk-miner/target/macos/bootstrap/protoc-36.2/bin/protoc
 ENGINE_DIR=/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0
+python3 scripts/macos/local-engine.py "$ENGINE_DIR" target/macos/local-engine.toml --revision cef3559d6805769c5b33fb4040abe548e670e268
 python3 scripts/macos/build-native-wrap.py --engine "$ENGINE_DIR"
-python3 scripts/macos/build-worker.py --mode native --engine "$ENGINE_DIR" --config target/macos/local-engine.toml --revision 0d5b41e8e44876c1e8b5a8a671aabc154e33106c
+python3 scripts/macos/build-worker.py --mode native --engine "$ENGINE_DIR" --config target/macos/local-engine.toml --revision cef3559d6805769c5b33fb4040abe548e670e268
 ```
 
 The standalone witness/wrap acceptance tool uses the isolated manifest
