@@ -127,6 +127,33 @@ under `~/.cache/` (`libsycl_cache`, `neo_compiler_cache`) for every later proces
 each Intel card up with one small verified proof before its first benchmark or proof, outside their
 time limits. Discovery reads an Intel card's memory from the xe driver.
 
+**SP1 on AMD and Intel**: put `sp1-gpu-server-hip` (AMD), or `sp1-gpu-server-sycl` with its
+`sp1-gpu-server-sycl-lib/` (Intel), beside `zkminer-prove-sp1`, and those cards get SP1 slots too.
+Build them from the same hemilabs/sp1 commit as the worker, with `SP1_GPU_BACKEND=hip` and
+`HIP_ARCHS` (e.g. `gfx1100`), or `SP1_GPU_BACKEND=sycl`. The HIP server needs ROCm 7.2 or newer:
+built against Ubuntu 26.04's ROCm 7.1, its proofs on an RX 7900 XTX fail verification; against
+AMD's ROCm 10.1 they verify. Its kernels' device asserts and `printf` also need PCIe atomics
+between the card and the CPU; without them (some VM passthrough setups) a launch fails with
+"AQL dispatch failed". Where AMD's ROCm is installed beside a distribution's ROCm in `/usr`, point
+the build at it explicitly, or the compiler picks up the older HIP headers and runtime:
+
+```bash
+# In the hemilabs/sp1 checkout, with the usual SP1 build prerequisites.
+R=/opt/rocm/core-10.1
+printf 'set(CMAKE_HIP_COMPILER_ROCM_ROOT "%s")\n' "$R" > hip-rocm.cmake
+env SP1_GPU_BACKEND=hip HIP_ARCHS=gfx1100 ROCM_PATH=$R HIP_PATH=$R \
+    CMAKE_TOOLCHAIN_FILE=$PWD/hip-rocm.cmake HIPCXX=$R/lib/llvm/bin/clang++ \
+    HIPFLAGS="--hip-path=$R --rocm-path=$R -isystem $R/include" CXXFLAGS="-isystem $R/include" \
+    RUSTFLAGS="-C link-arg=-Wl,--disable-new-dtags,-rpath,$R/lib" \
+    cargo build --release -p sp1-gpu-server
+```
+
+The rpath matters: ROCm 10.1's `libamdhip64.so.7` has the same name as ROCm 7's, and without it the
+loader takes the distribution's. A card both risc0 and SP1 use takes turns: before a proof, the
+miner stops the other backend's idle worker if it holds memory the proof needs (SP1's HIP server
+keeps all but 2 GB of the card once it has proved). It reads each process's share from the
+kernel's DRM fdinfo, as it reads `nvidia-smi` on NVIDIA.
+
 If a worker needs environment the miner's own process won't have (a systemd unit or cron
 job does *not* source `~/.bashrc`), install a small wrapper script under the expected
 name that sets it up and then `exec`s the real binary — `exec` preserves the PID and

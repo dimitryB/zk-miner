@@ -653,16 +653,16 @@ const ROCM_SCRATCH_LIMIT_FALLBACK: u64 = 16 * 1024 * 1024 * 1024;
 
 /// An AMD card's total VRAM in bytes, from the amdgpu driver's sysfs entry for its PCI bus id.
 fn amd_vram_bytes(pci_bus_id: &str) -> Option<u64> {
+    amd_mem_info(pci_bus_id, "vram_total").filter(|v| *v > 0)
+}
+
+/// One of the amdgpu driver's `mem_info_<what>` sysfs figures for a card, in bytes.
+fn amd_mem_info(pci_bus_id: &str, what: &str) -> Option<u64> {
     let path = format!(
-        "/sys/bus/pci/devices/{}/mem_info_vram_total",
+        "/sys/bus/pci/devices/{}/mem_info_{what}",
         pci_bus_id.to_ascii_lowercase()
     );
-    std::fs::read_to_string(path)
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-        .filter(|v| *v > 0)
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Bounded like `gpu_vram_bytes`, but tighter: these queries run on every GPU dispatch — two or three
@@ -676,8 +676,9 @@ const FOREIGN_VRAM_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PPID_WALK: usize = 32;
 
 /// CUDA device index named by a slot key (`sp1:cuda:1` -> 1), or `None` when the key does not name
-/// one: a CPU slot, a non-CUDA vendor, or a 2-part key with no index at all. `None` disables the
-/// VRAM gate for that slot, because there is no device to query.
+/// one: a CPU slot, a non-CUDA vendor, or a 2-part key with no index at all. `nvidia-smi` cannot
+/// read such a slot's card; `read_card` reads AMD and Intel cards another way, and for anything else
+/// the VRAM gate has no device to query and stays off.
 fn slot_cuda_index(key: &str) -> Option<u32> {
     let mut parts = key.splitn(3, ':');
     let _backend = parts.next()?;
@@ -911,14 +912,35 @@ impl CardOccupancy {
         owner: impl Fn(u32) -> PidOwner,
     ) -> Self {
         const MIB: u64 = 1024 * 1024;
+        let apps: Vec<(u32, u64)> = apps
+            .iter()
+            .map(|&(pid, mib)| (pid, mib.saturating_mul(MIB)))
+            .collect();
+        Self::from_bytes(
+            used_mib.saturating_mul(MIB),
+            total_mib.saturating_mul(MIB),
+            reserved_mib.saturating_mul(MIB),
+            &apps,
+            owner,
+        )
+    }
+
+    /// As `from_readings`, from figures in bytes: what the DRM drivers report (see
+    /// `read_drm_card_occupancy`).
+    fn from_bytes(
+        used: u64,
+        total: u64,
+        reserved: u64,
+        apps: &[(u32, u64)],
+        owner: impl Fn(u32) -> PidOwner,
+    ) -> Self {
         let mut card = CardOccupancy {
-            total: total_mib.saturating_mul(MIB),
-            reserved: reserved_mib.saturating_mul(MIB),
-            used: used_mib.saturating_mul(MIB),
+            total,
+            reserved,
+            used,
             ..Default::default()
         };
-        for &(pid, mib) in apps {
-            let bytes = mib.saturating_mul(MIB);
+        for &(pid, bytes) in apps {
             match owner(pid) {
                 PidOwner::Slot(key) => {
                     let held = card.by_slot.entry(key).or_insert(0);
@@ -1078,6 +1100,138 @@ fn read_card_occupancy(
         &known,
         owner,
     ))
+}
+
+/// Read an AMD or Intel card (slot tag `rocm` or `intel`) the way `read_card_occupancy` reads an
+/// NVIDIA one. `None` when the card cannot be read: no opinion, as there.
+///
+/// Without it the gate had no opinion on these cards, so it never made room on them, and two
+/// backends sharing one could not take turns. Seen on an RX 7900 XTX: SP1's HIP server reserves
+/// the card's free memory less 2 GB as an arena at its first proof and keeps it while idle (23.3 GB
+/// of 24), so every risc0 proof after it failed `hipMalloc` until its claim was given up. On NVIDIA
+/// the gate recycles the idle SP1 worker first.
+///
+/// The card's figures come from the driver: amdgpu's `mem_info_vram_{total,used}` in sysfs, which
+/// count every context like `memory.used`; xe's memory-regions query (`discovery::intel_vram`),
+/// whose use figure the xe uapi promises to be accurate only to CAP_PERFMON (an unprivileged read of
+/// an idle Arc B580 gave 24 MiB), so there the card is taken to be at least as full as what the
+/// processes we can see hold. Each process's share comes from DRM fdinfo, `drm_vram_by_pid`.
+/// Neither driver has a `memory.reserved`.
+fn read_drm_card_occupancy(
+    gpu_tag: &str,
+    pci_bus_id: &str,
+    slot_pids: &HashMap<u32, String>,
+) -> Option<CardOccupancy> {
+    let apps = drm_vram_by_pid(std::path::Path::new("/proc"), pci_bus_id);
+    let (total, used) = match gpu_tag {
+        "rocm" => (
+            amd_vram_bytes(pci_bus_id)?,
+            amd_mem_info(pci_bus_id, "vram_used")?,
+        ),
+        "intel" => {
+            let (total, used) = crate::discovery::intel_vram(pci_bus_id)?;
+            let seen = apps
+                .iter()
+                .fold(0u64, |sum, (_, held)| sum.saturating_add(*held));
+            (total, used.max(seen))
+        }
+        _ => return None,
+    };
+    let miner = std::process::id();
+    let retired = retired_groups();
+    let owner = |pid: u32| owner_of(pid, miner, slot_pids, &retired);
+    Some(CardOccupancy::from_bytes(used, total, 0, &apps, owner))
+}
+
+/// What each process holds of one card's VRAM, in bytes, from the DRM fdinfo of the render and card
+/// nodes it has open (`<proc_root>/<pid>/fdinfo/<fd>`). amdgpu (ROCm's KFD memory included) and xe
+/// both report `drm-resident-vram*` per open DRM file, matched to the card by `drm-pdev`.
+///
+/// Only processes whose fds we may read appear: those of our own user, which every worker of ours
+/// is. Anyone else's memory stays in the card's `used` and reads as foreign, the conservative
+/// direction. A DRM file shared by several fds or processes (dup, fork) is counted once, by its
+/// `drm-client-id`, for the lowest pid holding it.
+fn drm_vram_by_pid(proc_root: &std::path::Path, pci_bus_id: &str) -> Vec<(u32, u64)> {
+    let card = pci_bus_id.to_ascii_lowercase();
+    let mut pids: Vec<u32> = std::fs::read_dir(proc_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse().ok())
+        .collect();
+    pids.sort_unstable();
+    let mut clients = HashSet::new();
+    let mut held = Vec::new();
+    for pid in pids {
+        let dir = proc_root.join(pid.to_string());
+        let Ok(fds) = std::fs::read_dir(dir.join("fd")) else {
+            continue;
+        };
+        let mut bytes = 0u64;
+        for fd in fds.flatten() {
+            if !std::fs::read_link(fd.path()).is_ok_and(|to| to.starts_with("/dev/dri/")) {
+                continue;
+            }
+            let Ok(info) = std::fs::read_to_string(dir.join("fdinfo").join(fd.file_name())) else {
+                continue;
+            };
+            if let Some((client, vram)) = parse_drm_fdinfo(&info, &card) {
+                if clients.insert(client) {
+                    bytes = bytes.saturating_add(vram);
+                }
+            }
+        }
+        if bytes > 0 {
+            held.push((pid, bytes));
+        }
+    }
+    held
+}
+
+/// `(drm-client-id, VRAM bytes)` from one DRM fdinfo, or `None` when it is for another card (or has
+/// no client id). The VRAM is the sum of the `drm-resident-vram<N>` regions (amdgpu: `vram`, xe:
+/// `vram0`, `vram1`, ...), or the older `drm-memory-vram` when no region is reported.
+fn parse_drm_fdinfo(info: &str, pci_bus_id: &str) -> Option<(u64, u64)> {
+    let (mut pdev, mut client, mut resident, mut legacy) = (None, None, None, None);
+    for line in info.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "drm-pdev" => pdev = Some(value.to_ascii_lowercase()),
+            "drm-client-id" => client = value.parse::<u64>().ok(),
+            "drm-memory-vram" => legacy = parse_drm_size(value),
+            key if key
+                .strip_prefix("drm-resident-vram")
+                .is_some_and(|region| region.bytes().all(|b| b.is_ascii_digit())) =>
+            {
+                if let Some(bytes) = parse_drm_size(value) {
+                    resident = Some(resident.unwrap_or(0u64).saturating_add(bytes));
+                }
+            }
+            _ => {}
+        }
+    }
+    if pdev.as_deref() != Some(pci_bus_id) {
+        return None;
+    }
+    Some((client?, resident.or(legacy).unwrap_or(0)))
+}
+
+/// A DRM fdinfo size: a number and an optional `KiB`/`MiB`/`GiB`, which the kernel picks as the
+/// largest unit the size is a whole multiple of.
+fn parse_drm_size(value: &str) -> Option<u64> {
+    let mut parts = value.split_whitespace();
+    let n: u64 = parts.next()?.parse().ok()?;
+    let unit: u64 = match parts.next() {
+        None => 1,
+        Some("KiB") => 1 << 10,
+        Some("MiB") => 1 << 20,
+        Some("GiB") => 1 << 30,
+        Some(_) => return None,
+    };
+    n.checked_mul(unit)
 }
 
 /// What bounds a slot's VRAM-derived sizing other than the card it is on, as the dispatcher predicts
@@ -5863,7 +6017,6 @@ impl WorkerPool {
     /// with "ours, unattributed". It is never a candidate for recycling: only same-card siblings are,
     /// because only they are behind the guard we hold.
     fn read_card(&self, key: &str) -> Option<CardOccupancy> {
-        let idx = slot_cuda_index(key)?;
         let slot_pids: HashMap<u32, String> = self
             .workers
             .iter()
@@ -5872,7 +6025,12 @@ impl WorkerPool {
                 (pid != 0).then(|| (pid, k.clone()))
             })
             .collect();
-        read_card_occupancy(idx, &slot_pids)
+        if let Some(idx) = slot_cuda_index(key) {
+            return read_card_occupancy(idx, &slot_pids);
+        }
+        let gpu_tag = key.split(':').nth(1)?;
+        let pci_bus_id = self.workers.get(key)?.pci_bus_id.as_deref()?;
+        read_drm_card_occupancy(gpu_tag, pci_bus_id, &slot_pids)
     }
 
     /// Take `entry.slot`, bounded by `give_up_at` when set. With no cutoff (benchmark/calibration, or
@@ -7971,6 +8129,119 @@ mod tests {
         assert_eq!(slot_cuda_index("risc0:cuda"), None);
         assert_eq!(slot_cuda_index("mock"), None);
         assert_eq!(slot_cuda_index("sp1:cuda:x"), None);
+    }
+
+    /// DRM fdinfo as amdgpu (Linux 7.0, an SP1 HIP server holding its arena on an RX 7900 XTX) and
+    /// xe print it: the card is matched by `drm-pdev`, sizes carry the kernel's unit, xe's regions are
+    /// numbered and summed, and an old amdgpu's `drm-memory-vram` is the fallback.
+    #[test]
+    fn drm_fdinfo_names_the_card_and_what_it_holds() {
+        let amdgpu = "pos:\t0\nflags:\t02100002\nmnt_id:\t26\nino:\t1234\n\
+                      drm-driver:\tamdgpu\ndrm-client-id:\t2212\ndrm-pdev:\t0000:08:0f.0\n\
+                      drm-total-cpu:\t3074916 KiB\ndrm-total-vram:\t23262992 KiB\n\
+                      drm-resident-vram:\t23262992 KiB\ndrm-memory-vram:\t23262992 KiB\n\
+                      drm-memory-gtt: \t8272 KiB\namd-evicted-vram:\t0 KiB\n";
+        assert_eq!(
+            parse_drm_fdinfo(amdgpu, "0000:08:0f.0"),
+            Some((2212, 23_262_992 * 1024))
+        );
+        // Another card's file holds nothing of this one.
+        assert_eq!(parse_drm_fdinfo(amdgpu, "0000:08:0d.0"), None);
+
+        let xe = "drm-driver:\txe\ndrm-client-id:\t41\ndrm-pdev:\t0000:08:0D.0\n\
+                  drm-total-system:\t0\ndrm-resident-system:\t0\n\
+                  drm-total-vram0:\t3 GiB\ndrm-resident-vram0:\t3 GiB\n\
+                  drm-resident-vram1:\t512 MiB\ndrm-resident-vram-mapped:\t7 MiB\n";
+        assert_eq!(
+            parse_drm_fdinfo(xe, "0000:08:0d.0"),
+            Some((41, (3 << 30) + (512 << 20)))
+        );
+
+        let old = "drm-driver:\tamdgpu\ndrm-client-id:\t7\ndrm-pdev:\t0000:03:00.0\n\
+                   drm-memory-vram:\t1024 KiB\n";
+        assert_eq!(parse_drm_fdinfo(old, "0000:03:00.0"), Some((7, 1 << 20)));
+        // No client id: nothing to count it once by.
+        assert_eq!(
+            parse_drm_fdinfo(
+                "drm-pdev:\t0000:03:00.0\ndrm-resident-vram:\t1 KiB\n",
+                "0000:03:00.0"
+            ),
+            None
+        );
+        assert_eq!(parse_drm_size("17"), Some(17));
+        assert_eq!(parse_drm_size("2 MiB"), Some(2 << 20));
+        assert_eq!(parse_drm_size("2 TiB"), None);
+    }
+
+    /// Against a fake `/proc`: a DRM file is counted once however many fds or processes share it,
+    /// for the lowest pid; files of other cards and fds that are not DRM nodes count nothing.
+    #[cfg(unix)]
+    #[test]
+    fn drm_vram_is_counted_once_per_drm_file() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "zkminer-drm-fdinfo-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let fdinfo = |client: u64, pdev: &str, kib: u64| {
+            format!(
+                "drm-driver:\tamdgpu\ndrm-client-id:\t{client}\ndrm-pdev:\t{pdev}\n\
+                 drm-resident-vram:\t{kib} KiB\n"
+            )
+        };
+        let card = "0000:08:0f.0";
+        // (pid, fd, link target, fdinfo)
+        let fds: Vec<(u32, u32, &str, String)> = vec![
+            // The worker: its own file, and a dup of it.
+            (300, 5, "/dev/dri/renderD128", fdinfo(10, card, 1024)),
+            (300, 6, "/dev/dri/renderD128", fdinfo(10, card, 1024)),
+            // Its server, forked with the worker's file open, plus one of its own.
+            (301, 5, "/dev/dri/renderD128", fdinfo(10, card, 1024)),
+            (301, 9, "/dev/dri/renderD128", fdinfo(11, card, 4096)),
+            // Another card, and a file that only claims to be DRM.
+            (
+                301,
+                10,
+                "/dev/dri/renderD129",
+                fdinfo(12, "0000:08:0d.0", 8192),
+            ),
+            (302, 3, "/tmp/not-a-gpu", fdinfo(13, card, 8192)),
+        ];
+        for (pid, fd, to, info) in &fds {
+            let dir = root.join(pid.to_string());
+            std::fs::create_dir_all(dir.join("fd")).unwrap();
+            std::fs::create_dir_all(dir.join("fdinfo")).unwrap();
+            symlink(to, dir.join("fd").join(fd.to_string())).unwrap();
+            std::fs::write(dir.join("fdinfo").join(fd.to_string()), info).unwrap();
+        }
+        std::fs::create_dir_all(root.join("self")).unwrap();
+        let mut held = drm_vram_by_pid(&root, "0000:08:0F.0");
+        held.sort_unstable();
+        assert_eq!(held, vec![(300, 1024 * 1024), (301, 4096 * 1024)]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The AMD reading against this host's cards, when it has any: it must find one, and agree with
+    /// the driver's own totals.
+    #[test]
+    fn the_amd_card_reading_is_sane_on_this_host() {
+        let Ok(devices) = std::fs::read_dir("/sys/bus/pci/devices") else {
+            return;
+        };
+        for device in devices.flatten() {
+            let bus = device.file_name().to_string_lossy().into_owned();
+            let Some(total) = amd_vram_bytes(&bus) else {
+                continue;
+            };
+            let card = read_drm_card_occupancy("rocm", &bus, &HashMap::new())
+                .unwrap_or_else(|| panic!("{bus} has amdgpu VRAM figures but reads as unreadable"));
+            assert_eq!(card.total, total);
+            assert!(card.used <= card.total, "{bus}: {card:?}");
+            // Nothing is a slot's here, so whatever of ours is on the card is unattributed.
+            assert!(card.by_slot.is_empty(), "{bus}: {card:?}");
+        }
     }
 
     /// The parent walk against the REAL `/proc`: a child of ours is attributed to the slot whose pid
