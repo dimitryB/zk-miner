@@ -500,6 +500,9 @@ struct Measured {
     /// same lock hold, or none. `Some` only for a real measurement whose worker reported the whole
     /// journal; `None` for every infeasible verdict.
     journal: Option<std::sync::Arc<[u8]>>,
+    /// How long the measuring execute took, in whole seconds rounded up; 0 for a verdict, or not
+    /// known. In this entry so it co-evicts with `cycles`: see [`execute_allowance_secs`].
+    execute_secs: u64,
 }
 
 /// A resolved measurement's journal, with the keccak of the input it was executed on.
@@ -786,15 +789,16 @@ fn insert_measured(
             retry_after: None,
             verified_elf_hash: None,
             journal: None,
+            execute_secs: 0,
         },
     );
 }
 
 /// Insert a real measurement: its cycle count, the execute's peak host footprint, and — for risc0 —
-/// the keccak of the image-id-verified ELF, and the journal, stored in ONE value so they co-evict
-/// (finding C-8 and the independent-eviction residual). Expires only without a journal
-/// (`MEASURED_NO_JOURNAL_TTL`). `verified_elf_hash` is `Some` only for a real risc0 measurement; pass
-/// `None` for SP1 and for callers without a verified hash.
+/// the keccak of the image-id-verified ELF, the journal and how long the execute took (0: not
+/// known), stored in ONE value so they co-evict (finding C-8 and the independent-eviction residual).
+/// Expires only without a journal (`MEASURED_NO_JOURNAL_TTL`). `verified_elf_hash` is `Some` only for
+/// a real risc0 measurement; pass `None` for SP1 and for callers without a verified hash.
 #[allow(clippy::too_many_arguments)]
 fn insert_measurement(
     cache: &MeasuredCache,
@@ -805,6 +809,7 @@ fn insert_measurement(
     peak_host_bytes: u64,
     verified_elf_hash: Option<alloy::primitives::B256>,
     journal: Option<std::sync::Arc<[u8]>>,
+    execute_secs: u64,
 ) {
     insert_measured_value(
         cache,
@@ -819,6 +824,7 @@ fn insert_measurement(
                 .then(|| std::time::Instant::now() + MEASURED_NO_JOURNAL_TTL),
             verified_elf_hash,
             journal,
+            execute_secs,
         },
     );
 }
@@ -846,6 +852,7 @@ fn insert_unmeasurable(
             retry_after: Some(std::time::Instant::now() + UNMEASURABLE_RETRY_TTL),
             verified_elf_hash: None,
             journal: None,
+            execute_secs: 0,
         },
     );
 }
@@ -2046,14 +2053,14 @@ fn resolve_measured_peak(
 /// so a concurrent cache eviction cannot drop the entry between a cycles read and a peak read and
 /// desync the peak to 0 (which would silently un-gate the H1 claim check). Applies the UNMEASURABLE
 /// TTL exactly as [`resolve_measured`]: an expired entry is removed and `None` returned so the pair is
-/// re-measured. Returns `(cycles, peak_host_bytes, journal)`.
+/// re-measured. Returns `(cycles, peak_host_bytes, journal, execute_secs)`.
 fn resolve_measured_full(
     measured: &MeasuredCache,
     desc_input: &DescInputCache,
     backend: &str,
     program_id: alloy::primitives::B256,
     descriptor_hash: alloy::primitives::B256,
-) -> Option<(u64, u64, MeasuredJournal)> {
+) -> Option<(u64, u64, MeasuredJournal, u64)> {
     let input_hash = desc_input.lock().ok()?.get(&descriptor_hash)?.input_hash;
     let key = (backend_tag(backend), program_id, input_hash);
     let mut m = measured.lock().ok()?;
@@ -2068,6 +2075,7 @@ fn resolve_measured_full(
         entry.cycles,
         entry.peak_host_bytes,
         entry.journal.map(|j| (input_hash, j)),
+        entry.execute_secs,
     ))
 }
 
@@ -2076,14 +2084,14 @@ fn resolve_measured_full(
 /// measurement the claim rides. Because the hash lives in the SAME merged entry as `cycles`, a claim
 /// that resolves a measurement here ALWAYS gets that measurement's verified hash (or `None` for a
 /// risc0 program never measured as a real binding, or SP1). Applies the UNMEASURABLE TTL exactly as
-/// [`resolve_measured`]. Returns `(cycles, verified_elf_hash, journal)`.
+/// [`resolve_measured`]. Returns `(cycles, verified_elf_hash, journal, execute_secs)`.
 fn resolve_measured_with_hash(
     measured: &MeasuredCache,
     desc_input: &DescInputCache,
     backend: &str,
     program_id: alloy::primitives::B256,
     descriptor_hash: alloy::primitives::B256,
-) -> Option<(u64, Option<alloy::primitives::B256>, MeasuredJournal)> {
+) -> Option<(u64, Option<alloy::primitives::B256>, MeasuredJournal, u64)> {
     let input_hash = desc_input.lock().ok()?.get(&descriptor_hash)?.input_hash;
     let key = (backend_tag(backend), program_id, input_hash);
     let mut m = measured.lock().ok()?;
@@ -2098,6 +2106,7 @@ fn resolve_measured_with_hash(
         entry.cycles,
         entry.verified_elf_hash,
         entry.journal.map(|j| (input_hash, j)),
+        entry.execute_secs,
     ))
 }
 
@@ -4019,6 +4028,20 @@ fn fixed_proving_allowance_secs(backend: &str) -> u64 {
     }
 }
 
+/// Seconds of a risc0 proof's budget for executing its guest, from how long the measuring execute
+/// took. A proof executes the guest again before proving it and replays each segment's execution in
+/// its preflight: about twice the measurement, and half again for a busier host. A guest can make
+/// execution slow out of all proportion to its cycles (a bigint2 ecall's verify arithmetic, its
+/// nondet program), which sizing on cycles alone misses: its proof was killed by the watchdog, or
+/// claimed into a window it could not fit. 0 without a measurement, and for other backends.
+fn execute_allowance_secs(backend: &str, measured_execute_secs: Option<u64>) -> u64 {
+    if backend == zkminer_prover_protocol::BACKEND_RISC0 {
+        measured_execute_secs.unwrap_or(0).saturating_mul(3)
+    } else {
+        0
+    }
+}
+
 /// Warms SP1 up in the background until it succeeds (see `WorkerPool::warm_up`): installs its
 /// Groth16 circuit artifacts and, where its server supports it, builds the stripped circuit, before
 /// its first proof rather than inside it. A failure (a network error, the host short of memory just
@@ -5256,28 +5279,6 @@ async fn miner_brain(
             // Watch-only locks nothing, so take off what its would-be claims would have locked.
             .saturating_sub(watch_locked_collateral());
 
-        // Worst-case risc0 po2 an operator `po2_overrides` entry forces this tick, so the CLAIM
-        // gate reserves the SAME host RAM the PROVE gate will. Host memory roughly DOUBLES per po2
-        // step (see `expected_host_peak_at_po2`), while the per-backend peak the claim gate reads is
-        // po2-BLIND. Without this a risc0 job fits the (baseline-po2) claim gate, is bonded, then can
-        // NEVER be admitted to prove at the override po2 (`can_admit`'s committed term is
-        // unsatisfiable at any free-memory level — raising `available` or preempting cannot lower the
-        // requested figure), so it burns the deadline as HostMemoryShortage and releases at a
-        // penalty. Reserving at the override po2 makes such a job fail the claim gate instead (free),
-        // not a release penalty. `None` (no risc0 override) leaves the figure at the baseline, so a
-        // box with no override is unaffected — no over-block. (The dynamic calibration path — a
-        // confident per-device po2 pick > baseline — is not reflected here; it is VRAM-bounded and,
-        // per `confident_po2_for_job`, rarely fires, so it remains a documented residual.)
-        let max_risc0_override_po2: Option<u8> = {
-            let s = state.read().await;
-            s.runtime_settings
-                .po2_overrides
-                .iter()
-                .filter(|((_, backend), _)| backend == "risc0")
-                .map(|(_, po2)| *po2)
-                .max()
-        };
-
         // Highest-priced open jobs first; skip any already in flight. Cheap local verdicts are applied
         // BEFORE the status read, and the read is bounded to the top MAX_CANDIDATES_PER_TICK: the brain
         // reads views in 25-job chunks through the shared 4 req/s throttle, so an unbounded read of a
@@ -5658,12 +5659,13 @@ async fn miner_brain(
                     }
                     if !sim_mode {
                         if let Some(pool) = zkminer_prover::engine::worker_pool() {
-                            // Reserve for the po2 the PROVE gate will actually use, not the
-                            // po2-blind baseline — otherwise a risc0 job under an operator po2
-                            // override is claimed here but can never be admitted to prove, and
-                            // releases at a penalty (see `max_risc0_override_po2`).
+                            // Reserve for the po2 the PROVE gate will use (`RISC0_SEGMENT_PO2`, every
+                            // risc0 job's), so a job claimed here is one it can admit.
                             let want = if backend == "risc0" {
-                                pool.expected_host_peak_at_po2(backend, max_risc0_override_po2)
+                                pool.expected_host_peak_at_po2(
+                                    backend,
+                                    Some(zkminer_prover_protocol::RISC0_SEGMENT_PO2),
+                                )
                             } else {
                                 pool.expected_host_peak(backend)
                             };
@@ -5803,7 +5805,8 @@ async fn miner_brain(
             // it will truly have — closing the optimistic-full-window gap that led to admitted-then-
             // doomed claims (claim → watchdog kill → penalized release). The size-independent
             // `min_deadline_floor` gate above already guarantees time_remaining ≥ min_attempt
-            // + fixed_allowance + fulfill, so this stays ≥ MIN_ATTEMPT_BUDGET_SECS (never 0) here.
+            // + fixed_allowance + fulfill, so this stays ≥ MIN_ATTEMPT_BUDGET_SECS (never 0) here,
+            // before the measurement's execute allowance comes off it below.
             let prove_window = time_remaining.saturating_sub(
                 DEADLINE_FULFILL_MARGIN_SECS
                     + backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0),
@@ -5820,8 +5823,9 @@ async fn miner_brain(
                     job.info.program_id,
                     snapshot.descriptor_hash,
                 ) {
-                    Some((cycles, peak, journal)) => {
+                    Some((cycles, peak, journal, execute_secs)) => {
                         snapshot.measured_journal = journal;
+                        snapshot.measured_execute_secs = Some(execute_secs);
                         (Some(cycles), Some(peak))
                     }
                     None => (None, None),
@@ -5839,11 +5843,12 @@ async fn miner_brain(
                     job.info.program_id,
                     snapshot.descriptor_hash,
                 ) {
-                    Some((cycles, hash, journal)) => {
+                    Some((cycles, hash, journal, execute_secs)) => {
                         snapshot.verified_elf_hash = hash;
                         // The journal the lifecycle checks a bound job's binding against before the
                         // claim, from the same entry as the cycles.
                         snapshot.measured_journal = journal;
+                        snapshot.measured_execute_secs = Some(execute_secs);
                         (Some(cycles), None)
                     }
                     None => (None, None),
@@ -5855,6 +5860,11 @@ async fn miner_brain(
             snapshot.measured_cycles = measured_for_job;
             // The execute PEAK (same merged entry) for the RH2 prove reservation; carried on the snapshot.
             snapshot.measured_peak = measured_peak_for_job;
+            // The proof executes the guest again, which its cycles do not size: out of the window,
+            // into the watchdog gate and the planner's backlog below.
+            let execute_allowance =
+                execute_allowance_secs(backend_opt.unwrap_or(""), snapshot.measured_execute_secs);
+            let prove_window = prove_window.saturating_sub(execute_allowance);
 
             // H1 provability gate (SP1 only). A guest measured feasible on the SERVER-LESS measure
             // worker can still OOM at PROVE time, where `run_proof` replays the same deterministic
@@ -6160,7 +6170,8 @@ async fn miner_brain(
             if let Some(cycles) = measured_for_job {
                 if slowest_eligible > 0.0 {
                     let est_secs = (cycles as f64 / slowest_eligible) * deadline_safety_margin
-                        + backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0) as f64;
+                        + backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0) as f64
+                        + execute_allowance as f64;
                     if est_secs >= proving_timeout.as_secs_f64() {
                         tracing::debug!(
                             "Skipping {}: measured {cycles} cycles need ~{est_secs:.0}s, over the {}s \
@@ -6431,13 +6442,16 @@ async fn miner_brain(
                     // jobs shed k seconds of modelled backlog per wall second, so the
                     // planner's one invariant — feasible from the start it would actually get
                     // — was void at any depth >= 2, i.e. the feature's own steady state.
-                    queue_model.commit(jid.0, &a.device_id, a.finishes_in);
+                    // Its execute allowance too, which the planner's cycle estimate leaves out (its
+                    // window had it taken off): a later job queues behind all of it.
+                    let finishes_in = a.finishes_in + Duration::from_secs(execute_allowance);
+                    queue_model.commit(jid.0, &a.device_id, finishes_in);
                     // Prefer the planner's per-device, backlog-aware device over the fastest-eligible
                     // hint set above; dispatch tries it first, with the same graceful fallback.
                     snapshot.preferred_device = Some(a.device_id.clone());
                     // Queued behind others, the job is done when the planner says, not one proof
                     // from now: watch-only holds its would-be claim that long.
-                    snapshot.estimated_prove_secs = Some(a.finishes_in.as_secs());
+                    snapshot.estimated_prove_secs = Some(finishes_in.as_secs());
                 }
                 reserved_this_tick = reserved_this_tick.saturating_add(required_collateral);
                 available_collateral = available_collateral.saturating_sub(required_collateral);
@@ -6735,6 +6749,10 @@ struct JobStatusSnapshot {
     /// same cache entry as `measured_cycles`. The lifecycle checks a journal-bound job's binding
     /// against it before claiming. `None` on recovery and wherever no whole journal was measured.
     measured_journal: MeasuredJournal,
+    /// How long this (program, input)'s measuring execute took, in whole seconds, from the same
+    /// cache entry as `measured_cycles`. The prove path's watchdog and the claim's window allow for
+    /// it (see [`execute_allowance_secs`]). `None` without a measurement.
+    measured_execute_secs: Option<u64>,
     /// How long the claim gate estimated this job's proof to take, when it evaluated it. A
     /// watch-only "would claim" holds its slot and collateral this long, as a real one would.
     estimated_prove_secs: Option<u64>,
@@ -6770,6 +6788,7 @@ impl JobStatusSnapshot {
             preferred_device: None,
             verified_elf_hash: None,
             measured_journal: None,
+            measured_execute_secs: None,
             estimated_prove_secs: None,
             current_bidder: v.currentBidder,
             bid_deadline: u64::try_from(v.bidDeadline).unwrap_or(u64::MAX),
@@ -7261,7 +7280,7 @@ async fn watch_inspect(
             format!("{head}: its fulfil payload would exceed the cap"),
         );
     }
-    let Some((cycles, _, journal)) = resolve() else {
+    let Some((cycles, _, journal, _)) = resolve() else {
         return if job_is_undecodable(job_id) {
             Inspected::Done(
                 "dropped at measure",
@@ -8236,7 +8255,8 @@ async fn process_job_lifecycle(
         // Only a MEASURED job is tightened: a recovered lock carries no measurement, and a small
         // declared count (or the floor) would kill a long proof on every attempt.
         if sizing_cycles > 0 && snapshot.measured_cycles.is_some() {
-            let fixed = fixed_proving_allowance_secs(backend);
+            let fixed = fixed_proving_allowance_secs(backend)
+                + execute_allowance_secs(backend, snapshot.measured_execute_secs);
             let est = (sizing_cycles / CONSERVATIVE_CPS * TIMEOUT_MARGIN).saturating_add(fixed);
             Duration::from_secs(est.clamp((MIN_PROVING_TIMEOUT_SECS + fixed).min(cap), cap))
         } else {
@@ -8329,33 +8349,11 @@ async fn process_job_lifecycle(
                 .then(|| program_id.0);
             let mv = min_vram;
             let excl = excluded.clone();
-            // Per-device segment size (po2). Snapshot the inputs here, then build the
-            // resolver INSIDE the blocking closure — the dispatcher only knows which
-            // GPU it picked after VRAM/availability filtering, so po2 cannot be chosen
-            // up front. With no calibration samples `Po2Profile::from_device_benchmark`
-            // returns None and `resolve_po2` yields None, i.e. the SDK keeps choosing —
-            // exactly the behaviour before this was wired up.
-            let (po2_overrides, cached_bench) = {
-                let s = state.read().await;
-                (
-                    s.runtime_settings.po2_overrides.clone(),
-                    s.benchmark_results.clone(),
-                )
-            };
-            // Mirror the evaluator's estimate (run.rs eval path): trust on-chain
-            // `expectedCycles`, else the conservative fallback. Using the raw field
-            // would leave this 0 for every job whose submitter sends CycleConfig
-            // zeroed — which is ALL jobs from `testnet_submitter_cast.sh` — and
-            // `resolve_po2` requires `estimated_cycles > 0`, so po2 selection would
-            // silently never engage. Note `optimal_po2_for_job` is argmax(throughput)
-            // and therefore independent of the magnitude; the value only has to be
-            // non-zero to enable selection.
-            // Size po2 on the measured count too, not the declared field.
-            let est_cycles = if sizing_cycles > 0 {
-                sizing_cycles
-            } else {
-                FALLBACK_ESTIMATED_CYCLES
-            };
+            // A risc0 job proves at the segment size it was measured at, on any card: the guest can
+            // tell the size it runs at, so a calibrated pick or an override (or the SDK's own) could
+            // run it otherwise than the measurement did. See `RISC0_SEGMENT_PO2`.
+            let job_po2 = (backend == zkminer_prover_protocol::BACKEND_RISC0)
+                .then_some(zkminer_prover_protocol::RISC0_SEGMENT_PO2);
             // Cloned for the progress callback below, which runs on the blocking thread.
             let state_for_prove_progress = state.clone();
             // Cloned per attempt: the closure below moves into `spawn_blocking`, and the retry loop
@@ -8373,24 +8371,6 @@ async fn process_job_lifecycle(
             // by value into the move closure.
             let execute_peak_for_prove = snapshot.measured_peak.unwrap_or(0);
             let (proof_result, used_slot) = match tokio::task::spawn_blocking(move || {
-                let resolve_backend = backend_str.clone();
-                let po2_for_device = move |device_id: &str| -> Option<u8> {
-                    let profile = cached_bench
-                        .as_ref()
-                        .and_then(|suite| {
-                            suite.device_benchmarks.iter().find(|d| {
-                                d.device_id == device_id && d.prover_backend == resolve_backend
-                            })
-                        })
-                        .and_then(zkminer_prover::benchmark::Po2Profile::from_device_benchmark);
-                    zkminer_prover::engine::resolve_po2(
-                        device_id,
-                        &resolve_backend,
-                        est_cycles,
-                        &po2_overrides,
-                        profile.as_ref(),
-                    )
-                };
                 let mut used = None;
                 // Flip Queued -> Proving the moment the dispatcher actually starts
                 // work. Until now `on_progress` was unused and the status was set to
@@ -8447,7 +8427,7 @@ async fn process_job_lifecycle(
                     &backend_str,
                     &elf_clone,
                     &input_clone,
-                    None,
+                    job_po2,
                     Some(effective_timeout),
                     Some(Box::new(mark_started)),
                     mv,
@@ -8455,7 +8435,7 @@ async fn process_job_lifecycle(
                     &disabled_for_prove,
                     &mut used,
                     abort_at,
-                    Some(&po2_for_device),
+                    None,
                     program_id_bytes,
                     preferred_for_prove.as_deref(),
                     execute_peak_for_prove,
@@ -9918,6 +9898,7 @@ async fn measure_cycles(
                 journal_len,
                 journal,
                 peak_host_bytes,
+                duration_secs,
             } = measurement;
             if paces_claims {
                 clear_preclaim_strikes(job_id);
@@ -9994,6 +9975,7 @@ async fn measure_cycles(
                     peak_host_bytes,
                     elf_keccak,
                     measured_journal.as_ref().map(|(_, j)| j.clone()),
+                    duration_secs.max(0.0).ceil() as u64,
                 );
                 clear_measure_strikes(measure_strikes, backend, program_id, input_hash);
                 drop_if_measured_binding_fails(
@@ -12794,7 +12776,7 @@ mod r2_sizing_tests {
 
         // A real measurement stores cycles AND peak in one value.
         const PEAK: u64 = 9 * 1024 * 1024 * 1024;
-        insert_measurement(&measured, "sp1", prog, ih, 5_000, PEAK, None, None);
+        insert_measurement(&measured, "sp1", prog, ih, 5_000, PEAK, None, None, 0);
         assert_eq!(
             resolve_measured(&measured, &desc_input, "sp1", prog, desc),
             Some(5_000)
@@ -12838,12 +12820,13 @@ mod r2_sizing_tests {
             0,
             Some(elf_keccak),
             None,
+            0,
         );
 
         // The hash rides out of the SAME resolve that makes the job claimable.
         assert_eq!(
             resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc),
-            Some((42_000, Some(elf_keccak), None)),
+            Some((42_000, Some(elf_keccak), None, 0)),
             "a claim resolving this measurement must receive its verified ELF hash"
         );
         // And the plain cycle resolve is unchanged.
@@ -12862,10 +12845,10 @@ mod r2_sizing_tests {
         insert_desc_input(&desc_input, desc, ih);
 
         // SP1 carries no co-stored hash (it is bound by the registry elf_hash instead).
-        insert_measurement(&measured, "sp1", prog, ih, 5_000, 7, None, None);
+        insert_measurement(&measured, "sp1", prog, ih, 5_000, 7, None, None, 0);
         assert_eq!(
             resolve_measured_with_hash(&measured, &desc_input, "sp1", prog, desc),
-            Some((5_000, None, None))
+            Some((5_000, None, None, 0))
         );
 
         // A deterministic infeasible verdict (and the cycle-only insert path) carries no hash.
@@ -12875,7 +12858,7 @@ mod r2_sizing_tests {
         insert_measured(&measured, "risc0", prog, ih2, UNMEASURABLE_CYCLES);
         assert_eq!(
             resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc2),
-            Some((UNMEASURABLE_CYCLES, None, None))
+            Some((UNMEASURABLE_CYCLES, None, None, 0))
         );
     }
 
@@ -12898,12 +12881,13 @@ mod r2_sizing_tests {
             0,
             Some(keccak256(b"old")),
             None,
+            0,
         );
         // A subsequent cycle-only write (e.g. an UNMEASURABLE verdict) replaces the merged entry.
         insert_measured(&measured, "risc0", prog, ih, UNMEASURABLE_CYCLES);
         assert_eq!(
             resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc),
-            Some((UNMEASURABLE_CYCLES, None, None)),
+            Some((UNMEASURABLE_CYCLES, None, None, 0)),
             "the hash must follow the entry, not be stranded"
         );
     }
@@ -12927,10 +12911,11 @@ mod r2_sizing_tests {
             0,
             None,
             Some(journal.clone()),
+            7,
         );
         assert_eq!(
             resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc),
-            Some((9_000, None, Some((ih, journal.clone()))))
+            Some((9_000, None, Some((ih, journal.clone())), 7))
         );
         insert_measurement(
             &measured,
@@ -12941,17 +12926,28 @@ mod r2_sizing_tests {
             5,
             None,
             Some(journal.clone()),
+            0,
         );
         assert_eq!(
             resolve_measured_full(&measured, &desc_input, "sp1", prog, desc),
-            Some((8_000, 5, Some((ih, journal))))
+            Some((8_000, 5, Some((ih, journal)), 0))
         );
         // An infeasible verdict replaces the entry, journal and all.
         insert_measured(&measured, "risc0", prog, ih, UNMEASURABLE_CYCLES);
         assert_eq!(
             resolve_measured_with_hash(&measured, &desc_input, "risc0", prog, desc),
-            Some((UNMEASURABLE_CYCLES, None, None))
+            Some((UNMEASURABLE_CYCLES, None, None, 0))
         );
+    }
+
+    // A risc0 proof executes its guest again: its budget allows three times the measurement for it,
+    // whatever the guest's cycles say. Other backends, and a job with no measurement, get none.
+    #[test]
+    fn the_execute_allowance_is_three_measurements_for_risc0_only() {
+        assert_eq!(execute_allowance_secs("risc0", Some(40)), 120);
+        assert_eq!(execute_allowance_secs("risc0", None), 0);
+        assert_eq!(execute_allowance_secs("sp1", Some(40)), 0);
+        assert_eq!(execute_allowance_secs("risc0", Some(u64::MAX)), u64::MAX);
     }
 
     // Journals of up to 32 KiB in 100k entries would hold ~3 GiB: the cache evicts other entries past
@@ -12975,6 +12971,7 @@ mod r2_sizing_tests {
                     0,
                     None,
                     Some(small.clone()),
+                    0,
                 ),
                 1 => insert_measurement(
                     &measured,
@@ -12985,6 +12982,7 @@ mod r2_sizing_tests {
                     0,
                     None,
                     Some(empty.clone()),
+                    0,
                 ),
                 _ => insert_measured(&measured, "risc0", prog, *ih, UNMEASURABLE_CYCLES),
             }
@@ -13003,6 +13001,7 @@ mod r2_sizing_tests {
                 0,
                 None,
                 Some(journal.clone()),
+                0,
             );
         }
         let m = measured.lock().unwrap();
@@ -13034,7 +13033,7 @@ mod r2_sizing_tests {
         let desc = B256::repeat_byte(0xF5);
         let ih = keccak256(b"no-journal");
         insert_desc_input(&desc_input, desc, ih);
-        insert_measurement(&measured, "risc0", prog, ih, 4_000, 0, None, None);
+        insert_measurement(&measured, "risc0", prog, ih, 4_000, 0, None, None, 0);
         let key = (backend_tag("risc0"), prog, ih);
         let until = measured.lock().unwrap()[&key]
             .retry_after
@@ -13065,6 +13064,7 @@ mod r2_sizing_tests {
             0,
             None,
             Some(std::sync::Arc::from(&b"j"[..])),
+            0,
         );
         assert!(measured.lock().unwrap()[&key].retry_after.is_none());
     }
@@ -13223,6 +13223,7 @@ mod r2_sizing_tests {
                 retry_after: Some(std::time::Instant::now() - Duration::from_secs(1)),
                 verified_elf_hash: None,
                 journal: None,
+                execute_secs: 0,
             },
         );
         assert_eq!(

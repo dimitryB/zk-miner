@@ -85,11 +85,19 @@ zkminer-config = { path = "crates/zkminer-config" }
 
 # Patch risc0 crates to use hemilabs fork (AMD + NVIDIA GPU support)
 #
-# Pinned by REV to branch `zkminer/deterministic-sys-rand` @ ae6a85560: `release-3.0` @ 46e8e20d (through
-# hemilabs/risc0 #25) plus two commits zk-miner needs on top of it:
+# Pinned by REV to branch `zkminer/measure-matches-prove` @ d7847647c (on `zkminer/deterministic-sys-rand`
+# @ ae6a85560): `release-3.0` @ 46e8e20d (through hemilabs/risc0 #25) plus the commits zk-miner needs on
+# top of it, all so that the risc0 worker's pre-claim measurement executes a guest exactly as its proof
+# will (a guest that measures clean must not fail every proof, after the claim):
 # - `ExecutorEnv::random_seed`, which answers the guest's `sys_rand` from a seed instead of fresh host
-#   entropy, so the risc0 worker's pre-claim measurement and its proof run a guest identically (see
-#   `sys_rand_seed` in crates/zkminer-prove-risc0);
+#   entropy (see `sys_rand_seed` in crates/zkminer-prove-risc0);
+# - execution runs a bigint2 ecall's verify program as the prover's preflight does (its checks, memory
+#   writes and cycle count), where it used to trust the program's declared size, in exact arithmetic,
+#   with the circuit's address checks and a bound on its work;
+# - execution refuses a guest that halts with an output digest other than its journal's and
+#   assumptions' (which the prover proves);
+# - execution refuses what no proof can verify: sys_poseidon2, encodings the circuit does not decode,
+#   misaligned sha2 pointers, traps, host writes, a misaligned pc and an out-of-reach bigint offset;
 # - nttq's L2 `discard` compiled out below sm_80, without which the sm_75 target in Dockerfile.build and
 #   build-windows.yml fails in ptxas.
 # release-3.0 is upstream v3.0.6 plus the Intel port (#11, #25) and the GPU work zk-miner runs on: the
@@ -106,23 +114,23 @@ zkminer-config = { path = "crates/zkminer-config" }
 # A rev and not a branch for the reason given on `sppark` below: a branch pin follows a moved head on
 # the next `cargo update` without anyone choosing to.
 [patch.crates-io]
-risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
-risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "ae6a85560" }
+risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
+risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "d7847647c6bd76ef1dbe6683b54daa6d21289ffe" }
 # Pinned by immutable REV, not a branch: a branch head can silently move the build
 # off a validated commit (which is why the risc0/sp1 patches below carry a
 # do-not-cargo-update warning). 725d3af = hemilabs/risc0-sppark main after #7: #5's

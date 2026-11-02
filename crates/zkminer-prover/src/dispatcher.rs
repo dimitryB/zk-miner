@@ -75,6 +75,8 @@ pub struct ExecuteMeasurement {
     pub journal: Option<Vec<u8>>,
     /// Peak host RSS of the execute (0 = unknown).
     pub peak_host_bytes: u64,
+    /// How long the execute took, in seconds: what a proof spends executing the guest again.
+    pub duration_secs: f64,
 }
 
 /// The journal an `ExecuteResult` reported, if it is the whole journal `journal_len` describes. The
@@ -3987,6 +3989,7 @@ impl WorkerPool {
                     journal_len,
                     journal: whole_journal(journal, journal_len),
                     peak_host_bytes,
+                    duration_secs,
                 })
             }
             WorkerResponse::Error { message, .. } => {

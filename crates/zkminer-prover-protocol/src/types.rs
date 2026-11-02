@@ -16,7 +16,18 @@ use serde::{Deserialize, Serialize};
 /// the keccak proofs), the `sys_rand` seed hashes the image id and the key comes from the miner. A
 /// v7 risc0 worker would measure in other units and seed guests differently from a v8 one proving
 /// the same job, so the handshake refuses it.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// 9: no new field, a new meaning: a risc0 worker measures and proves a job at `RISC0_SEGMENT_PO2`,
+/// refuses a job proof at any other, and executes with risc0's refusals of guests no proof of which
+/// can verify. A v8 worker would measure such a guest clean, and a v9 one refuses the po2 a v8 host
+/// may send.
+pub const PROTOCOL_VERSION: u32 = 9;
+
+/// The segment size (po2) a risc0 worker both measures a job at and proves it at. A guest can tell
+/// the size it runs at: every split leaves the pc it suspended at in memory the guest can read (its
+/// own kernel, or a copy through the sha ecall). So a measurement at one size says nothing about a
+/// proof at another, where one that measured clean could exit, or commit, otherwise. Neither a
+/// calibrated pick nor an override, nor the SDK's own choice (21 on a 32 GB card), applies to a job.
+pub const RISC0_SEGMENT_PO2: u8 = 20;
 
 /// The longest journal an `ExecuteResult` carries. The router refuses a longer one on every fulfil
 /// path (`MAX_JOURNAL_BYTES`, `JournalTooLarge`), so a longer journal is reported by its length alone.

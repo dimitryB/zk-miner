@@ -147,7 +147,7 @@ export ZKMINER_PRIVATE_KEY=0x...
 
 zkminer status                # balance, stake, collateral, job stats
 zkminer benchmark             # measure real per-GPU proving throughput
-zkminer benchmark --calibrate # also measure segment size (po2); saves benchmarks.json
+zkminer benchmark --calibrate # also time each segment size (po2); saves benchmarks.json
 zkminer run                   # interactive TUI
 zkminer -v run --headless     # headless; -v shows per-job claim/skip reasoning
 zkminer run --watch-only      # watch the market; claim, sign and send nothing
@@ -211,9 +211,10 @@ Worth knowing:
 - **Rebuild every worker with the miner.** A worker built for another protocol version is
   refused at start.
 
-`benchmark --calibrate` measures proving time at each segment size and only overrides the
-SDK's own choice when one size wins by a decisive margin — differences inside measurement
-noise are discarded rather than acted on.
+`benchmark --calibrate` measures proving time at each segment size, for information: every
+risc0 job is measured and proven at po2 20. A guest can tell the segment size it runs at, so a
+proof at another size could run it otherwise than the measurement did; calibrated picks and
+the TUI's per-device overrides don't apply to jobs.
 
 ## Layout
 

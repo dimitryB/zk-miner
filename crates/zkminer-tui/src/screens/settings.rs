@@ -70,7 +70,9 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
         3 // just border + "no combos" message
     };
     let pm_h = (param_count as u16 + 2).max(3);
-    let adv_h = (advanced_count as u16 + 2).max(3);
+    // In advanced mode, a line above the rows says jobs do not use them.
+    let adv_lines = advanced_count + usize::from(state.runtime_settings.advanced_mode);
+    let adv_h = (adv_lines as u16 + 2).max(3);
     let tuning_h = gpu_tuning_height(state);
 
     let chunks = Layout::default()
@@ -444,6 +446,14 @@ fn render_advanced(f: &mut Frame, area: Rect, state: &MinerState, focused: bool)
             theme::dim(),
         )));
     } else {
+        // Jobs no longer read these (see `RISC0_SEGMENT_PO2`): say so where they are set.
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  risc0 jobs prove at po2 {}, the size they are measured at: these are not used",
+                zkminer_prover_protocol::RISC0_SEGMENT_PO2
+            ),
+            theme::dim(),
+        )));
         let pairs = fully_enabled_pairs(state);
         for (i, (dev, bk)) in pairs.iter().enumerate() {
             let row_idx = i + 1;

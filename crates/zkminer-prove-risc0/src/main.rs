@@ -13,7 +13,7 @@ use zkminer_prover_protocol::{
     is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
     WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
     BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
-    PROTOCOL_VERSION,
+    PROTOCOL_VERSION, RISC0_SEGMENT_PO2,
 };
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
@@ -810,6 +810,8 @@ fn run_execute(
         env_builder.write_slice(input_data);
     }
     env_builder.random_seed(sys_rand_seed(&sys_rand_key(), &image_id, input_data));
+    // At the size the job will be proven at: the guest can tell (see `RISC0_SEGMENT_PO2`).
+    env_builder.segment_limit_po2(RISC0_SEGMENT_PO2 as u32);
     if let Some(limit) = execute_session_cycle_limit() {
         env_builder.session_limit(Some(limit));
     }
@@ -846,6 +848,8 @@ fn run_execute(
     // A guest that halts with no output (a zero output digest: `sys_halt` skipped `env::finalize`)
     // executes cleanly and proves, but its receipt never verifies — a claim without an output is not
     // what `receipt.verify(image_id)` or the chain accept. An honest guest always has one, if empty.
+    // (One that halts with a non-zero digest other than its output's, the pinned executor refuses
+    // itself, as it does a bigint2 witness its verify program rejects.)
     let output = session
         .receipt_claim
         .as_ref()
@@ -878,16 +882,15 @@ fn run_execute(
     // What proving costs, and reports as `total_cycles`: every segment padded to its power of two.
     // `SessionInfo::cycles()` counts user cycles only — no paging, no padding — and a guest that
     // pages heavily (each page-in costs hundreds of cycles) can make a proof 100x what it shows.
-    // Measured at the default segment size: a smaller proving po2 repeats the paging in more
-    // segments, a larger one pads the last segment further. Each keccak request is a further proof
-    // of its own (a 2^17-row keccak STARK, its lift and a join), priced here as a 2^20 segment.
+    // Measured at `RISC0_SEGMENT_PO2`, the size the job proves at. Each keccak request is a further
+    // proof of its own (a 2^17-row keccak STARK, its lift and a join), priced here as a 2^20 segment.
     let cycles: u64 = session.segments.iter().map(|s| 1u64 << s.po2).sum::<u64>() + keccak.cycles;
     // The journal the guest committed here is byte-identical to the one the later proof
-    // would carry (both are a deterministic function of (ELF, input) — `sys_rand` included, via the
-    // shared seed, and the guest's cycle counter, which counts user cycles whatever the segment size —
-    // and the image-id check makes measure-ELF == prove-ELF). The host checks the job's journal
-    // binding against it, and screens a journal that would blow the fulfillJob payload cap, before
-    // committing collateral and a full proof to it.
+    // would carry (both are a deterministic function of (ELF, input) at the one segment size both
+    // run at, which a guest can tell — `sys_rand` included, via the shared seed — and the image-id
+    // check makes measure-ELF == prove-ELF). The host checks the job's journal binding against it,
+    // and screens a journal that would blow the fulfillJob payload cap, before committing
+    // collateral and a full proof to it.
     Ok((
         cycles,
         session.journal.bytes,
@@ -962,6 +965,15 @@ fn run_proof(
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
     // Bind the ELF to the job's programId ONCE, before the retry loop spends any GPU on it.
     let image_id = verify_program_id(elf, program_id)?;
+    // A job (bound to a programId) proves at the size it was measured at; other sizes are for
+    // benchmarks and calibration.
+    if let (Some(_), Some(p)) = (program_id, po2) {
+        if p != RISC0_SEGMENT_PO2 {
+            anyhow::bail!(
+                "po2 value {p} is not the segment size a job is measured at ({RISC0_SEGMENT_PO2})"
+            );
+        }
+    }
     // The seed the pre-claim measurement used, so every attempt runs the guest exactly as it did.
     let seed = sys_rand_seed(&sys_rand_key(), &image_id, input_data);
     // Retry-on-invalid mitigation for the rare (~1.5%) nondeterministic GPU
@@ -976,6 +988,11 @@ fn run_proof(
     // surfaces instead of looping. Only the GPU-corruption error class is retried.
     const MAX_ATTEMPTS: usize = 4;
     let mut last_err: Option<anyhow::Error> = None;
+    // The segment the last invalid proof failed at. A race lands on a segment at random; the same
+    // one failing twice is a witness the circuit rejects (a guest the measurement missed) or a fault
+    // of this card's, and re-proving here would only spend it again. Reported as a failed proof, so
+    // the host tries another card.
+    let mut last_failed_segment: Option<u64> = None;
     for attempt in 1..=MAX_ATTEMPTS {
         match run_proof_once(elf, input_data, po2, seed) {
             Ok(result) => {
@@ -1004,6 +1021,14 @@ fn run_proof(
                         || msg.contains("verify segment")
                         || msg.contains("receipt is invalid")
                         || msg.contains("proof verification failed"));
+                let segment = failed_segment(&msg);
+                if recoverable && failed_twice(segment, last_failed_segment) {
+                    let index = segment.unwrap_or_default();
+                    return Err(e.context(format!(
+                        "segment {index} failed to verify twice: deterministic, not a GPU race"
+                    )));
+                }
+                last_failed_segment = segment;
                 if recoverable && attempt < MAX_ATTEMPTS {
                     tracing::warn!(
                         "Proof attempt {attempt}/{MAX_ATTEMPTS} produced an invalid proof (likely GPU race), re-proving: {e:#}"
@@ -1016,6 +1041,20 @@ fn run_proof(
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("proof failed after {MAX_ATTEMPTS} attempts")))
+}
+
+/// The index of the segment whose seal did not verify, from the prover's (host-generated) context
+/// "verify segment N" or "verify segment (last) N", in `msg` lowercased.
+fn failed_segment(msg: &str) -> Option<u64> {
+    let rest = msg.split("verify segment ").nth(1)?;
+    let rest = rest.strip_prefix("(last) ").unwrap_or(rest);
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Whether an invalid proof failed at the segment the one before it did (both known).
+fn failed_twice(segment: Option<u64>, last: Option<u64>) -> bool {
+    segment.is_some() && segment == last
 }
 
 fn run_proof_once(
@@ -1042,13 +1081,14 @@ fn run_proof_once(
     let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
     env_builder.write_slice(input_data);
     env_builder.random_seed(seed);
-    if let Some(po2) = po2 {
-        if !(13..=24).contains(&po2) {
-            anyhow::bail!("po2 value {po2} out of valid range 13..=24");
-        }
-        tracing::info!("Setting segment_limit_po2 = {po2}");
-        env_builder.segment_limit_po2(po2 as u32);
+    // Never left to the SDK, which picks 21 on a 32 GB card: a job is measured at
+    // `RISC0_SEGMENT_PO2`, and the guest can tell the size it runs at.
+    let po2 = po2.unwrap_or(RISC0_SEGMENT_PO2);
+    if !(13..=24).contains(&po2) {
+        anyhow::bail!("po2 value {po2} out of valid range 13..=24");
     }
+    tracing::info!("Setting segment_limit_po2 = {po2}");
+    env_builder.segment_limit_po2(po2 as u32);
     if let Some(limit) = prove_session_cycle_limit() {
         tracing::info!("Setting session_limit = {limit} cycles (operator override)");
         env_builder.session_limit(Some(limit));
@@ -1626,6 +1666,49 @@ mod sys_rand_tests {
         assert_eq!(
             verify_program_id(FIBONACCI_ELF, Some(image)).unwrap(),
             image
+        );
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn the_failed_segment_is_read_from_the_provers_context() {
+        let msg = "verify segment 3: verification indicates proof is invalid";
+        assert_eq!(failed_segment(msg), Some(3));
+        let msg = "verify segment (last) 17: verification indicates proof is invalid";
+        assert_eq!(failed_segment(msg), Some(17));
+        // No index (the test injection, a receipt check): no segment to compare.
+        let msg = "verify segment: verification indicates proof is invalid (test injected)";
+        assert_eq!(failed_segment(msg), None);
+        assert_eq!(failed_segment("receipt is invalid"), None);
+    }
+
+    #[test]
+    fn only_the_same_segment_failing_again_stops_the_retries() {
+        assert!(failed_twice(Some(3), Some(3)));
+        assert!(!failed_twice(Some(3), Some(4)));
+        assert!(!failed_twice(Some(3), None));
+        assert!(
+            !failed_twice(None, None),
+            "an unindexed failure is never the same segment"
+        );
+    }
+
+    #[test]
+    fn a_job_proves_only_at_the_segment_size_it_was_measured_at() {
+        if FIBONACCI_ELF.is_empty() {
+            return; // stubbed guests; nothing to validate
+        }
+        let image = verify_program_id(FIBONACCI_ELF, None).unwrap();
+        let po2 = RISC0_SEGMENT_PO2 - 1;
+        // Refused before any proving (or seeding): no GPU needed.
+        let err = run_proof(FIBONACCI_ELF, &[], Some(po2), Some(image)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&format!("po2 value {po2} is not the segment size")),
+            "{err:#}"
         );
     }
 }
