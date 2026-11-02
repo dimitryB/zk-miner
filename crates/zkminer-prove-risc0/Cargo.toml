@@ -26,6 +26,8 @@ macos = ["risc0-zkvm/disable-dev-mode", "dep:serde_json", "dep:sha2"]
 macos-metal = ["macos", "dep:risc0-zkp", "dep:metal"]
 # Build tooling also selects the local engine's native-groth16 feature.
 macos-native-wrap = ["macos"]
+# Build tooling also enables the local engine's metal-recursion feature.
+macos-recursion-metal = ["macos-native-wrap", "dep:metal"]
 cuda = ["risc0-zkvm/cuda", "risc0-groth16/cuda"]
 rocm = ["risc0-zkvm/rocm", "risc0-groth16/rocm"]
 

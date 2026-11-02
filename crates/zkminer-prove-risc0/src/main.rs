@@ -31,6 +31,13 @@ include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
+    #[cfg(feature = "macos-recursion-metal")]
+    if std::env::args().nth(1).as_deref() == Some("--macos-recursion-probe") {
+        match macos::recursion_device_probe() {
+            Ok(value) => { println!("{value}"); return; }
+            Err(error) => { eprintln!("recursion Metal probe failed: {error:#}"); std::process::exit(1); }
+        }
+    }
     // Isolated, bounded capability probe: no IPC, guest, helper or network path.
     #[cfg(feature = "macos-metal")]
     if std::env::args().nth(1).as_deref() == Some("--macos-metal-probe") {

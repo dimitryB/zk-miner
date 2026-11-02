@@ -709,7 +709,16 @@ pub fn unmeasured_peak_for(backend: &str) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     match backend {
         #[cfg(target_os = "macos")]
-        "risc0" if std::env::var("ZKMINER_RISC0_WRAP").as_deref() == Ok("native") => 16 * GIB,
+        "risc0" if std::env::var("ZKMINER_RISC0_WRAP").as_deref() == Ok("native") => {
+            // Recursion Metal's measured first-process group peak was 17.3 GiB.
+            // Keep its initial budget above that peak; measured calibration
+            // still applies the existing safety factor and host clamp.
+            if std::env::var("RISC0_RECURSION_HAL").as_deref() == Ok("metal") {
+                20 * GIB
+            } else {
+                16 * GIB
+            }
+        }
         "risc0" | "openvm" => 6 * GIB,
         // `mock_worker` speaks the protocol and allocates nothing; `crates/zkminer-prover/src/bin/`
         // builds it and the integration tests register it as a backend. Charging it the

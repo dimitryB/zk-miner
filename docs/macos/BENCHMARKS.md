@@ -1,5 +1,101 @@
 # macOS proving measurements
 
+## Poseidon2 lift/join recursion Metal completed 2026-11-01
+
+The opt-in native worker now proves Poseidon2 lift/join using shared Metal
+buffers for transforms, commitment hashing and constraint evaluation. Witness
+generation and accumulation run the pinned CPU routines directly on those
+buffers. RV32IM segment proving, identity-p254 and native Groth16 remain CPU.
+Every GPU command completes before CPU access, and temporary Objective-C command
+objects drain after each dispatch. Control buffers/groups retain the engine's
+bounded caches. The evaluator inserts the current CUDA polynomial body verbatim
+into the Metal address-space wrapper using the retained field headers.
+
+A five-pair warm-worker comparison passed the frozen performance criterion:
+**86.921 → 77.772 seconds** median complete latency, **10.5% less time** (1.118×
+throughput), with all five pairs faster. The criterion, recorded before any
+case started, required at least 1.05× median speedup and four faster pairs.
+Both modes used the same sealed worker, helper, 18 Rayon / 18 Go threads,
+fixture and segment cap. One first-process warmup per mode was excluded; request
+order alternated each round. Both workers remained resident, with one active
+proof at a time. All twelve proofs, including warmups, verified independently
+and passed 36 negative checks. No measured row was removed or retried.
+
+Fibonacci(150,000) executes 1,503,116 guest / 1,572,864 padded cycles in two
+segments at the production po2-20 cap. The comparison is specific to this fixed
+fixture; it does not establish a speedup for every job or statistical significance.
+
+| Seconds, median [minimum–maximum], n=5 per mode | CPU recursion | Metal recursion |
+|---|---:|---:|
+| Execution + segment proving | 58.380 [58.204–58.434] | 58.363 [57.932–58.691] |
+| Recursion | 10.350 [10.334–10.415] | 1.824 [1.817–1.840] |
+| Identity + native wrapping | 17.332 [17.280–17.385] | 17.322 [17.286–17.424] |
+| Worker body | 86.091 [85.958–86.221] | 77.545 [77.135–77.834] |
+| Complete call + independent verification | 86.921 [86.903–86.952] | 77.772 [77.746–78.806] |
+
+The two 10M fixtures also passed as separate first-process observations:
+
+| Fixture | Guest / padded cycles | Segments | Worker body | Complete call + independent verification |
+|---|---:|---:|---:|---:|
+| Fibonacci(1,000,000) | 10,003,116 / 10,485,760 | 10 | 417.286 s | 418.323 s |
+| SHA-256 chain, 2,262 hashes | 10,003,440 / 10,485,760 | 10 | 420.833 s | 421.236 s |
+
+Each recorded 19 successful Metal constraint checks (ten lifts and nine joins).
+These are single observations, not new five-sample usefulness medians or
+cold-boot measurements. The step-4 CPU dataset below remains the established
+10M acceptance set. The 46M CPU stretch was not repeated with Metal.
+
+The final campaign passed nine input controls, tiny-tail and segment-boundary
+proofs, the twelve comparison proofs, two 10M proofs, twenty consecutive
+requests on one worker, helper cancellation, the ten-second watchdog, a verified
+restart proof and shutdown: **37 complete proofs and 111 negative checks**.
+The twenty-request worker's settled footprint ranged from 3.849 to 4.008 GiB
+(first 3.902, last 3.851). The largest sampled owned-group footprint was
+17.279 GiB during Metal startup; the native CPU comparison peaked at 15.112 GiB.
+Conservative host availability stayed above 22.0 GiB and sampled pressure was
+normal. Worker/helper maxima need not occur together; footprints and peaks are
+sampled observations, not hard allocation bounds. Thermal nominal can mean
+unavailable; no energy or frequency claim is made.
+
+After timing, the initial Metal admission budget was raised from 16 to **20 GiB**
+to exceed that startup peak; native CPU keeps 16 GiB. The existing measured safety
+factor, host reserve and 32-GiB group watchdog remain. A separate final check
+held 93 GiB of logical reservations, received a typed refusal before dispatch,
+released reservations to zero and verified a recovery proof with three negative
+checks. The represented reservation was not physically allocated. This final
+supervisor change leaves the sealed proving worker unchanged; the timing
+campaign's original acceptance binaries and source manifests are retained.
+
+Validation also passed 18 Metal primitive tests, the evaluator CPU differential
+at po2 4/7/10 with offsets/sentinels, four worker startup tests, 62 benchmark
+unit tests, 12 memory tests and CLI compilation. An isolated, source-bound test
+reused actual shared buffers across CPU writes and GPU hashing, covering empty
+inputs, zero-output rejection, nonzero offsets and grid boundaries: 36 GPU
+commands matched CPU results. Linux ARM64 CPU checks passed through both
+recursion and zkVM Metal feature paths on Rust 1.93.1; no Linux GPU runtime was
+tested. The dedicated VM was stopped before native timing.
+
+The preliminary campaign `ac530c478a9047daa7a424c43b76de8d` was deliberately
+stopped after review found the missing per-dispatch autorelease pool. Its seven
+verified artifacts, started request, pending slots, `replan.json`, binary and
+source archive are retained separately. A separate three-proof pilot is also
+retained. Neither contributes to the final performance result. Pre-proof setup
+rejections and the operator-interrupted Linux check remain alongside corrected
+runs. No cryptographic proof failure was retried.
+
+Evidence: [validation JSON](evidence/recursion-metal-validation.json),
+[ten measured rows](evidence/recursion-metal-comparison.csv) and
+[engine patch](evidence/recursion-metal-engine.patch).
+Raw final campaign:
+`target/macos/native-wrap/workload-campaigns/ed853b04d39243a4b6da292774bc34f6`.
+The exact worker, shader and acceptance executables are preserved under
+`target/macos/recursion-metal-final-build`. Steps 1–4 are committed in miner
+`09a6910` and engine `98d940d4b`. Step-5 measurements were captured before its
+checkpoint commits; the owner subsequently authorized committing step 5 and
+assessing RV32IM Metal. The step-5 engine checkpoint is `0515e0bde`. Nothing
+has been pushed. Poseidon254 Metal and full RV32IM acceleration remain
+separate milestones.
+
 ## Workload expansion completed 2026-11-01
 
 The native worker defaults to po2 20 and a configurable 64-Mi guest-cycle

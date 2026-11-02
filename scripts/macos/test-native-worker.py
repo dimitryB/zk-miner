@@ -14,6 +14,9 @@ from worker_provenance import verify_build as verify_worker, paths
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", type=Path, required=True)
+    parser.add_argument("--worker-kind", choices=["native", "native-recursion-metal"], default="native")
+    parser.add_argument("--recursion-hal", choices=["cpu", "metal"], default="cpu")
+    parser.add_argument("--recursion-cases", help="counterbalanced warm-worker comparison, e.g. cpu,metal")
     parser.add_argument("--workload", choices=["fibonacci", "sha256-chain", "segment-boundary"], default="fibonacci")
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--proof-only", action="store_true")
@@ -31,13 +34,18 @@ def main():
     parser.add_argument("--min-guest-cycles", type=int, default=1)
     parser.add_argument("--warmup", action="store_true", help="one extra complete proof before the measured repeats")
     args = parser.parse_args()
+    if args.recursion_cases:
+        cases = args.recursion_cases.split(',')
+        if args.worker_kind != "native-recursion-metal" or sorted(cases) != ["cpu", "metal"]:
+            parser.error("recursion comparison requires native-recursion-metal and the two cases cpu,metal")
+        args.thread_cases = args.thread_cases or "18:18,18:18"
     if not 1 <= args.repeat <= 20 or (not args.proof_only and args.repeat < 3):
         parser.error("use 1..20 repeats; lifecycle acceptance requires at least three")
     if not 1 <= args.session_limit <= 67_108_864 or not 30 <= args.timeout_seconds <= 3600:
         parser.error("invalid session limit or watchdog")
     if not 1 <= args.min_guest_cycles <= args.session_limit:
         parser.error("minimum guest cycles must fit session limit")
-    worker_manifest = verify_worker("native", args.engine)
+    worker_manifest = verify_worker(args.worker_kind, args.engine)
     verifier_manifest = verify_build("verifier")
     spec = importlib.util.spec_from_file_location("worker_acceptance", Path(__file__).with_name("test-worker.py"))
     acceptance = importlib.util.module_from_spec(spec)
@@ -57,7 +65,8 @@ def main():
     env = dict(os.environ, ZKMINER_RISC0_WRAP="native", ZKMINER_RISC0_NATIVE_DIR=str(base / "assets"),
                ZKMINER_RISC0_MODE="cpu", ZKMINER_RISC0_WORK_ROOT=str(directory / "work"),
                ZKMINER_RISC0_EVIDENCE_DIR=str(directory / "sidecars"),
-               ZKMINER_MACOS_WORKER=str(paths("native")["binary"]), ZKMINER_MACOS_WORKER_KIND="native",
+               ZKMINER_MACOS_WORKER=str(paths(args.worker_kind)["binary"]), ZKMINER_MACOS_WORKER_KIND="native",
+               RISC0_RECURSION_HAL=args.recursion_hal,
                ZKMINER_MACOS_PROGRAM=str(program), ZKMINER_MACOS_VERIFIER=str(ROOT / "target/macos/verifier/release/hemi-macos-proof"),
                ZKMINER_MACOS_WORKLOAD=args.workload, ZKMINER_MACOS_INPUT=str(directory / "input.bin"),
                ZKMINER_MACOS_EXPECTED_JOURNAL_HEX=expected, ZKMINER_MACOS_PO2=str(po2),
@@ -74,6 +83,8 @@ def main():
                PATH=str(directory / "bin") + os.pathsep + os.environ["PATH"])
     if args.thread_cases:
         env.update(ZKMINER_MACOS_THREAD_CASES=args.thread_cases, ZKMINER_MACOS_THREAD_SAMPLES=str(args.samples))
+    if args.recursion_cases:
+        env["ZKMINER_MACOS_RECURSION_CASES"] = args.recursion_cases
     if args.calibration:
         args.calibration = args.calibration.resolve(strict=True)
         env["ZKMINER_MACOS_CALIBRATION"] = str(args.calibration)
@@ -82,6 +93,7 @@ def main():
               "iterations":args.iterations,"po2":po2,"session_guest_cycle_limit":args.session_limit,
               "proof_watchdog_seconds":args.timeout_seconds,"warmup_count":int(args.warmup),"measured_repeats":args.repeat,
               "min_guest_cycles":args.min_guest_cycles,"program_sha256":sha(program),"input_sha256":sha(directory / "input.bin")}
+    report.update(worker_kind=args.worker_kind, recursion_hal=args.recursion_hal, recursion_cases=args.recursion_cases)
     if args.calibration:
         report["calibration"] = {"path":str(args.calibration), "sha256":sha(args.calibration)}
     print(directory, flush=True)
@@ -92,7 +104,7 @@ def main():
             subprocess.run([str(binary), test, "--exact", "--ignored", "--nocapture"],
                            env=env, stdout=log, stderr=subprocess.STDOUT, check=True,
                            timeout=(args.repeat + int(args.warmup) + (4 if not args.proof_only else 0))*args.timeout_seconds + 600)
-        if verify_worker("native", args.engine) != worker_manifest:
+        if verify_worker(args.worker_kind, args.engine) != worker_manifest:
             raise RuntimeError("native worker build changed during acceptance")
         if sha(binary) != build["binary_sha256"] or acceptance.test_sources() != build["source_inputs"]:
             raise RuntimeError("WorkerPool acceptance sources changed during the run")

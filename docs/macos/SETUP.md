@@ -89,8 +89,9 @@ are sampled observations, not a kernel-enforced allocation cap or an exact peak;
 shared charges can make the group sum conservative. Native mode uses no container
 lease. The original Docker path remains the default for earlier worker builds.
 
-Native RISC0 admission starts with a 16-GiB unmeasured proof budget; sampled
-group peaks then feed the existing calibration margin. Resident footprint of
+Native CPU RISC0 admission starts with a 16-GiB unmeasured proof budget;
+Poseidon2 recursion Metal starts at 20 GiB after its measured 17.3-GiB startup
+group peak. Sampled group peaks then feed the existing calibration margin. Resident footprint of
 the owned worker group supplies the existing resident-memory credit. The host
 estimate remains free pages plus half the smaller of file-backed and inactive
 pages, with no separate credit for compression. It is not an allocation guarantee.
@@ -186,6 +187,59 @@ claiming remains outside this acceptance workflow.
 This experimental path is local only. It does not require a wallet or a
 marketplace job. Use one proof at a time. Do not treat these instructions as
 approval to run `mine`, `init`, claim, stake or submit commands.
+
+## Poseidon2 lift/join recursion Metal (step 5)
+
+This separate native worker keeps RV32IM segment proving on CPU and uses shared
+Metal buffers for Poseidon2 recursion transforms, commitments, hashing and
+constraint evaluation. Witness generation and accumulation run the pinned CPU
+routines directly on those buffers. Identity-p254 and native Groth16 remain CPU.
+The Metal evaluator inserts the current CUDA `poly_fp` body verbatim into its
+address-space wrapper at build time, using the retained field headers; it does
+not use the empty legacy evaluator or the legacy accumulation kernels.
+
+```sh
+source scripts/macos/env.sh
+export PROTOC=/Users/dbur/dev/zk-miner/target/macos/bootstrap/protoc-36.2/bin/protoc
+ENGINE_DIR=/Users/dbur/.codex/worktrees/hemi-macos-cpu/risc0
+python3 scripts/macos/build-worker.py --mode native-recursion-metal --engine "$ENGINE_DIR" --config target/macos/local-engine.toml --revision 0515e0bdebcd1f5f2d24cef91691ebd5b0c5d0a6 --tests
+python3 scripts/macos/test-native-worker.py --engine "$ENGINE_DIR" --worker-kind native-recursion-metal --recursion-hal metal --iterations 50000 --po2 19 --repeat 3 --proof-only
+```
+
+The build lives in `target/macos/worker-native-recursion-metal`; the measured
+CPU worker is preserved under `target/macos/native-wrap/step4-cpu-baseline`.
+Use `RISC0_RECURSION_HAL=metal` explicitly with this worker; the default is CPU.
+Set `ZKMINER_RISC0_MODE=cpu` for segment proving; the recursion setting selects
+the separate Poseidon2 Metal stage.
+Unsupported/invalid requests fail startup. Device preflight is bounded; runtime
+shader compilation is included in the first proof rather than the handshake.
+Metal compilation or execution failure does not silently switch to CPU.
+Complete-proof sidecars bind the shader hash and count successful Metal checks.
+All GPU commands complete before shared buffers are accessed by CPU code.
+Control-buffer/group caches remain bounded by the engine's existing limits.
+Acceptance passed: five warm CPU/Metal pairs measured 86.921/77.772 seconds
+median complete latency on the fixed 1.5M fixture (all five pairs faster).
+Single 10M arithmetic/hash proofs verified in 418.323/421.236 seconds, and
+20-request cancellation/watchdog/restart/shutdown acceptance passed. These
+10M observations do not replace the five-sample step-4 CPU medians. See
+[BENCHMARKS.md](BENCHMARKS.md) and the bound validation evidence.
+
+Reproduce the paired and large-workload campaign, then run buffer controls
+separately so they do not compete with timing:
+
+```sh
+python3 scripts/macos/benchmark-native-workloads.py --engine "$ENGINE_DIR" --worker-kind native-recursion-metal --recursion-hal metal --recursion-comparison --large-repeats 1
+python3 scripts/macos/test-metal-buffers.py --engine "$ENGINE_DIR"
+python3 scripts/macos/test-native-worker.py --engine "$ENGINE_DIR" --worker-kind native-recursion-metal --recursion-hal metal --repeat 1 --proof-only --admission-pressure
+```
+
+`--large-repeats 5` selects the full warm five-sample 10M sets instead. The
+collector takes the campaign directory plus `--buffers RUN_DIR` and
+`--admission RUN_DIR`. Buffer controls use a copied engine and leave the sealed
+candidate's source unchanged. Zero-output hash shapes are intentionally rejected
+by both CPU and GPU; their caught panics in the test log are expected.
+The initial Metal admission budget is 20 GiB; CPU remains 16 GiB. Measured
+calibration, host reserve and physical-footprint watchdog policies still apply.
 
 ## Prerequisites and source
 

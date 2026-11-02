@@ -8,6 +8,72 @@ step 5, Poseidon2 lift/join recursion Metal. The engine checkpoint is
 preserved in `target/macos/native-wrap/step4-cpu-baseline` before committing.
 The measurement-time source hashes below remain historical evidence. Do not push.
 
+The Poseidon2 lift/join milestone of step 5 passed. The owner subsequently
+authorized its commit and the step-6 RV32IM assessment. The engine checkpoint is
+`0515e0bde`; the exact measured binaries/manifests remain archived. Nothing was pushed.
+The separate `native-recursion-metal` worker uses `RISC0_RECURSION_HAL=metal`
+and `ZKMINER_RISC0_MODE=cpu` for CPU segments. Witness/accumulation use pinned
+CPU routines directly on shared buffers; identity-p254 remains CPU. Every GPU
+command completes and drains its temporary Objective-C objects before CPU access.
+
+The worker SHA-256 is
+`d157305ba0e0830671c6b8f6238dc68e59ae8a68dc3454865c2084c21bc347b9`.
+The completed final campaign is
+`target/macos/native-wrap/workload-campaigns/ed853b04d39243a4b6da292774bc34f6`:
+37 complete proofs and 111 negative checks, plus nine input controls. Its five
+warm CPU/Metal pairs on Fibonacci(150000), po2 20, had complete medians of
+86.921/77.772 seconds (10.5% less time; all five pairs faster), exceeding the
+predefined 1.05× / four-pair criterion. The two 10M fixtures verified once each
+in 418.323/421.236 seconds; these are not five-sample usefulness medians.
+Twenty consecutive requests on one worker, cancellation, watchdog, verified
+restart and shutdown passed. Idle worker footprints stayed within 3.849..4.008
+GiB across those twenty requests. The largest sampled group peak was 17.279 GiB
+at Metal startup; pressure stayed normal. The largest CPU comparison peak was
+15.112 GiB. Host availability stayed above 22.0 GiB with two resident paired
+workers; one proof was active at a time.
+
+After timing, the initial Metal admission budget was raised from 16 to 20 GiB;
+native CPU remains 16 GiB. A final production-ledger check held 93 GiB of logical
+reservations, refused before dispatch, released to zero and independently
+verified a recovery proof plus three negative checks. No represented memory was
+allocated. This supervisor-only change leaves the measured worker binary
+unchanged; both timing and final acceptance binaries/source manifests survive
+in `target/macos/recursion-metal-final-build/acceptance`.
+
+The unchanged verifier remains SHA-256
+`2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c`.
+Shader SHA-256 is
+`137564beae0d2804c66d1957411d6be97b6b4d7b9cb4d7868eecdc80b0c69bb5`.
+The worker, manifests and exact generated shader are archived in
+`target/macos/recursion-metal-final-build`. The evaluator takes the current CUDA
+polynomial body verbatim; legacy Metal accumulation kernels are audited but unused.
+
+Validation passed 18 Metal primitives, the evaluator CPU differential (po2
+4/7/10 with offsets/sentinels), four worker startup tests, 62 benchmark tests,
+12 memory tests and CLI compilation. Isolated shared-buffer controls in
+`target/macos/metal-buffer-controls/1ff7cd33ecf046a8b780167fe64c8041` exercised
+36 GPU hash commands with actual allocation reuse, intervening CPU writes,
+empty inputs, nonzero offsets and grid boundaries, matching CPU outputs.
+Expected zero-output rejection panics were caught. Linux ARM64 CPU checks for
+both recursion and zkVM feature paths passed with Rust 1.93.1. The dedicated VM
+is stopped; the original default VM remains running.
+
+The preliminary campaign `ac530c478a9047daa7a424c43b76de8d` was deliberately
+interrupted to add the per-dispatch autorelease pool. Its seven verified
+artifacts, started request and pending slots remain with `replan.json` and
+`target/macos/recursion-metal-before-pools`. A separate three-proof pilot
+`71684d3b53884fc2bc4fb3b3cfe654ee` is retained and excluded from final timing.
+Pre-proof setup errors and one operator-interrupted Linux check remain alongside
+the corrected runs. No failed cryptographic proof was retried.
+
+See [workload results](BENCHMARKS.md), [setup](SETUP.md),
+[validation](evidence/recursion-metal-validation.json),
+[comparison CSV](evidence/recursion-metal-comparison.csv) and
+[engine diff](evidence/recursion-metal-engine.patch). The root Cargo.lock is
+unchanged. Engine Cargo.lock adds only the already-existing build-kernel
+package dependency edge. Identity-p254 Metal and full RV32IM acceleration have
+not started; those are separate follow-up decisions.
+
 The owner approved [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) on
 2026-11-01 and requested implementation with all new changes left uncommitted.
 This supersedes the earlier next step of extending fold-only benchmarks.
@@ -119,8 +185,9 @@ Worker tests, protocol limits, 62 benchmark tests, shared executor regressions
 and CLI compilation passed. Earlier pre-proof setup failures (network lookup,
 dependency test workspace selection, default container toolchain and
 execution-only dead-code warnings) remain archived. No proof failure was retried.
-The root dependency lock and both repository HEADs remain unchanged. All changes
-remain uncommitted/unpushed. Step 5, Poseidon2 recursion Metal, has not started.
+At the step-4 measurement checkpoint, the root dependency lock and both
+repository HEADs were unchanged and all changes were uncommitted. The owner
+subsequently authorized the checkpoint commits and step 5 described above.
 
 Order: ARM64 wrapper feasibility, native macOS helper, native thread/memory
 tuning, larger workloads, Poseidon2 recursion Metal, then separate Poseidon254

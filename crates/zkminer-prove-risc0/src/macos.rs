@@ -17,7 +17,7 @@ use std::{
 const STAGE: &str = "segment_poseidon2_merkle_fold";
 const DEFAULT_STAGING_BYTES: usize = 512 * 1024;
 const HELPER_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
-#[cfg(feature = "macos-metal")]
+#[cfg(any(feature = "macos-metal", feature = "macos-recursion-metal"))]
 const METAL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct Config {
@@ -31,6 +31,8 @@ struct Config {
     cpu_threads: usize,
     go_threads: usize,
     limits: zkminer_prover_protocol::macos::Risc0Limits,
+    recursion_hal: &'static str,
+    recursion_probe: Option<Value>,
 }
 static CONFIG: OnceLock<Config> = OnceLock::new();
 fn config() -> &'static Config {
@@ -100,15 +102,19 @@ fn probe_metal(_staging_bytes: usize) -> Result<Value> {
 pub fn capabilities() -> (bool, Option<String>) {
     let c = config();
     (
-        c.metal,
+        c.metal || c.recursion_hal == "metal",
         c.probe
             .as_ref()
+            .or(c.recursion_probe.as_ref())
             .and_then(|p| p["device_name"].as_str().map(str::to_owned)),
     )
 }
 
 pub fn warmup_summary() -> String {
     let c = config();
+    if cfg!(feature = "macos-native-wrap") {
+        return format!("Native helper ready; segments CPU; Poseidon2 recursion {}; witness, accumulation and identity-p254 CPU", c.recursion_hal);
+    }
     if c.metal {
         format!("Metal ready: segment Poseidon2 Merkle folds; other native stages CPU; emulated Groth16 helper preflight passed; staging={} bytes", c.staging_bytes)
     } else {
@@ -118,6 +124,42 @@ pub fn warmup_summary() -> String {
             c.fallback.as_deref().unwrap_or("none")
         )
     }
+}
+
+fn recursion_mode(value: Option<&str>) -> Result<&'static str> {
+    match value {
+        None | Some("cpu") => Ok("cpu"),
+        Some("metal") if cfg!(feature = "macos-recursion-metal") => Ok("metal"),
+        Some("metal") => bail!("worker was compiled without macos-recursion-metal"),
+        _ => bail!("RISC0_RECURSION_HAL must be cpu or metal"),
+    }
+}
+
+#[cfg(feature = "macos-recursion-metal")]
+pub fn recursion_device_probe() -> Result<Value> {
+    metal::objc::rc::autoreleasepool(|| {
+        let device = metal::Device::system_default().context("Metal device unavailable")?;
+        ensure!(device.has_unified_memory(), "recursion Metal requires unified memory");
+        Ok(json!({"device_name":device.name(),"unified_memory":true,
+            "max_buffer_bytes":device.max_buffer_length(),"scope":"device only; shader compilation is on the proof path"}))
+    })
+}
+
+fn probe_recursion(hal: &str) -> Result<Option<Value>> {
+    if hal == "cpu" { return Ok(None); }
+    #[cfg(feature = "macos-recursion-metal")]
+    {
+        let (status, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
+            Command::new(std::env::current_exe()?).arg("--macos-recursion-probe"),
+            METAL_PROBE_TIMEOUT, 64 * 1024,
+        );
+        ensure!(matches!(status, zkminer_prover_protocol::proc::Outcome::Ran { success:true, .. }), "forced recursion Metal device probe failed: {}", status.describe());
+        let probe: Value = serde_json::from_str(&stdout)?;
+        ensure!(probe["unified_memory"] == true && probe["device_name"].as_str().is_some_and(|s| !s.is_empty()), "invalid recursion Metal device probe");
+        return Ok(Some(probe));
+    }
+    #[cfg(not(feature = "macos-recursion-metal"))]
+    bail!("worker was compiled without macos-recursion-metal")
 }
 
 fn prover() -> LocalProver {
@@ -286,6 +328,13 @@ pub fn preflight() -> Result<()> {
         probe_metal(staging_bytes)
     };
     let (metal, probe, fallback) = select_mode(&requested, available)?;
+    let recursion_value = match std::env::var("RISC0_RECURSION_HAL") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => bail!("invalid RISC0_RECURSION_HAL: {error}"),
+    };
+    let recursion_hal = recursion_mode(recursion_value.as_deref())?;
+    let recursion_probe = probe_recursion(recursion_hal)?;
     let evidence_dir = std::env::var_os("ZKMINER_RISC0_EVIDENCE_DIR").map(PathBuf::from);
     if let Some(path) = &evidence_dir {
         std::fs::create_dir_all(path).context("create worker evidence directory")?;
@@ -301,12 +350,15 @@ pub fn preflight() -> Result<()> {
         cpu_threads,
         go_threads,
         limits,
+        recursion_hal,
+        recursion_probe,
     };
     tracing::info!(
         "macos_mode {}",
         json!({"requested_mode":state.requested,"observed_mode":if metal {"metal"} else {"cpu"},
         "fallback_reason":state.fallback,"probe":state.probe,"staging_limit_bytes":staging_bytes,
-        "other_native_stages":"cpu","groth16":if cfg!(feature = "macos-native-wrap") { "native_darwin_arm64_helper" } else { "local_linux_amd64_helper" }})
+        "poseidon2_recursion":recursion_hal,"recursion_probe":state.recursion_probe,
+        "witness_accumulation_identity_p254":"cpu","groth16":if cfg!(feature = "macos-native-wrap") { "native_darwin_arm64_helper" } else { "local_linux_amd64_helper" }})
     );
     CONFIG
         .set(state)
@@ -409,6 +461,8 @@ fn prove_staged(
 ) -> Result<Completed> {
     let c = config();
     let total = Instant::now();
+    #[cfg(feature = "macos-recursion-metal")]
+    let recursion_before = risc0_zkvm::metal_recursion_stats();
     let filename = if operation == "prove" {
         format!("{}-{request_id}.json", std::process::id())
     } else {
@@ -421,6 +475,7 @@ fn prove_staged(
         "helper_container":c.helper_container,"helper_arch":if cfg!(feature = "macos-native-wrap") { "darwin/arm64" } else { "linux/amd64 (emulated)" },
         "rayon_threads":c.cpu_threads,"gomaxprocs":if cfg!(feature = "macos-native-wrap") { Some(c.go_threads) } else { None },
         "max_guest_cycles":c.limits.max_guest_cycles,"minimum_segment_po2":14,
+        "recursion_hal":c.recursion_hal,"recursion_cpu_stages":["witness","accumulation","identity_p254"],
         "staging_limit_bytes":c.staging_bytes,"stage_ms":{},"error":null});
     write_report(&report, &filename)?;
     let result = (|| -> Result<Completed> {
@@ -439,7 +494,7 @@ fn prove_staged(
             .verify(image)
             .context("verify composite receipt")?;
         report["stats"] = serde_json::to_value(&info.stats)?;
-        let mut observed = json!({"other_segment_operations":"cpu","recursion":"cpu",
+        let mut observed = json!({"other_segment_operations":"cpu","recursion":c.recursion_hal,
             "identity":"cpu","groth16":if cfg!(feature = "macos-native-wrap") { "native_darwin_arm64_helper" } else { "local_linux_amd64_helper" }});
         #[cfg(feature = "macos-metal")]
         if c.metal {
@@ -476,6 +531,23 @@ fn prove_staged(
 
         let started = Instant::now();
         let succinct = prover.compress(&ProverOpts::succinct(), &info.receipt)?;
+        #[cfg(feature = "macos-recursion-metal")]
+        {
+            let after = risc0_zkvm::metal_recursion_stats();
+            let checks = after.completed_constraint_checks - recursion_before.completed_constraint_checks;
+            let points = after.evaluation_points - recursion_before.evaluation_points;
+            if c.recursion_hal == "metal" {
+                ensure!(checks >= 2 * info.stats.segments as u64 - 1 && points > 0,
+                    "missing Metal lift/join constraint checks");
+                report["observed_stages"]["recursion_metal"] = json!({
+                    "completed_constraint_checks":checks,"evaluation_points":points,
+                    "kernel_source_sha256":hash(risc0_zkvm::metal_recursion_kernel_source().as_bytes()),
+                    "cpu_stages":["witness","accumulation"],
+                });
+            } else {
+                ensure!(checks == 0 && points == 0, "CPU recursion unexpectedly dispatched Metal");
+            }
+        }
         let recursion_secs = started.elapsed().as_secs_f64();
         succinct.verify(image).context("verify succinct receipt")?;
         report["stage_ms"]["recursion"] = json!(recursion_secs * 1000.0);
@@ -609,10 +681,18 @@ mod tests {
     }
 
     #[test]
+    fn recursion_mode_requires_an_explicit_supported_build() {
+        assert_eq!(recursion_mode(None).unwrap(), "cpu");
+        assert_eq!(recursion_mode(Some("cpu")).unwrap(), "cpu");
+        assert!(recursion_mode(Some("auto")).is_err());
+        assert_eq!(recursion_mode(Some("metal")).is_ok(), cfg!(feature = "macos-recursion-metal"));
+    }
+
+    #[test]
     fn startup_probe_budgets_fit_the_existing_handshake() {
         use zkminer_prover_protocol::proc::{max_overhead, HANDSHAKE_TIMEOUT};
         let probes = 2 * (HELPER_PROBE_TIMEOUT + max_overhead());
-        #[cfg(feature = "macos-metal")]
+        #[cfg(any(feature = "macos-metal", feature = "macos-recursion-metal"))]
         let probes = probes + METAL_PROBE_TIMEOUT + max_overhead();
         assert!(probes + Duration::from_millis(500) < HANDSHAKE_TIMEOUT);
     }

@@ -17,6 +17,18 @@ captured before the checkpoint commits. Step 5 starts from the committed native
 CPU baseline; its exact measured worker is archived under
 `target/macos/native-wrap/step4-cpu-baseline`.
 
+The Poseidon2 lift/join milestone of step 5 subsequently passed: five warm
+CPU/Metal pairs on the fixed 1.5M fixture measured 86.921/77.772 seconds complete
+median latency, all five pairs faster. Separate single 10M arithmetic/hash
+proofs verified in 418.323/421.236 seconds; the twenty-request lifecycle gate,
+primitive/differential/reuse tests and Linux CPU feature checks passed. The
+initial Metal memory budget is 20 GiB after a measured 17.3-GiB startup peak,
+with final admission refusal/recovery verified on the unchanged worker binary.
+See [BENCHMARKS.md](BENCHMARKS.md). The owner authorized committing step 5 before the step-6 assessment. The
+engine checkpoint is `0515e0bde`; measurement-time source hashes remain historical
+evidence. Identity-p254 Metal remains its own milestone; a full RV32IM port
+is the separate investment decision in step 6.
+
 ## Acceptance target
 
 Useful local proving means at least 10 million guest cycles in at most 10 minutes,

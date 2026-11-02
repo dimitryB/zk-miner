@@ -23,6 +23,9 @@ def check_lock_delta(original, local):
         if key[0] == "risc0-zkp" and "metal" in a.get("dependencies", []) and "metal" not in b.get("dependencies", []):
             # The explicit Metal feature makes this existing dependency optional.
             a["dependencies"] = [d for d in a["dependencies"] if d != "metal"]
+        if key[0] == "risc0-circuit-recursion" and "risc0-build-kernel" not in a.get("dependencies", []):
+            # Recursion Metal embeds the existing field headers at build time.
+            b["dependencies"] = [d for d in b.get("dependencies", []) if d != "risc0-build-kernel"]
         valid = valid and a == b
     return valid
 
@@ -32,7 +35,7 @@ def main():
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--engine", required=True, type=Path)
     parser.add_argument("--revision", required=True, help="full reviewed engine commit SHA")
-    parser.add_argument("--mode", choices=["cpu", "metal", "native"], default="cpu")
+    parser.add_argument("--mode", choices=["cpu", "metal", "native", "native-recursion-metal"], default="cpu")
     parser.add_argument("--tests", action="store_true", help="run the selected worker unit tests before sealing")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
@@ -62,6 +65,9 @@ def main():
     if args.mode == "native":
         feature = "macos-native-wrap,risc0-groth16/native-groth16"
         metadata_feature = "zkminer-prove-risc0/macos-native-wrap,risc0-groth16/native-groth16"
+    if args.mode == "native-recursion-metal":
+        feature = "macos-recursion-metal,risc0-zkvm/metal-recursion,risc0-groth16/native-groth16"
+        metadata_feature = "zkminer-prove-risc0/" + feature
     snapshot(args.mode, engine, config, env)
     try:
         subprocess.run(["cargo", "+1.93.0", "build", "-p", "zkminer-prove-risc0", "--bin", "zkminer-prove-risc0",
@@ -76,7 +82,7 @@ def main():
                 "--features", metadata_feature, "--config", str(config), "--format-version", "1"],
                 cwd=root, env=env, stdout=file, check=True)
         subprocess.run(["python3", str(root / "scripts/macos/check-source.py"), str(artifacts["metadata"]),
-                        "--engine", str(engine)] + (["--metal-hybrid"] if args.mode == "metal" else []), check=True)
+                        "--engine", str(engine)] + (["--metal-hybrid"] if args.mode == "metal" else ["--metal-recursion"] if args.mode == "native-recursion-metal" else []), check=True)
         with (output / f"{name}-tree.txt").open("w") as file:
             subprocess.run(["cargo", "+1.93.0", "tree", "--locked", "-p", "zkminer-prove-risc0",
                 "--features", feature, "--target", "aarch64-apple-darwin", "--edges", "features",

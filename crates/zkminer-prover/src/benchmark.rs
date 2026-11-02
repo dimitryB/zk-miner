@@ -1686,7 +1686,13 @@ fn build_gpu_device_benchmarks_from_workers(
         // made them collide onto one row. Must match `WorkerPool::benchmark_device_id`.
         let device_id = if native_cpu { CPU_DEVICE_ID.into() }
             else { crate::dispatcher::WorkerPool::gpu_device_id(&r.gpu_tag, &idx.to_string()) };
-        let device_label = if native_cpu { "Native Mac CPU".to_string() } else { match &r.gpu_name {
+        let device_label = if native_cpu {
+            if std::env::var("RISC0_RECURSION_HAL").as_deref() == Ok("metal") {
+                "Native Mac CPU + Metal recursion".to_string()
+            } else {
+                "Native Mac CPU".to_string()
+            }
+        } else { match &r.gpu_name {
             Some(name) => format!("GPU{idx} {name}"),
             None => format!("GPU{idx} ({})", r.gpu_tag),
         }};

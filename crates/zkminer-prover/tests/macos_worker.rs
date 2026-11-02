@@ -208,18 +208,27 @@ fn native_thread_comparison() {
     assert!(settings
         .iter()
         .all(|(a, b)| (1..=18).contains(a) && (1..=18).contains(b)));
+    let recursion_cases: Option<Vec<String>> = std::env::var("ZKMINER_MACOS_RECURSION_CASES")
+        .ok().map(|s| s.split(',').map(str::to_owned).collect());
+    if let Some(cases) = &recursion_cases {
+        assert_eq!(cases.len(), settings.len());
+        assert!(cases.iter().all(|s| s == "cpu" || s == "metal"));
+    }
     let samples: usize = std::env::var("ZKMINER_MACOS_THREAD_SAMPLES")
         .unwrap()
         .parse()
         .unwrap();
     assert!((1..=5).contains(&samples));
     let mut pools = Vec::new();
-    for &(rayon, go) in &settings {
-        let mut pool = WorkerPool::new(HashMap::new(), vec![], Some(Duration::from_secs(600)));
-        let overrides = HashMap::from([
+    for (index, &(rayon, go)) in settings.iter().enumerate() {
+        let mut pool = WorkerPool::new(HashMap::new(), vec![], Some(proof_timeout()));
+        let mut overrides = HashMap::from([
             ("ZKMINER_RISC0_CPU_THREADS".to_owned(), rayon.to_string()),
             ("RISC0_GROTH16_NATIVE_THREADS".to_owned(), go.to_string()),
         ]);
+        if let Some(cases) = &recursion_cases {
+            overrides.insert("RISC0_RECURSION_HAL".into(), cases[index].clone());
+        }
         pool.insert_test_worker(KEY, "risc0", required("ZKMINER_MACOS_WORKER"), overrides)
             .unwrap();
         pools.push(pool);
@@ -239,6 +248,9 @@ fn native_thread_comparison() {
             assert_eq!(record["rayon_threads"], settings[index].0);
             assert_eq!(record["gomaxprocs"], settings[index].1);
             assert_eq!(record["helper_arch"], "darwin/arm64");
+            if let Some(cases) = &recursion_cases {
+                assert_eq!(record["recursion_hal"], cases[index]);
+            }
             let external = verify(
                 &required("ZKMINER_MACOS_VERIFIER"),
                 &program,
@@ -270,7 +282,7 @@ fn native_thread_comparison() {
     fs::write(
         evidence.join("complete.json"),
         serde_json::to_vec_pretty(&json!({"status":"complete_independently_verified",
-        "samples_per_case":samples,"settings":settings,"rows":rows}))
+        "samples_per_case":samples,"settings":settings,"recursion_cases":recursion_cases,"rows":rows}))
         .unwrap(),
     )
     .unwrap();
@@ -401,6 +413,21 @@ fn validate_stage(record: &Value, workload: &Workload) {
         );
     }
     let count = positive(&record["stats"], "segments");
+    let recursion = if let Ok(cases) = std::env::var("ZKMINER_MACOS_RECURSION_CASES") {
+        let actual = record["recursion_hal"].as_str().unwrap();
+        assert!(cases.split(',').any(|s| s == actual));
+        Ok(actual.to_owned())
+    } else { std::env::var("RISC0_RECURSION_HAL") };
+    if let Ok(recursion) = recursion {
+        assert_eq!(record["recursion_hal"], recursion);
+        if recursion == "metal" {
+            let stage = &record["observed_stages"]["recursion_metal"];
+            assert!(positive(stage, "completed_constraint_checks") >= 2 * count - 1);
+            assert!(positive(stage, "evaluation_points") > 0);
+            assert_eq!(stage["kernel_source_sha256"].as_str().unwrap().len(), 64);
+            assert_eq!(record["observed_stages"]["identity"], "cpu");
+        }
+    }
     let minimum: u64 = std::env::var("ZKMINER_MACOS_MIN_GUEST_CYCLES")
         .unwrap_or_else(|_| "1".into()).parse().unwrap();
     assert!(positive(&record["stats"], "user_cycles") >= minimum);
@@ -413,7 +440,7 @@ fn validate_stage(record: &Value, workload: &Workload) {
     );
     let stage = &record["observed_stages"]["metal_stage"];
     if observed_mode() == "cpu" {
-        assert!(stage.is_null(), "CPU mode unexpectedly executed Metal");
+        assert!(stage.is_null(), "CPU segment mode unexpectedly executed a Metal fold");
         return;
     }
     assert_eq!(stage["name"], "segment_poseidon2_merkle_fold");
@@ -984,8 +1011,9 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             ..
         } => {
             assert_eq!(backend, "risc0");
-            assert_eq!(gpu_available, observed_mode() == "metal");
-            assert_eq!(gpu_name.is_some(), observed_mode() == "metal");
+            let gpu = observed_mode() == "metal" || std::env::var("RISC0_RECURSION_HAL").as_deref() == Ok("metal");
+            assert_eq!(gpu_available, gpu);
+            assert_eq!(gpu_name.is_some(), gpu);
             assert_eq!(supported_benchmarks, ["fibonacci", "sha256-chain"]);
         }
         other => panic!("unexpected capabilities: {other:?}"),
