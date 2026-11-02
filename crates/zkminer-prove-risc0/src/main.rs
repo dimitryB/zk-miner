@@ -1345,40 +1345,6 @@ fn benchmark_program(
         .build()
         .ok()?;
 
-    // Quick HIP sanity check before proving
-    #[cfg(feature = "rocm")]
-    {
-        use std::ffi::c_void;
-        extern "C" {
-            fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
-            fn hipMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: i32) -> i32;
-            fn hipFree(ptr: *mut c_void) -> i32;
-            fn hipGetLastError() -> i32;
-            fn hipDeviceSynchronize() -> i32;
-        }
-        unsafe {
-            // Clear any pending errors
-            let last = hipGetLastError();
-            if last != 0 {
-                tracing::warn!("Pending HIP error before prove: {last}");
-            }
-            let sync = hipDeviceSynchronize();
-            if sync != 0 {
-                tracing::warn!("hipDeviceSynchronize before prove: {sync}");
-            }
-            // Test allocation + memcpy
-            let mut ptr: *mut c_void = std::ptr::null_mut();
-            let ret = hipMalloc(&mut ptr, 256);
-            tracing::info!("HIP test: hipMalloc(256) = {ret}, ptr = {ptr:?}");
-            if ret == 0 && !ptr.is_null() {
-                let data = [0xAAu8; 256];
-                let ret2 = hipMemcpy(ptr, data.as_ptr() as *const c_void, 256, 1);
-                tracing::info!("HIP test: hipMemcpy H2D = {ret2}");
-                hipFree(ptr);
-            }
-        }
-    }
-
     // ONE proof, staged, so each stage is timed exactly rather than inferred from two runs.
     //
     // This previously called bare `prove(env, elf)`, i.e. `ProverOpts::default()`, which is

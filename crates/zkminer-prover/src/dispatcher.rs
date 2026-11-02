@@ -596,8 +596,17 @@ fn physical_gpu_id(key: &str) -> Option<String> {
 /// delays startup.
 const VRAM_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn gpu_vram_bytes(gpu_tag: &str, device_index: Option<u32>) -> Option<u64> {
+fn gpu_vram_bytes(
+    gpu_tag: &str,
+    device_index: Option<u32>,
+    pci_bus_id: Option<&str>,
+) -> Option<u64> {
     let idx = device_index?;
+    if gpu_tag == "rocm" {
+        // The amdgpu driver's own count (sysfs); routing, benchmark rows and calibration then size
+        // an AMD card as they size a CUDA one.
+        return amd_vram_bytes(pci_bus_id?);
+    }
     if gpu_tag != "cuda" {
         return None;
     }
@@ -632,6 +641,10 @@ fn gpu_vram_bytes(gpu_tag: &str, device_index: Option<u32>) -> Option<u64> {
     let mib: u64 = stdout.trim().parse().ok()?;
     Some(mib * 1024 * 1024)
 }
+
+/// `HSA_SCRATCH_SINGLE_LIMIT` for a ROCm worker whose card's memory cannot be read: above the ~7.6 GB
+/// the keccak eval_check asks for on a 96-CU card (see `gpu_env`).
+const ROCM_SCRATCH_LIMIT_FALLBACK: u64 = 16 * 1024 * 1024 * 1024;
 
 /// An AMD card's total VRAM in bytes, from the amdgpu driver's sysfs entry for its PCI bus id.
 fn amd_vram_bytes(pci_bus_id: &str) -> Option<u64> {
@@ -1645,7 +1658,7 @@ impl WorkerPool {
                         // its own appetite has the two numbers to scale against. Neither is
                         // discoverable from inside the worker: `nvidia-smi` ignores
                         // `CUDA_VISIBLE_DEVICES`, and only the dispatcher knows the host reserve.
-                        if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index) {
+                        if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index, pci_bus_id) {
                             env.insert(
                                 zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
                                 vram.to_string(),
@@ -1693,7 +1706,7 @@ impl WorkerPool {
                         // `CUDA_VISIBLE_DEVICES`, the worker cannot ask `nvidia-smi` about its own
                         // card. The risc0 worker needs it to decide whether its Groth16 SRS cache
                         // can stay resident between proofs; see `release_groth16_cache_if_tight`.
-                        if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index) {
+                        if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index, pci_bus_id) {
                             env.insert(
                                 zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
                                 vram.to_string(),
@@ -1707,6 +1720,25 @@ impl WorkerPool {
                 env.insert("NVCC".into(), "off".into());
                 if let Some(i) = device_index {
                     env.insert("HIP_VISIBLE_DEVICES".into(), i.to_string());
+                }
+                // Scratch (per-lane private memory) for a single kernel dispatch. risc0's HIP prover
+                // tunes ROCm at start-up when these are unset (`auto_configure_hw_queues`, since
+                // hemilabs/risc0 #28): HSA_SCRATCH_SINGLE_LIMIT 384 MiB and HSA_NO_SCRATCH_RECLAIM=1
+                // on gfx11. The keccak circuit's eval_check needs ~7.6 GB of scratch on a 96-CU RX
+                // 7900 XTX, so under those settings every keccak proof aborted the worker
+                // (HSA_STATUS_ERROR_OUT_OF_RESOURCES, "reserved node is already in use or too
+                // small"), and a larger limit alone does not help while reclaim is off. With the
+                // limit at the card's memory and reclaim on, keccak proves, and other proofs take the
+                // same time (sha256-chain@10000, 3 proofs each way, 23.0-23.4 s). An operator's own
+                // setting, inherited from this process, wins.
+                if std::env::var_os("HSA_SCRATCH_SINGLE_LIMIT").is_none() {
+                    let limit = pci_bus_id
+                        .and_then(amd_vram_bytes)
+                        .unwrap_or(ROCM_SCRATCH_LIMIT_FALLBACK);
+                    env.insert("HSA_SCRATCH_SINGLE_LIMIT".into(), limit.to_string());
+                }
+                if std::env::var_os("HSA_NO_SCRATCH_RECLAIM").is_none() {
+                    env.insert("HSA_NO_SCRATCH_RECLAIM".into(), "0".into());
                 }
             }
             "intel" => {
@@ -1851,7 +1883,7 @@ impl WorkerPool {
 
             if let (Some(floor), Some(have)) = (
                 crate::discovery::min_vram_bytes_for_backend(&backend),
-                gpu_vram_bytes(&gpu_tag, device_index),
+                gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref()),
             ) {
                 if have < floor {
                     tracing::warn!(
@@ -1911,7 +1943,11 @@ impl WorkerPool {
                                 declined: None,
                                 proofs_since_spawn: 0,
                             }),
-                            vram_bytes: gpu_vram_bytes(&gpu_tag, device_index),
+                            vram_bytes: gpu_vram_bytes(
+                                &gpu_tag,
+                                device_index,
+                                pci_bus_id.as_deref(),
+                            ),
                             pci_bus_id: pci_bus_id.clone().filter(|b| !b.is_empty()),
                             pid: Arc::new(AtomicU32::new(worker_pid)),
                             pid_starttime: Arc::new(AtomicU64::new(
@@ -1938,7 +1974,7 @@ impl WorkerPool {
                     } else {
                         tracing::error!("Failed to start worker {key}{device_desc}: {msg}");
                     }
-                    let vram_bytes = gpu_vram_bytes(&gpu_tag, device_index);
+                    let vram_bytes = gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref());
                     let entry_bus_id = pci_bus_id.clone().filter(|b| !b.is_empty());
                     self.workers.insert(
                         key,
@@ -5405,8 +5441,8 @@ impl WorkerPool {
 
     /// Every risc0 proving slot, sorted, as `(slot key, benchmark device id, card VRAM if known)`: what
     /// a card's job segment size is decided from (`benchmark::risc0_job_po2`), its calibration row and
-    /// its Settings override being keyed by the device id. An AMD card's VRAM, which routing does not
-    /// know, is read from the driver here. Takes no slot lock.
+    /// its Settings override being keyed by the device id. A slot whose VRAM was not read at spawn falls
+    /// back to the amdgpu driver's count for an AMD card. Takes no slot lock.
     pub fn risc0_slots(&self) -> Vec<(String, String, Option<u64>)> {
         let mut slots: Vec<_> = self
             .keys_for_prefix(zkminer_prover_protocol::BACKEND_RISC0)
@@ -7738,6 +7774,17 @@ mod tests {
         let env = WorkerPool::gpu_env("risc0", "rocm", None, Some(2));
         assert_eq!(env.get("HIP_VISIBLE_DEVICES").unwrap(), "2");
         assert_eq!(env.get("NVCC").unwrap(), "off");
+        // Room for the keccak eval_check's scratch, reclaim on (see `gpu_env`); an operator's own
+        // values, inherited from this process, are left alone.
+        if std::env::var_os("HSA_SCRATCH_SINGLE_LIMIT").is_none() {
+            assert_eq!(
+                env.get("HSA_SCRATCH_SINGLE_LIMIT").unwrap(),
+                &ROCM_SCRATCH_LIMIT_FALLBACK.to_string()
+            );
+        }
+        if std::env::var_os("HSA_NO_SCRATCH_RECLAIM").is_none() {
+            assert_eq!(env.get("HSA_NO_SCRATCH_RECLAIM").unwrap(), "0");
+        }
     }
 
     #[test]
