@@ -11,7 +11,6 @@ members = [
     "crates/zkminer-cli",
     "crates/zkminer-prove-risc0",
     "crates/zkminer-prove-sp1",
-    "crates/zkminer-prove-openvm",
     "crates/zkminer-e2e",
 ]
 default-members = [
@@ -26,6 +25,10 @@ default-members = [
 ]
 exclude = [
     "crates/zkminer-prover/guests",
+    # Its own workspace and lockfile: OpenVM 1.5.0-rc.1 pins p3-field =0.4.1 and SP1 6.8.1's slop
+    # crates =0.4.3-succinct, and one workspace can hold only one 0.4.x. Build it with
+    # `--manifest-path crates/zkminer-prove-openvm/Cargo.toml`.
+    "crates/zkminer-prove-openvm",
 ]
 
 [workspace.package]
@@ -155,33 +158,36 @@ sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "5f68eb3eb9e4
 
 # Patch SP1 crates to use hemilabs fork (AMD GPU + PLONK optimizations)
 #
-# Pinned by commit: the head of branch `zkminer/sp1-gpu-fixes`, which is `max/optimizations_and_amd` @
-# 676290bb8 plus four out-of-bounds GPU fixes that crash Blackwell (sm_120) and the changes that let a
-# 16 GB card finish a Groth16 proof. Those commits touch only the `sp1-gpu` crates, which zkminer does
-# not compile: they take effect in `sp1-gpu-server`, which must be BUILT FROM THIS COMMIT (the server
-# the SDK downloads is upstream's and has neither the fixes nor the 16 GB tier). Dockerfile.build
-# builds it from the commit Cargo.lock records here, and the release ships it beside
-# `zkminer-prove-sp1`, which installs it. A commit rather than a branch, so that a moved branch can
-# never pair an SDK with a different server. Keep `crates/zkminer-cli/Cargo.toml`, which names the
-# commit directly, in step with this.
-sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-build = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-cuda = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-prover = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-prover-types = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-core-executor = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-core-machine = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-curves = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-derive = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-hypercube = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-jit = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-primitives = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-verifier = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+# Pinned by commit: hemilabs/sp1 #19 (`perf/windows-gpu-cpu`) @ 23a275ccd, tagged `zkminer-pin-2026-11-02`
+# so a rebased or deleted branch cannot orphan it. It is SP1 6.8.1 (circuit v6.1.0, the circuit
+# 743111's SP1 verifier accepts) with the proof-nonce fix, the CUDA build fix and the fork's CUDA, HIP
+# and SYCL GPU backends. The previous pin, `zkminer/sp1-gpu-fixes` @ 64e895cb3 (v6.0.2), stays tagged
+# `zkminer-pin-2026-10-11`. The `sp1-gpu` crates, which zkminer does not compile, take effect in
+# `sp1-gpu-server`, which must be BUILT FROM THIS COMMIT, once per GPU vendor (SP1_GPU_BACKEND=cuda,
+# hip, sycl; the HIP and SYCL builds are installed as `sp1-gpu-server-hip` / `-sycl`): the server the
+# SDK downloads is upstream's CUDA build without the fork's fixes. Dockerfile.build builds the CUDA
+# one from the commit Cargo.lock records here, and the release ships it beside `zkminer-prove-sp1`,
+# which installs it. A commit rather than a branch, so that a moved branch can never pair an SDK with
+# a different server. Keep `crates/zkminer-cli/Cargo.toml`, which names the commit directly, in step
+# with this.
+sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-build = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-cuda = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-prover = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-prover-types = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-core-executor = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-core-machine = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-curves = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-derive = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-hypercube = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-jit = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-primitives = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
+sp1-verifier = { git = "https://github.com/hemilabs/sp1", rev = "23a275ccd93884901ea58df0c200318d8cf98bc6" }
 
 [profile.release]
 opt-level = 3
@@ -213,6 +219,4 @@ codegen-units = 1
 [profile.release.package.zkminer-prove-risc0]
 codegen-units = 1
 [profile.release.package.zkminer-prove-sp1]
-codegen-units = 1
-[profile.release.package.zkminer-prove-openvm]
 codegen-units = 1

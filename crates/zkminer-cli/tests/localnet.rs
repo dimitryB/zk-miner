@@ -77,7 +77,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use zkminer_chain::auction::risc_zero_groth16_v1_id;
+use zkminer_chain::auction::{is_sp1_id, risc_zero_groth16_v1_id, sp1_groth16_v1_id};
 use zkminer_chain::binding::{fields_hash, full_hash};
 use zkminer_chain::deployment::HEMI_TESTNET_743111 as DEPLOYMENT;
 use zkminer_config::ZkMinerConfig;
@@ -330,8 +330,10 @@ enum Clock {
 /// The program a run's jobs are for: what its registry URI serves, and what its jobs bind.
 struct Program {
     name: &'static str,
-    /// The image id: the jobs' `programId`.
+    /// The image id (risc0) or vkey hash (SP1): the jobs' `programId`.
     id: B256,
+    /// The jobs' `proofSystemId`, and the one the program is registered under.
+    proof_system: B256,
     /// The bytes its storage URI serves.
     elf: Vec<u8>,
     /// Every job's `inputData`.
@@ -348,6 +350,7 @@ impl Program {
         Program {
             name: "fibonacci (zkminer localnet)",
             id,
+            proof_system: risc_zero_groth16_v1_id(),
             elf,
             input: FIB_N.to_le_bytes().to_vec(),
             journal: fib(FIB_N).to_le_bytes().to_vec(),
@@ -360,9 +363,24 @@ impl Program {
         Program {
             name: "receipt fixture (zkminer localnet)",
             id: FIXTURE_IMAGE_ID,
+            proof_system: risc_zero_groth16_v1_id(),
             elf: b"zkminer localnet: the mock worker replays this program's receipt".to_vec(),
             input: b"zkminer localnet".to_vec(),
             journal: FIXTURE_JOURNAL.to_vec(),
+        }
+    }
+
+    /// The SP1 fibonacci guest, exported by the SP1 worker (its vkey hash is the `programId`). It reads
+    /// a `u32` and commits the `u64` result, as the risc0 one does.
+    fn sp1_fibonacci(worker: &Path, dir: &Path) -> Self {
+        let (elf, id) = export_guest(worker, &dir.join("sp1"));
+        Program {
+            name: "fibonacci SP1 (zkminer localnet)",
+            id,
+            proof_system: sp1_groth16_v1_id(),
+            elf,
+            input: FIB_N.to_le_bytes().to_vec(),
+            journal: fib(FIB_N).to_le_bytes().to_vec(),
         }
     }
 
@@ -581,6 +599,7 @@ fn mock_worker() -> PathBuf {
 
 /// The fibonacci guest and its image id (the jobs' `programId`), from the worker that runs it.
 fn export_guest(worker: &Path, dir: &Path) -> (Vec<u8>, B256) {
+    std::fs::create_dir_all(dir).expect("create the export directory");
     let path = dir.join("fibonacci.bin");
     let out = Command::new(worker)
         .args(["--export-guest", "fibonacci"])
@@ -629,6 +648,8 @@ macro_rules! mined {
 /// A job submitted for one case.
 struct Job {
     case: Case,
+    /// Which of the world's programs (0: `World::program`, then `World::extra`).
+    program: usize,
     id: B256,
     /// The block its submit was mined in.
     block: u64,
@@ -649,6 +670,10 @@ struct World {
     prover: PrivateKeySigner,
     submitter: Address,
     program: Program,
+    /// More programs, each submitted with every case as `program` is (`World::with_programs`).
+    extra: Vec<Program>,
+    /// How many jobs of each case and program.
+    copies: usize,
     /// The cases this run submits.
     cases: Vec<Case>,
     /// The jobs submitted so far.
@@ -662,6 +687,28 @@ struct World {
 
 impl World {
     async fn new(dir: &Path, program: Program, cases: &[Case], clock: Clock) -> Self {
+        Self::with_programs(dir, vec![program], cases, clock, 1).await
+    }
+
+    /// The program of a job.
+    fn program_of(&self, job: &Job) -> &Program {
+        match job.program {
+            0 => &self.program,
+            i => &self.extra[i - 1],
+        }
+    }
+
+    /// A world whose every program gets `copies` jobs of each case.
+    async fn with_programs(
+        dir: &Path,
+        programs: Vec<Program>,
+        cases: &[Case],
+        clock: Clock,
+        copies: usize,
+    ) -> Self {
+        let mut programs = programs.into_iter();
+        let program = programs.next().expect("a world has a program");
+        let extra: Vec<Program> = programs.collect();
         let mut anvil = start_anvil(dir);
         let provider = ProviderBuilder::new()
             .connect_http(anvil.url.parse().unwrap())
@@ -716,6 +763,8 @@ impl World {
         let from_block = provider.get_block_number().await.unwrap() + 1;
 
         let (elf_url, elf_hits) = serve_file(program.elf.clone());
+        let extra_urls: Vec<String> = extra.iter().map(|p| serve_file(p.elf.clone()).0).collect();
+        let n_programs = 1 + extra.len();
 
         let submitter = Address::from_word(keccak256(b"zkminer localnet submitter"));
         let prover = PrivateKeySigner::random();
@@ -727,17 +776,20 @@ impl World {
 
         // The submitter pays the registry's fee (as set on the fork) for each program it registers,
         // and each job's deposit.
-        let registrations = 1 + cases
-            .iter()
-            .filter(|c| matches!(c, Case::DecoyElf | Case::ElfUnreachable))
-            .count();
+        let registrations = n_programs
+            + cases
+                .iter()
+                .filter(|c| matches!(c, Case::DecoyElf | Case::ElfUnreachable))
+                .count();
         let registration_fees = IProgramRegistryFee::new(DEPLOYMENT.program_registry, &provider)
             .registrationFee()
             .call()
             .await
             .expect("read the registry's registrationFee()")
             * U256::from(registrations);
-        let deposits = U256::from(cases.iter().map(|c| c.deposit()).sum::<u128>());
+        let deposits = U256::from(
+            cases.iter().map(|c| c.deposit()).sum::<u128>() * (n_programs * copies) as u128,
+        );
 
         let token = ITestnetToken::new(DEPLOYMENT.token, &provider);
         let erc20 = IERC20::new(DEPLOYMENT.token, &provider);
@@ -775,15 +827,24 @@ impl World {
             "approve the registration fees"
         );
         let elf_hash = keccak256(&program.elf);
-        register_program(
-            &provider,
-            submitter,
-            program.id,
-            program.name,
-            &elf_url,
-            elf_hash,
-        )
-        .await;
+        for (p, url) in std::iter::once((&program, &elf_url)).chain(extra.iter().zip(&extra_urls)) {
+            let hash = keccak256(&p.elf);
+            register_program(
+                &provider,
+                submitter,
+                p.id,
+                p.proof_system,
+                p.name,
+                url,
+                hash,
+            )
+            .await;
+            if is_sp1_id(p.proof_system) {
+                // The registry takes an SP1 program's ELF hash in a call of its own, and the miner
+                // claims no SP1 job without it.
+                set_build_info(&provider, submitter, p.id, hash, p.name).await;
+            }
+        }
         if cases.contains(&Case::DecoyElf) {
             // Another programId whose URI serves this run's ELF.
             let id = Case::DecoyElf.program_id(&program);
@@ -791,6 +852,7 @@ impl World {
                 &provider,
                 submitter,
                 id,
+                program.proof_system,
                 "decoy (zkminer localnet)",
                 &elf_url,
                 elf_hash,
@@ -804,6 +866,7 @@ impl World {
                 &provider,
                 submitter,
                 id,
+                program.proof_system,
                 "unreachable (zkminer localnet)",
                 &url,
                 B256::ZERO,
@@ -822,6 +885,8 @@ impl World {
             prover,
             submitter,
             program,
+            extra,
+            copies,
             cases: cases.to_vec(),
             jobs: Vec::new(),
             from_block,
@@ -832,8 +897,13 @@ impl World {
         // waits for its receipt, so the next is mined in a later block.
         let mut before: Vec<Case> = cases.iter().copied().filter(|c| c.before_start()).collect();
         before.sort_by_key(|&c| c != Case::Full);
-        for case in before {
-            world.submit(case).await;
+        // The first program's first Full job first (see above), then the rest in order.
+        for program in 0..n_programs {
+            for copy in 0..copies {
+                for &case in &before {
+                    world.submit_job(case, program, copy).await;
+                }
+            }
         }
         if let Some(full) = world.jobs.iter().find(|j| j.case == Case::Full) {
             for job in world.jobs.iter().filter(|j| j.case != Case::Full) {
@@ -967,10 +1037,19 @@ impl World {
     }
 
     async fn submit(&mut self, case: Case) {
+        self.submit_job(case, 0, 0).await;
+    }
+
+    /// Submit a job of `case` for the world's `program`-th program, the `copy`-th of its kind.
+    async fn submit_job(&mut self, case: Case, program: usize, copy: usize) {
         let core = IHemiProveCore::new(DEPLOYMENT.router, &self.provider);
+        let p = match program {
+            0 => &self.program,
+            i => &self.extra[i - 1],
+        };
         let receipt = mined!(
             core.submitJob(
-                descriptor(case, &self.program, self.prover.address()),
+                descriptor(case, p, self.prover.address(), copy),
                 case.auction(),
                 no_cycles(),
                 no_bidding(),
@@ -988,7 +1067,12 @@ impl World {
         let block = receipt
             .block_number
             .expect("the submit receipt has a block");
-        self.jobs.push(Job { case, id, block });
+        self.jobs.push(Job {
+            case,
+            program,
+            id,
+            block,
+        });
     }
 
     /// Where the miner's backfill starts: the block of the Case::Full job's submit, the first job
@@ -1006,8 +1090,18 @@ impl World {
         if !wait_for_line(miner, "Job monitor started", Duration::from_secs(120)).await {
             miner.fail("the miner's job monitor did not start within 120 s");
         }
-        for case in self.cases.clone().into_iter().filter(|c| !c.before_start()) {
-            self.submit(case).await;
+        let after: Vec<Case> = self
+            .cases
+            .iter()
+            .copied()
+            .filter(|c| !c.before_start())
+            .collect();
+        for program in 0..=self.extra.len() {
+            for copy in 0..self.copies {
+                for &case in &after {
+                    self.submit_job(case, program, copy).await;
+                }
+            }
         }
     }
 
@@ -1080,6 +1174,30 @@ impl World {
         c.save(Some(&path)).expect("write the miner config");
         path
     }
+
+    /// The miner's config with every worker in `workers` discovered (one per card each), and risc0
+    /// job sizes for the cards in `risc0_po2` (device id, po2): a card under 14 GiB proves risc0 jobs
+    /// only with a size, from calibration or the config.
+    fn write_config_for(
+        &self,
+        dir: &Path,
+        workers: &[PathBuf],
+        risc0_po2: &[(String, u8)],
+    ) -> PathBuf {
+        let path = self.write_config(dir, &workers[0], true);
+        let mut c = ZkMinerConfig::load(Some(&path)).expect("read the miner config back");
+        let provers = dir.join("provers");
+        for worker in &workers[1..] {
+            let link = provers.join(worker.file_name().unwrap());
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(worker, &link).unwrap();
+        }
+        for (device, po2) in risc0_po2 {
+            c.prover.risc0_job_po2.insert(device.clone(), *po2);
+        }
+        c.save(Some(&path)).expect("write the miner config");
+        path
+    }
 }
 
 async fn set_balance(provider: &DynProvider, a: Address, wei: u128) {
@@ -1140,6 +1258,7 @@ async fn register_program(
     provider: &DynProvider,
     from: Address,
     id: B256,
+    proof_system: B256,
     name: &str,
     url: &str,
     content_hash: B256,
@@ -1176,7 +1295,7 @@ async fn register_program(
         registry
             .registerProgram(
                 id,
-                risc_zero_groth16_v1_id(),
+                proof_system,
                 B256::ZERO,
                 ResourceEstimate {
                     estimatedCycles: 0,
@@ -1197,8 +1316,49 @@ async fn register_program(
     );
 }
 
-fn descriptor(case: Case, program: &Program, prover: Address) -> JobDescriptor {
-    let psid = risc_zero_groth16_v1_id();
+alloy::sol! {
+    #[sol(rpc)]
+    interface IProgramBuildInfo {
+        function setBuildInfo(
+            bytes32 programId,
+            bytes32 sourceCodeHash,
+            bytes32 elfHash,
+            string sourceUri,
+            string buildCommand,
+            string toolchainVersion,
+            string rustToolchain,
+            string containerImage
+        ) external;
+    }
+}
+
+/// Record a program's ELF hash (`ProgramRegistry.setBuildInfo`, as its registrant).
+async fn set_build_info(
+    provider: &DynProvider,
+    from: Address,
+    id: B256,
+    elf_hash: B256,
+    name: &str,
+) {
+    mined!(
+        IProgramBuildInfo::new(DEPLOYMENT.program_registry, provider)
+            .setBuildInfo(
+                id,
+                B256::ZERO,
+                elf_hash,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            )
+            .from(from),
+        format!("set the build info of {name}")
+    );
+}
+
+fn descriptor(case: Case, program: &Program, prover: Address, copy: usize) -> JobDescriptor {
+    let psid = program.proof_system;
     let (program_id, journal) = (case.program_id(program), &program.journal);
     let slot0 = |word: u32| {
         let mut f = B256::ZERO;
@@ -1252,7 +1412,7 @@ fn descriptor(case: Case, program: &Program, prover: Address) -> JobDescriptor {
         proofSystemId: psid,
         callbackContract: Address::ZERO,
         assignedProver: assigned,
-        tag: keccak256(format!("zkminer localnet {case:?}")),
+        tag: keccak256(format!("zkminer localnet {case:?} {} {copy}", program.name)),
         inputData: program.input.clone().into(),
         callbackExtraData: Bytes::new(),
         extraVerifierData: Bytes::new(),
@@ -2029,6 +2189,114 @@ async fn mines_the_claimable_jobs() {
     dir.finish();
 }
 
+/// Every GPU proves: risc0 and SP1 fibonacci jobs (FULL, FIELDS and NONE-for-us, several copies each)
+/// for one miner holding every worker, until each is fulfilled on the fork; then every slot named in
+/// `ZKMINER_LOCALNET_EXPECT_SLOTS` must have proved at least one of them.
+///
+/// Needs `ZKMINER_LOCALNET_MINE_ALL=1`, `ZKMINER_LOCALNET_WORKERS` (the risc0 workers, `:`-separated,
+/// the first exporting the risc0 guest) and `ZKMINER_LOCALNET_SP1_WORKER` (with its servers beside it).
+/// Optional: `ZKMINER_LOCALNET_COPIES` (default 3), `ZKMINER_LOCALNET_RISC0_PO2` (`gpu1=19,...`), and
+/// `SP1_GROTH16_CIRCUIT_PATH`, `XDG_CACHE_HOME`, `ZKMINER_MIN_AVAILABLE_VRAM_MB` and
+/// `ZKMINER_GPU_NAME_FILTER`, passed to the miner.
+#[tokio::test]
+#[ignore = "needs every GPU worker and SP1 server"]
+async fn mines_on_every_gpu() {
+    if !env_flag("ZKMINER_LOCALNET_MINE_ALL") {
+        eprintln!(
+            "localnet: SKIPPED the every-GPU test; set ZKMINER_LOCALNET_MINE_ALL=1 to run it"
+        );
+        return;
+    }
+    let timeout = Duration::from_secs(
+        std::env::var("ZKMINER_LOCALNET_MINE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3_600),
+    );
+    let workers: Vec<PathBuf> = std::env::var("ZKMINER_LOCALNET_WORKERS")
+        .expect("ZKMINER_LOCALNET_WORKERS: the risc0 workers, `:`-separated")
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let sp1_worker = PathBuf::from(
+        std::env::var("ZKMINER_LOCALNET_SP1_WORKER").expect("ZKMINER_LOCALNET_SP1_WORKER"),
+    );
+    for w in workers.iter().chain(std::iter::once(&sp1_worker)) {
+        assert!(w.is_file(), "no worker at {}", w.display());
+    }
+    let copies = std::env::var("ZKMINER_LOCALNET_COPIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let po2: Vec<(String, u8)> = std::env::var("ZKMINER_LOCALNET_RISC0_PO2")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().parse().ok()?))
+        })
+        .collect();
+    let dir = RunDir::new("mine-all");
+    let risc0 = Program::fibonacci(&workers[0], &dir.0);
+    let sp1 = Program::sp1_fibonacci(&sp1_worker, &dir.0);
+    let cases = [Case::Full, Case::Fields, Case::NoneForUs];
+    let mut world =
+        World::with_programs(&dir.0, vec![risc0, sp1], &cases, Clock::Wall, copies).await;
+    let mut all = workers.clone();
+    all.push(sp1_worker);
+    let config = world.write_config_for(&dir.0, &all, &po2);
+    let env: Vec<(&'static str, String)> = [
+        "SP1_GROTH16_CIRCUIT_PATH",
+        "XDG_CACHE_HOME",
+        "ZKMINER_MIN_AVAILABLE_VRAM_MB",
+        // To steer jobs onto particular NVIDIA cards: one SP1 proof at a time fits this host's RAM
+        // (each is charged ~24 GiB), so it lands on the same card every time unless others are hidden.
+        "ZKMINER_GPU_NAME_FILTER",
+    ]
+    .into_iter()
+    .filter_map(|k| std::env::var(k).ok().map(|v| (k, v)))
+    .collect();
+
+    let nonce_before = world.prover_nonce().await;
+    let mut miner = start_mining(&world, &dir, &config, env, false);
+    world.submit_after_start(&mut miner).await;
+    let (fulfilled, exited_early) = wait_fulfilled(&world, &mut miner, timeout).await;
+    tokio::time::sleep(SETTLE).await;
+    let stopped = miner.stop(DRAIN_GRACE);
+    let lines = miner.lines();
+    let mut failures = check_settlement(
+        &world,
+        &lines,
+        nonce_before,
+        &fulfilled,
+        exited_early,
+        stopped,
+    )
+    .await;
+    // Which slot proved each job: `Job <id> proved on <slot>`.
+    let mut by_slot: std::collections::BTreeMap<String, usize> = Default::default();
+    for line in &lines {
+        if let Some(rest) = strip_ansi(line).split(" proved on ").nth(1) {
+            let slot = rest.split_whitespace().next().unwrap_or("").to_string();
+            *by_slot.entry(slot).or_default() += 1;
+        }
+    }
+    eprintln!("localnet: proofs by slot: {by_slot:?}");
+    for slot in std::env::var("ZKMINER_LOCALNET_EXPECT_SLOTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !by_slot.contains_key(slot) {
+            failures.push(format!("slot {slot} proved none of the jobs ({by_slot:?})"));
+        }
+    }
+    report(&world, &dir, &miner, &failures).await;
+    dir.finish();
+}
+
 /// `zkminer run` with the prover's key.
 fn start_mining(
     world: &World,
@@ -2123,7 +2391,7 @@ async fn check_settlement(
                             job.case
                         ));
                     }
-                    if f.event.publicValues.as_ref() != world.program.journal.as_slice() {
+                    if f.event.publicValues.as_ref() != world.program_of(job).journal.as_slice() {
                         failures.push(format!(
                             "{:?}: fulfilled with journal {}, not the program's",
                             job.case, f.event.publicValues

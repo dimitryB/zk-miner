@@ -167,6 +167,9 @@ fn detect_nvidia_via_smi() -> Option<Vec<DetectedGpu>> {
     }
     let mut gpus = Vec::new();
     let mut saw_nonempty_line = false;
+    // Cards `ZKMINER_GPU_NAME_FILTER` left out: an empty list because of them is the operator's
+    // choice, not an unparseable probe, and must not fall back to /proc (which would bring them back).
+    let mut filtered_out = 0usize;
 
     for line in stdout.lines() {
         let line = line.trim();
@@ -192,10 +195,9 @@ fn detect_nvidia_via_smi() -> Option<Vec<DetectedGpu>> {
         // Optional operator override to restrict which physical GPUs are used — e.g.
         // to isolate a single card for testing, or to exclude one in a bad driver
         // state. Case-insensitive substring match on the GPU name; unset = all GPUs.
-        if let Ok(filter) = std::env::var("ZKMINER_GPU_NAME_FILTER") {
-            if !filter.is_empty() && !name.to_lowercase().contains(&filter.to_lowercase()) {
-                continue;
-            }
+        if !passes_gpu_name_filter(&name) {
+            filtered_out += 1;
+            continue;
         }
         // nvidia-smi outputs an 8-digit domain ("00000000:01:00.0"); sysfs uses 4.
         // Normalize so both sides of the cross-crate join produce the same string.
@@ -215,7 +217,7 @@ fn detect_nvidia_via_smi() -> Option<Vec<DetectedGpu>> {
     // If nvidia-smi ran but we couldn't parse a single GPU out of non-empty output
     // (e.g. a future column change or all-error lines), do NOT report "0 GPUs" —
     // that would silently skip the CUDA worker. Fall through to the /proc fallback.
-    if gpus.is_empty() && saw_nonempty_line {
+    if gpus.is_empty() && saw_nonempty_line && filtered_out == 0 {
         tracing::warn!(
             "nvidia-smi produced output but no GPUs were parsed; falling back to /proc detection"
         );
@@ -223,6 +225,15 @@ fn detect_nvidia_via_smi() -> Option<Vec<DetectedGpu>> {
     }
 
     Some(gpus)
+}
+
+/// `ZKMINER_GPU_NAME_FILTER` (a case-insensitive substring of the GPU name; unset or empty keeps every
+/// card): whether an NVIDIA card named `name` is kept.
+fn passes_gpu_name_filter(name: &str) -> bool {
+    match std::env::var("ZKMINER_GPU_NAME_FILTER") {
+        Ok(filter) if !filter.is_empty() => name.to_lowercase().contains(&filter.to_lowercase()),
+        _ => true,
+    }
 }
 
 /// Enumerate /proc/driver/nvidia/gpus/*/information as fallback.
@@ -260,6 +271,11 @@ fn detect_nvidia_via_proc() -> Vec<DetectedGpu> {
         if bus_location.is_empty() {
             // Use directory name as PCI bus ID
             bus_location = entry.file_name().to_string_lossy().to_string();
+        }
+        // The same filter as the nvidia-smi path, which this one stands in for. The index stays the
+        // card's position among them all, as there.
+        if !model.is_empty() && !passes_gpu_name_filter(&model) {
+            continue;
         }
 
         gpus.push(DetectedGpu {
@@ -794,7 +810,9 @@ pub fn discover_workers(
                 let gpu_tag = infer_gpu_tag(path);
                 let cuda_cards: Vec<&DetectedGpu> =
                     if gpu_tag == "generic" && drives_cuda_without_visibility_pin(backend) {
-                        gpus.iter().filter(|g| g.gpu_tag == "cuda").collect()
+                        gpus.iter()
+                            .filter(|g| sp1_serves_card(&g.gpu_tag, path))
+                            .collect()
                     } else {
                         Vec::new()
                     };
@@ -812,7 +830,7 @@ pub fn discover_workers(
                     for gpu in cuda_cards {
                         found.push(DiscoveredWorker {
                             backend: backend.to_string(),
-                            gpu_tag: "cuda".to_string(),
+                            gpu_tag: gpu.gpu_tag.clone(),
                             device_index: Some(gpu.device_index),
                             pci_bus_id: Some(gpu.pci_bus_id.clone()),
                             gpu_name: Some(gpu.name.clone()),
@@ -858,7 +876,9 @@ pub fn discover_workers(
             // can be routed to. See `drives_cuda_without_visibility_pin`.
             let cuda_tags: Vec<&DetectedGpu> =
                 if *gpu_tag == "generic" && drives_cuda_without_visibility_pin(backend) {
-                    gpus.iter().filter(|g| g.gpu_tag == "cuda").collect()
+                    gpus.iter()
+                        .filter(|g| sp1_serves_card(&g.gpu_tag, &path))
+                        .collect()
                 } else {
                     Vec::new()
                 };
@@ -866,10 +886,10 @@ pub fn discover_workers(
                 for gpu in cuda_tags {
                     found.push(DiscoveredWorker {
                         backend: backend.to_string(),
-                        // `cuda`, not `generic`: this is the occupancy fact, and every consumer of
-                        // `gpu_tag` (`physical_gpu_id`, `gpu_device_id`, `proving_gpu_count`) wants
-                        // it. The pin is withheld separately, in `gpu_env`.
-                        gpu_tag: "cuda".to_string(),
+                        // The card's vendor, not `generic`: this is the occupancy fact, and every
+                        // consumer of `gpu_tag` (`physical_gpu_id`, `gpu_device_id`,
+                        // `proving_gpu_count`) wants it. The pin is withheld separately, in `gpu_env`.
+                        gpu_tag: gpu.gpu_tag.clone(),
                         device_index: Some(gpu.device_index),
                         pci_bus_id: Some(gpu.pci_bus_id.clone()),
                         gpu_name: Some(gpu.name.clone()),
@@ -1064,7 +1084,44 @@ pub fn gpu_code_binary(backend: &str, worker: &Path) -> Option<PathBuf> {
 /// installed now, is the one the worker will use. Without either, the SDK downloads upstream's
 /// build later, whose GPU code nothing here can see in advance.
 fn sp1_server_for(worker: &Path, install: bool, home: Option<&Path>) -> Option<PathBuf> {
-    const SERVER: &str = "sp1-gpu-server";
+    sp1_named_server_for("sp1-gpu-server", worker, install, home)
+}
+
+/// The `sp1-gpu-server` build an SP1 worker runs on a card of `gpu_tag`, or `None` for a card no
+/// SP1 build drives. The CUDA build keeps the SDK's default name; hemilabs/sp1's HIP and SYCL builds
+/// (#19) are installed beside it under their own names and chosen with `SP1_GPU_SERVER_NAME`.
+pub fn sp1_server_name(gpu_tag: &str) -> Option<&'static str> {
+    match gpu_tag {
+        "cuda" => Some("sp1-gpu-server"),
+        "rocm" => Some("sp1-gpu-server-hip"),
+        "intel" => Some("sp1-gpu-server-sycl"),
+        _ => None,
+    }
+}
+
+/// Whether the SP1 worker at `worker` can drive a card of `gpu_tag`: always a CUDA card (the SDK
+/// downloads a CUDA server when none is shipped); an AMD or Intel card only when its vendor's server
+/// is shipped beside the worker or installed in `~/.sp1/bin`, since nothing downloads those.
+fn sp1_serves_card(gpu_tag: &str, worker: &Path) -> bool {
+    match gpu_tag {
+        "cuda" => true,
+        "rocm" | "intel" => {
+            let install = std::env::var(zkminer_prover_protocol::types::SP1_SERVER_INSTALL_ENV)
+                .map_or(true, |v| v.trim() != "0");
+            sp1_server_name(gpu_tag).is_some_and(|name| {
+                sp1_named_server_for(name, worker, install, dirs::home_dir().as_deref()).is_some()
+            })
+        }
+        _ => false,
+    }
+}
+
+fn sp1_named_server_for(
+    server: &str,
+    worker: &Path,
+    install: bool,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
     if install {
         // The worker looks beside its own executable, which for a symlinked worker is the target's
         // directory; a wrapper script sits beside the binary it runs, so its own directory works too.
@@ -1072,13 +1129,13 @@ fn sp1_server_for(worker: &Path, install: bool, home: Option<&Path>) -> Option<P
         let shipped = [real.as_deref().and_then(Path::parent), worker.parent()]
             .into_iter()
             .flatten()
-            .map(|dir| dir.join(SERVER))
+            .map(|dir| dir.join(server))
             .find(|path| path.is_file());
         if shipped.is_some() {
             return shipped;
         }
     }
-    let installed = home?.join(".sp1").join("bin").join(SERVER);
+    let installed = home?.join(".sp1").join("bin").join(server);
     installed.is_file().then_some(installed)
 }
 
@@ -1109,9 +1166,15 @@ fn sp1_server_for(worker: &Path, install: bool, home: Option<&Path>) -> Option<P
 /// empty `--version` reads as a version mismatch — this constant becomes too permissive and SP1 will
 /// fail on the 5080 again. `strings ~/.sp1/bin/sp1-gpu-server | grep 'must be at least'` is the check;
 /// `--version` cannot tell them apart, both print 6.0.2.
+///
+/// **hemilabs/sp1 #19 (6.8.1):** its server, on every backend, refuses only below
+/// `ceil(GiB) + 4 = 16`, so a 12 GB card (11.x GiB) runs, in the same element tier as a 16 GB one; an
+/// RTX 4070 and an Arc B580 proved SP1 Groth16 fibonacci on it. The floor is therefore 11 GB, the
+/// server's own. Whether a card has ROOM for a job is still [`min_available_vram_bytes_for_backend`]'s
+/// measured question, which keeps 12 GB cards out by default until their peaks are measured.
 pub fn min_vram_bytes_for_backend(backend: &str) -> Option<u64> {
     match backend {
-        "sp1" => Some(16_000_000_000),
+        "sp1" => Some(11_000_000_000),
         _ => None,
     }
 }
@@ -1426,12 +1489,16 @@ mod tests {
             16_303u64 * 1024 * 1024 >= floor,
             "the 5080 must qualify: the installed server's floor is 16 GB"
         );
-        // But a genuinely small card must not. A 12 GB card slips past the server's OWN guard
-        // (`ceil(11.x) + 4 = 16` is not `< 16`) and would then OOM in the 16 GB tier, so ours is
-        // deliberately the stricter of the two.
+        // A 12 GB card runs on hemilabs/sp1 #19's server (an RTX 4070 and an Arc B580 proved on it);
+        // whether it has room for a job is the available-VRAM floor's question.
         assert!(
-            12_288u64 * 1024 * 1024 < floor,
-            "a 12 GB card must be refused here even though the server would admit it"
+            12_288u64 * 1024 * 1024 >= floor,
+            "a 12 GB card must qualify: #19's server admits it"
+        );
+        // But a genuinely small card must not: below `ceil(GiB) + 4 = 16` the server refuses it.
+        assert!(
+            10_240u64 * 1024 * 1024 < floor,
+            "a 10 GB card must be refused, as the server refuses it"
         );
         // Nothing else has a floor: risc0 degrades by lowering po2 instead of refusing.
         assert_eq!(min_vram_bytes_for_backend("risc0"), None);

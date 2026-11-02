@@ -20,8 +20,6 @@ use anyhow::{anyhow, Context, Result};
 
 /// Set to `0` to leave `~/.sp1/bin/sp1-gpu-server` alone.
 pub(crate) const INSTALL_ENV: &str = zkminer_prover_protocol::types::SP1_SERVER_INSTALL_ENV;
-/// The shipped server's name, beside this worker's executable.
-const BUNDLED_NAME: &str = "sp1-gpu-server";
 
 /// Installs the server shipped beside this executable, if there is one; see the module docs.
 /// Never fails the worker: without it the SDK runs whatever is installed, as before.
@@ -29,9 +27,11 @@ pub(crate) fn install_bundled_server() {
     if std::env::var(INSTALL_ENV).is_ok_and(|value| value.trim() == "0") {
         return;
     }
+    // The build for this worker's card (`warmup::server_name`), shipped under its own name.
+    let name = crate::warmup::server_name();
     let Some(bundled) = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(BUNDLED_NAME)))
+        .and_then(|exe| exe.parent().map(|dir| dir.join(&name)))
         .filter(|path| path.is_file())
     else {
         // Not a release layout (a development build, say): nothing shipped to install.
@@ -44,6 +44,23 @@ pub(crate) fn install_bundled_server() {
             return;
         }
     };
+    // A build with libraries of its own (SYCL: `libsp1_gpu_sycl.so` and the oneAPI runtime) ships
+    // them in `<name>-lib/` beside it; they go to the same place beside the installed server, which
+    // `main` puts on the library path the server inherits.
+    let lib_dir = bundled.with_file_name(format!("{name}-lib"));
+    if lib_dir.is_dir() {
+        let to_dir = target.with_file_name(format!("{name}-lib"));
+        for entry in fs::read_dir(&lib_dir).into_iter().flatten().flatten() {
+            let to = to_dir.join(entry.file_name());
+            if let Err(e) = install(&entry.path(), &to) {
+                tracing::warn!(
+                    "could not install {} as {} ({e:#})",
+                    entry.path().display(),
+                    to.display()
+                );
+            }
+        }
+    }
     match install(&bundled, &target) {
         Ok(true) => tracing::info!("installed {} as {}", bundled.display(), target.display()),
         Ok(false) => tracing::debug!("{} is already installed", bundled.display()),
@@ -66,7 +83,10 @@ pub(crate) fn install(from: &Path, to: &Path) -> Result<bool> {
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent directory", to.display()))?;
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let temp = dir.join(format!(".{BUNDLED_NAME}.{}.tmp", std::process::id()));
+    let base = to
+        .file_name()
+        .map_or_else(|| "sp1-gpu-server".into(), |n| n.to_string_lossy());
+    let temp = dir.join(format!(".{base}.{}.tmp", std::process::id()));
     let copied = (|| -> Result<()> {
         fs::copy(from, &temp).with_context(|| format!("cannot copy to {}", temp.display()))?;
         {

@@ -1473,6 +1473,10 @@ struct OwnSlot {
 /// Where SP1's server keeps its host-wide final-wrap queue; see `gpu_env`.
 const SP1_QUEUE_DIR_ENV: &str = "SP1_GROTH16_QUEUE_DIR";
 
+/// Which build of `sp1-gpu-server` the SP1 SDK runs (`~/.sp1/bin/<name>`, socket
+/// `/tmp/<name>-<device>.sock`); see `discovery::sp1_server_name`.
+const SP1_GPU_SERVER_NAME_ENV: &str = "SP1_GPU_SERVER_NAME";
+
 /// How long SP1's warm-up may take: the circuit artifacts are ~8 GB to download.
 pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
@@ -1769,6 +1773,51 @@ impl WorkerPool {
                 }
             }
             _ => {}
+        }
+        // SP1 on an AMD or Intel card (hemilabs/sp1 #19): the same worker drives that vendor's own
+        // build of `sp1-gpu-server`, named by `SP1_GPU_SERVER_NAME`, which pins itself through the
+        // HIP_VISIBLE_DEVICES / ZE_AFFINITY_MASK set above (it drops the CUDA_VISIBLE_DEVICES the SDK
+        // gives it). The device id keeps each server on its own socket, and the execute cap and trace
+        // ring are the measure worker's, as on a CUDA card.
+        if crate::discovery::drives_cuda_without_visibility_pin(backend)
+            && matches!(gpu_tag, "rocm" | "intel")
+        {
+            if let Some(name) = crate::discovery::sp1_server_name(gpu_tag) {
+                env.insert(SP1_GPU_SERVER_NAME_ENV.into(), name.into());
+            }
+            env.insert(
+                "MEMORY_LIMIT".into(),
+                crate::memory::sp1_measure_cap_bytes(
+                    crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
+                )
+                .to_string(),
+            );
+            env.insert("TRACE_CHUNK_SLOTS".into(), "2".into());
+            if let Some(i) = device_index {
+                env.insert(
+                    zkminer_prover_protocol::types::CUDA_DEVICE_ID_ENV.into(),
+                    i.to_string(),
+                );
+                if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index, pci_bus_id) {
+                    env.insert(
+                        zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
+                        vram.to_string(),
+                    );
+                }
+                if let Some(budget) = crate::memory::worker_memory_ceiling_bytes(
+                    crate::memory::DEFAULT_HOST_RESERVE_BYTES,
+                ) {
+                    env.insert(
+                        zkminer_prover_protocol::types::HOST_MEM_BUDGET_ENV.into(),
+                        budget.to_string(),
+                    );
+                }
+                if std::env::var_os(SP1_QUEUE_DIR_ENV).is_none() {
+                    if let Some(dir) = sp1_queue_dir() {
+                        env.insert(SP1_QUEUE_DIR_ENV.into(), dir.display().to_string());
+                    }
+                }
+            }
         }
         env
     }

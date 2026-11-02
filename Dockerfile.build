@@ -8,7 +8,7 @@
 # ---------------------------------------------------------------------------
 # Build args (all overridable)
 # ---------------------------------------------------------------------------
-ARG RUST_VERSION=1.93.0
+ARG RUST_VERSION=1.97.1
 ARG CUDA_VERSION=12.8.0
 # sp1-gpu-server alone: see the sp1-server-cuda-rust-base stage.
 ARG SP1_SERVER_CUDA_VERSION=12.9.2
@@ -120,7 +120,8 @@ COPY . .
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=target-openvm,target=/build/target \
-    cargo build --release -p zkminer-prove-openvm --bin zkminer-prove-openvm \
+    cargo build --release --manifest-path crates/zkminer-prove-openvm/Cargo.toml \
+        --bin zkminer-prove-openvm --target-dir target \
     && cp target/release/zkminer-prove-openvm /zkminer-prove-openvm
 
 # ===========================================================================

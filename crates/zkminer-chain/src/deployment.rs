@@ -17,7 +17,8 @@ use anyhow::{bail, Context, Result};
 use crate::auction::ProofSystem;
 use crate::client::ChainClient;
 use zkminer_contracts::bindings::{
-    IHemiProveAux, IHemiProveRegistry, IHemiProveStaking, IRiscZeroSelectable, IVerifierAdapter,
+    IHemiProveAux, IHemiProveRegistry, IHemiProveStaking, IRiscZeroSelectable, ISP1NativeVerifier,
+    IVerifierAdapter,
 };
 
 /// Audited runtime pins (zkmarket c8333aa `script/lib/AuditedCorePins.sol`, `VerifierPins.sol`).
@@ -56,6 +57,19 @@ pub mod pins {
         b256!("0d2be77d8f4614c7c80be0da5f3b2a836b72b8650071d14006fbf43ecf34cf29");
     /// Its `SELECTOR()`: the 4-byte prefix of every risc0 3.0 Groth16 seal it accepts.
     pub const RISC0_V3_0_SELECTOR: [u8; 4] = [0x73, 0xc4, 0x57, 0xba];
+    /// SP1Groth16VerifierAdapter runtime with its `nativeVerifier` immutable zeroed at
+    /// [`SP1_GROTH16_ADAPTER_IMMUTABLES`] (1,851 B).
+    pub const SP1_GROTH16_ADAPTER: B256 =
+        b256!("99d18017af86518b2b86cd982aeadc69ed9c5c9611a52ccae7b637eb1b0c636d");
+    pub const SP1_GROTH16_ADAPTER_IMMUTABLES: [usize; 3] = [101, 527, 1165];
+    /// SP1 circuit v6.1.0 Groth16 verifier (sp1-contracts v6.1.1 `SP1VerifierGroth16.sol`), runtime
+    /// keccak (5,463 B, no immutables).
+    pub const SP1_V6_1_0_GROTH16_VERIFIER: B256 =
+        b256!("6e1a354cfd1694f27c6258729ce14a5b29fe57624d1d10c759a33aa2d7aa002b");
+    /// Its `VERIFIER_HASH()`: sha256 of the circuit's `groth16_vk.bin` (SP1 SDK 6.1.0 to 6.10.0). The
+    /// first 4 bytes prefix every v6.1.0 Groth16 seal.
+    pub const SP1_V6_1_0_GROTH16_VERIFIER_HASH: B256 =
+        b256!("4388a21c687fdd5f218d7e3d13190cac4c5355818d3605fd5fb811df468ee696");
 }
 
 /// ERC-1967 implementation slot: `bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)`.
@@ -402,6 +416,11 @@ impl ChainClient {
             ))
             .into());
         }
+        if ps == ProofSystem::Sp1Groth16 {
+            return self
+                .verify_sp1_groth16(ps, entry.adapter, seal_prefix)
+                .await;
+        }
         if ps != ProofSystem::Risc0Groth16 {
             bail!("{}: no pinned verifier — zkminer does not serve it yet", ps.label());
         }
@@ -453,6 +472,69 @@ impl ChainClient {
             .into());
         }
         Ok(entry.adapter)
+    }
+
+    /// `verify_proof_system` for `sp1.groth16.v1`: the adapter is the audited SP1Groth16VerifierAdapter
+    /// wrapping the audited circuit v6.1.0 Groth16 verifier, whose `VERIFIER_HASH()` is the v6.1.0
+    /// one and starts with `seal_prefix` (the first 4 bytes of every seal the SP1 worker returns).
+    async fn verify_sp1_groth16(
+        &self,
+        ps: ProofSystem,
+        adapter: Address,
+        seal_prefix: [u8; 4],
+    ) -> Result<Address> {
+        let native = IVerifierAdapter::new(adapter, &*self.provider)
+            .nativeVerifier()
+            .call()
+            .await
+            .context("adapter.nativeVerifier()")?;
+        if !code_pins_skipped() {
+            let acode = self
+                .provider
+                .get_code_at(adapter)
+                .await
+                .context("adapter code")?;
+            if !immutables_are(
+                &acode,
+                &pins::SP1_GROTH16_ADAPTER_IMMUTABLES,
+                B256::left_padding_from(native.as_slice()),
+            ) || keccak_offsets_zeroed(&acode, &pins::SP1_GROTH16_ADAPTER_IMMUTABLES)
+                != Some(pins::SP1_GROTH16_ADAPTER)
+            {
+                return Err(ProofSystemRefused(format!(
+                    "{} adapter {adapter} is not the audited SP1Groth16VerifierAdapter",
+                    ps.label()
+                ))
+                .into());
+            }
+            let vcode = self
+                .provider
+                .get_code_at(native)
+                .await
+                .context("verifier code")?;
+            if keccak256(&vcode) != pins::SP1_V6_1_0_GROTH16_VERIFIER {
+                return Err(ProofSystemRefused(format!(
+                    "{} native verifier {native} is not the audited SP1 circuit v6.1.0 Groth16 verifier",
+                    ps.label()
+                ))
+                .into());
+            }
+        }
+        let hash = ISP1NativeVerifier::new(native, &*self.provider)
+            .VERIFIER_HASH()
+            .call()
+            .await
+            .context("verifier VERIFIER_HASH()")?;
+        if hash != pins::SP1_V6_1_0_GROTH16_VERIFIER_HASH || hash[..4] != seal_prefix {
+            return Err(ProofSystemRefused(format!(
+                "{} verifier VERIFIER_HASH() is {hash} but zkminer's SP1 seals are prefixed 0x{} \
+                 (circuit v6.1.0) — every proof would revert VerifierCallFailed",
+                ps.label(),
+                alloy::hex::encode(seal_prefix)
+            ))
+            .into());
+        }
+        Ok(adapter)
     }
 }
 

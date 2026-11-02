@@ -21,6 +21,9 @@ libc = "0.2"
 # pulls tokio, so the feature set is unified — no extra compile cost.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time"] }
 sp1-sdk = { version = "6.0", features = ["blocking", "cuda"] }
+# Directly only for `build::groth16_circuit_artifacts_dir`, which sp1-sdk 6.8 no longer re-exports;
+# sp1-sdk depends on it already.
+sp1-prover = "6.0"
 
 [build-dependencies]
 sp1-build = "6.0"

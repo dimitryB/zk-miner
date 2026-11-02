@@ -1418,9 +1418,6 @@ pub fn run_benchmark() -> BenchmarkSuite {
         results.push(crate::sp1::benchmark_sha256_chain(10_000));
     }
 
-    #[cfg(feature = "openvm")]
-    results.push(crate::openvm::benchmark_fibonacci(1000));
-
     // Subprocess worker benchmarks (always try — captures GPU provers).
     // Use benchmark_all_with_device_info to get GPU metadata alongside results.
     let worker_device_results = if let Some(pool) = crate::engine::worker_pool() {

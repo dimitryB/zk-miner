@@ -177,6 +177,44 @@ fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::i
 }
 
 fn main() {
+    // `--export-guest <name> <path>`: write one of the embedded guests to `path` and print its vkey
+    // hash (`bytes32()`), which is the `programId` of an SP1 job for it. For harnesses that submit
+    // jobs this worker can serve (crates/zkminer-cli/tests/localnet.rs). Runs SP1's setup on the CPU
+    // prover: no GPU or server. Speaks no IPC.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--export-guest") {
+        use sp1_sdk::blocking::{Elf, Prover};
+        use sp1_sdk::{HashableKey, ProvingKey};
+        let (Some(name), Some(path)) = (args.get(i + 1), args.get(i + 2)) else {
+            eprintln!("usage: --export-guest fibonacci <path>");
+            std::process::exit(2);
+        };
+        let elf = match name.as_str() {
+            "fibonacci" => FIBONACCI_SP1_GUEST_ELF,
+            other => {
+                eprintln!("unknown guest {other:?} (known: fibonacci)");
+                std::process::exit(2);
+            }
+        };
+        let pk = match sp1_sdk::blocking::ProverClient::builder()
+            .cpu()
+            .build()
+            .setup(Elf::from(elf))
+        {
+            Ok(pk) => pk,
+            Err(e) => {
+                eprintln!("setup: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = std::fs::write(path, elf) {
+            eprintln!("write {path}: {e}");
+            std::process::exit(1);
+        }
+        println!("{}", pk.verifying_key().bytes32());
+        return;
+    }
+
     // CRITICAL: Save the real stdout FD for IPC before anything can pollute it.
     // The SP1 SDK's gnark CGO library (Go code) may print to stdout (FD 1),
     // which would corrupt the bincode IPC stream. We dup stdout for IPC,
@@ -224,7 +262,22 @@ fn main() {
     // Then make a CUDA 12 runtime reachable if the host has one anywhere, so the
     // installed toolkit version stops mattering. Must run BEFORE sp1_usability, which
     // execs sp1-gpu-server and is the authority on whether this actually worked.
-    ensure_cuda12_on_library_path();
+    if warmup::drives_cuda() {
+        ensure_cuda12_on_library_path();
+    } else {
+        // The HIP or SYCL build's own libraries, installed beside it (see `bundled_server`): put
+        // them on the library path the server inherits from this process.
+        if let Ok(server) = warmup::server_path() {
+            let lib = server.with_file_name(format!("{}-lib", warmup::server_name()));
+            if lib.is_dir() {
+                let path = match std::env::var("LD_LIBRARY_PATH") {
+                    Ok(p) if !p.is_empty() => format!("{}:{p}", lib.display()),
+                    _ => lib.display().to_string(),
+                };
+                std::env::set_var("LD_LIBRARY_PATH", path);
+            }
+        }
+    }
 
     if std::env::args().any(|a| a == "--benchmark") {
         // Honour the assigned device here too. Without this, benchmarking card 1 by hand silently
@@ -304,7 +357,9 @@ fn reap_orphaned_gpu_servers(our_device: Option<u32>) {
             let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
                 continue;
             };
-            if comm.trim() != "sp1-gpu-server" {
+            // Every build: `sp1-gpu-server`, and the HIP/SYCL ones under longer names (`comm` is
+            // truncated to 15 bytes, `sp1-gpu-server-`).
+            if !comm.trim().starts_with("sp1-gpu-server") {
                 continue;
             }
             // Field 4 of /proc/<pid>/stat is ppid, but comm (field 2) can contain spaces
@@ -773,8 +828,10 @@ fn sp1_usability() -> Result<(), String> {
     // the reason: do not report "0 GPUs" from an unparseable probe, because "that would
     // silently skip the CUDA worker". Only treat the GPU as absent when nvidia-smi AND
     // the kernel driver's own /proc entries agree.
+    // An AMD or Intel card's build of the server (`SP1_GPU_SERVER_NAME`) has its own pins and needs no
+    // NVIDIA GPU; its --version is still checked below.
     let (gpu_available, _) = detect_gpu();
-    if !gpu_available && !nvidia_gpu_in_proc() {
+    if warmup::drives_cuda() && !gpu_available && !nvidia_gpu_in_proc() {
         return Err(
             "no NVIDIA GPU detected (neither nvidia-smi nor /proc/driver/nvidia/gpus \
              reports one) and this SP1 worker is CUDA-only -- it has no CPU proving path"
@@ -788,7 +845,9 @@ fn sp1_usability() -> Result<(), String> {
     //   "error while loading shared libraries: libcudart.so.12: cannot open shared
     //    object file"
     // `--version` is what the SDK itself runs, costs milliseconds, and touches no GPU.
-    let server = std::path::PathBuf::from(&home).join(".sp1/bin/sp1-gpu-server");
+    let server = std::path::PathBuf::from(&home)
+        .join(".sp1/bin")
+        .join(warmup::server_name());
     if !server.exists() {
         // Absent: the SDK downloads it on first use. We cannot verify a binary that does
         // not exist yet, and refusing here would disable SP1 on a host where it works.

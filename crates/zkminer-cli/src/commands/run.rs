@@ -322,6 +322,33 @@ fn risc0_adapter_verified() -> bool {
         .is_some()
 }
 
+/// The same for sp1.groth16.v1 (adapter registered and claimable, audited SP1Groth16VerifierAdapter and
+/// circuit v6.1.0 verifier, `VERIFIER_HASH()` prefixing our seals), and the adapter it verified.
+static SP1_VERIFIED_ADAPTER: std::sync::Mutex<Option<alloy::primitives::Address>> =
+    std::sync::Mutex::new(None);
+
+fn sp1_claimable() -> bool {
+    DEPLOYMENT_VERIFIED.load(std::sync::atomic::Ordering::SeqCst) && sp1_adapter_verified()
+}
+
+fn sp1_adapter_verified() -> bool {
+    SP1_VERIFIED_ADAPTER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some()
+}
+
+/// The first 4 bytes of every SP1 circuit v6.1.0 Groth16 seal (`VERIFIER_HASH()[0:4]`), which the SP1
+/// worker's `proof.bytes()` already carries.
+fn sp1_seal_prefix() -> [u8; 4] {
+    let h = zkminer_chain::deployment::pins::SP1_V6_1_0_GROTH16_VERIFIER_HASH;
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// An SP1 Groth16 seal: the verifier hash prefix (4), the exit code, the vk root and the proof nonce
+/// (32 each), then the 256-byte Groth16 proof.
+const SP1_GROTH16_SEAL_LEN: usize = 4 + 3 * 32 + 256;
+
 /// One miner per home directory: two would recover, prove and release the same locks, collide on
 /// nonces, and overwrite each other's job journal (`~/.zkminer/job_journal.json`) — e.g. a second
 /// one started while the first is still draining. An exclusive `flock` on `~/.zkminer/miner.lock`,
@@ -381,6 +408,7 @@ fn claims_held_for(
     let backend = resolve_backend(proof_system_id);
     !DEPLOYMENT_VERIFIED.load(std::sync::atomic::Ordering::SeqCst)
         || (backend == Some("risc0") && !risc0_claimable())
+        || (backend == Some("sp1") && !sp1_claimable())
         || backend.is_some_and(|b| divergence_blocks_claim(submitter, program_id, b))
 }
 
@@ -426,6 +454,30 @@ async fn reverify_risc0(client: &ChainClient) -> Result<alloy::primitives::Addre
         Ok(a) => *g = Some(*a),
         // Only a definite refusal clears the verdict: one 429 says nothing about the adapter.
         Err(e) if e.downcast_ref::<zkminer_chain::deployment::ProofSystemRefused>().is_some() => *g = None,
+        Err(_) => {}
+    }
+    r
+}
+
+/// Run `verify_proof_system` for SP1 Groth16 and record the outcome (see [`SP1_VERIFIED_ADAPTER`]).
+async fn reverify_sp1(client: &ChainClient) -> Result<alloy::primitives::Address> {
+    let r = client
+        .verify_proof_system(
+            zkminer_chain::auction::ProofSystem::Sp1Groth16,
+            sp1_seal_prefix(),
+        )
+        .await;
+    let mut g = SP1_VERIFIED_ADAPTER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    match &r {
+        Ok(a) => *g = Some(*a),
+        Err(e)
+            if e.downcast_ref::<zkminer_chain::deployment::ProofSystemRefused>()
+                .is_some() =>
+        {
+            *g = None
+        }
         Err(_) => {}
     }
     r
@@ -2408,6 +2460,22 @@ pub async fn run(
         Err(e) => tracing::error!(
             "PAGE: risczero.groth16.v1 verification failed ({e:#}) — NOT claiming risc0 jobs; locks \
              already held are still recovered and driven. Re-checked every few minutes."
+        ),
+    }
+    // Not a PAGE: a deployment need not register SP1 at all.
+    match reverify_sp1(&client).await {
+        Ok(adapter) => tracing::info!(
+            "startup check — sp1.groth16.v1: adapter {adapter} registered, {}, VERIFIER_HASH 0x{}…",
+            if zkminer_chain::deployment::code_pins_skipped() {
+                "adapter and verifier code NOT checked (ZKMINER_SKIP_CODE_PINS=1)"
+            } else {
+                "audited circuit v6.1.0 verifier"
+            },
+            alloy::hex::encode(sp1_seal_prefix())
+        ),
+        Err(e) => tracing::warn!(
+            "sp1.groth16.v1 verification failed ({e:#}) — NOT claiming SP1 jobs. Re-checked every \
+             few minutes."
         ),
     }
     let state = new_shared_state();
@@ -4901,10 +4969,26 @@ async fn miner_brain(
         }
         if !SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
             && (last_reverify_at.elapsed() >= PROOF_SYSTEM_RECHECK
-                || (!risc0_adapter_verified()
+                || ((!risc0_adapter_verified() || !sp1_adapter_verified())
                     && last_reverify_at.elapsed() >= RECOVERY_REQUEST_FLOOR))
         {
             last_reverify_at = std::time::Instant::now();
+            let was_sp1 = sp1_adapter_verified();
+            match reverify_sp1(&client).await {
+                Ok(adapter) if !was_sp1 => {
+                    let msg = format!(
+                        "sp1.groth16.v1 verified (adapter {adapter}) — SP1 jobs can be claimed"
+                    );
+                    tracing::warn!("{msg}");
+                    state.write().await.add_log(LogLevel::Warn, msg);
+                }
+                Err(e) if was_sp1 && !sp1_adapter_verified() => tracing::error!(
+                    "PAGE: sp1.groth16.v1 no longer verifies ({e:#}) — not claiming SP1 jobs; held \
+                     locks are still driven"
+                ),
+                Err(e) => tracing::debug!("sp1.groth16.v1 re-check: {e:#}"),
+                _ => {}
+            }
             let was = risc0_adapter_verified();
             let msg = match reverify_risc0(&client).await {
                 Ok(adapter) if !was => Some((
@@ -5957,6 +6041,14 @@ async fn miner_brain(
                     // prefix — every proof would revert after the collateral-locking claim.
                     tracing::debug!(
                         "Skipping {}: risczero.groth16.v1 is not verified claimable right now",
+                        short_id(jid)
+                    );
+                    continue;
+                }
+                Some("sp1") if !sp1_claimable() => {
+                    // The same for sp1.groth16.v1 (its VERIFIER_HASH must prefix our seals).
+                    tracing::debug!(
+                        "Skipping {}: sp1.groth16.v1 is not verified claimable right now",
                         short_id(jid)
                     );
                     continue;
@@ -9439,6 +9531,22 @@ async fn process_job_lifecycle(
         proof.seal.clone()
     };
 
+    // An SP1 seal goes on chain as the worker returned it: one of another length or circuit would
+    // revert VerifierCallFailed after the fulfil's gas, so release instead of publishing it.
+    if backend == zkminer_prover_protocol::BACKEND_SP1
+        && (seal_bytes.len() != SP1_GROTH16_SEAL_LEN || seal_bytes[..4] != sp1_seal_prefix())
+    {
+        return Err(anyhow::anyhow!(
+            "SP1 seal for {} is {} bytes prefixed 0x{} — not a circuit v6.1.0 Groth16 seal ({} bytes \
+             prefixed 0x{}); releasing instead of publishing it",
+            short_id(job_id),
+            seal_bytes.len(),
+            alloy::hex::encode(&seal_bytes[..seal_bytes.len().min(4)]),
+            SP1_GROTH16_SEAL_LEN,
+            alloy::hex::encode(sp1_seal_prefix())
+        ));
+    }
+
     // A journal over MAX_JOURNAL_BYTES reverts `JournalTooLarge` — refuse BEFORE publishing the seal.
     if proof.journal.len() > zkminer_chain::jobs::MAX_JOURNAL_BYTES {
         // Pre-claim screens refuse a measured journal over the cap, so this one diverged.
@@ -9828,10 +9936,12 @@ fn resolve_backend(proof_system_id: alloy::primitives::B256) -> Option<&'static 
         // risc0 3.0.x Groth16 receipts encoded to the 260-byte seal (SELECTOR 0x73c457ba ‖ proof).
         // Checked at startup against the live adapter's native verifier.
         ProofSystem::Risc0Groth16 => Some("risc0"),
-        // NOT SERVED YET (Phase 3). The pinned SP1 SDK emits circuit v6.0.0 seals, which the 743111
-        // SP1 verifiers (circuit v6.1.0) refuse — every SP1 claim would end in a release or a slash.
-        // `sp1.plonk.v1` additionally needs a PLONK prove mode. Both are declined at ingest.
-        ProofSystem::Sp1Groth16 | ProofSystem::Sp1Plonk => None,
+        // SP1 6.8.1 (hemilabs/sp1 #19) Groth16 proofs of circuit v6.1.0, the circuit the 743111 SP1
+        // verifiers accept; checked at startup against the live adapter's native verifier.
+        ProofSystem::Sp1Groth16 => Some("sp1"),
+        // NOT SERVED: `sp1.plonk.v1` needs a PLONK prove mode, which the worker does not have (gnark's
+        // CPU PLONK prover takes ~3.5 minutes and ~49 GB of RAM a proof on this class of host).
+        ProofSystem::Sp1Plonk => None,
         // Not registered on 743111 at launch, and the OpenVM worker cannot prove (every Prove
         // returns an error) yet reports SIMULATED throughput, so the evaluator would find its jobs
         // attractive and claim what it cannot fulfil. Opt in with ZKMINER_ENABLE_OPENVM=1 only once
@@ -12553,9 +12663,8 @@ mod tests {
             openvm_halo2_v1_id, risc_zero_groth16_v1_id, sp1_groth16_v1_id, sp1_plonk_v1_id,
         };
         assert_eq!(resolve_backend(risc_zero_groth16_v1_id()), Some("risc0"));
-        // SP1 is declined until the toolchain emits circuit v6.1.0 seals (Phase 3): a claim would
-        // end in a release or a slash.
-        assert_eq!(resolve_backend(sp1_groth16_v1_id()), None);
+        // SP1 Groth16 is served (circuit v6.1.0); PLONK is not.
+        assert_eq!(resolve_backend(sp1_groth16_v1_id()), Some("sp1"));
         assert_eq!(resolve_backend(sp1_plonk_v1_id()), None);
         // OpenVM is declined by default (its worker cannot prove).
         if std::env::var("ZKMINER_ENABLE_OPENVM").ok().as_deref() != Some("1") {

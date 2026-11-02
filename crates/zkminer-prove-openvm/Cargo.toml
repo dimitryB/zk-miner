@@ -1,18 +1,33 @@
 [package]
 name = "zkminer-prove-openvm"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2021"
 
 [[bin]]
 name = "zkminer-prove-openvm"
 path = "src/main.rs"
 
 [dependencies]
-zkminer-prover-protocol = { workspace = true }
-serde = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
+zkminer-prover-protocol = { path = "../zkminer-prover-protocol" }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
 bincode = "1"
 libc = "0.2"
 openvm-sdk = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.5.0-rc.1" }
+
+# A workspace of its own (see the root Cargo.toml's `exclude`): OpenVM's p3 crates cannot share a
+# lockfile with SP1 6.8.1's. Its Cargo.lock started as a copy of the root one.
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "debuginfo"
+
+[profile.release.package."*"]
+codegen-units = 16
+
+[profile.release.package.zkminer-prove-openvm]
+codegen-units = 1
