@@ -13,7 +13,7 @@ use zkminer_prover_protocol::{
     is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
     WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
     BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
-    PROTOCOL_VERSION, RISC0_SEGMENT_PO2,
+    PROTOCOL_VERSION, RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN,
 };
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
@@ -298,8 +298,12 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 elf,
                 input_data,
                 program_id,
+                po2,
             } => {
-                tracing::info!("Execute request {request_id} ({} bytes ELF)", elf.len());
+                tracing::info!(
+                    "Execute request {request_id} ({} bytes ELF, po2={po2:?})",
+                    elf.len()
+                );
                 // The ELF bytes are fully attacker-controlled and reach risc0's ELF
                 // parser / image-id computation / executor UNCLAIMED on this pre-claim measurement
                 // path. Those SDK calls CAN PANIC on a malformed registered ELF rather than returning
@@ -310,7 +314,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // sustained liveness DoS. Contain it here: a caught panic is a property of the job
                 // (InvalidInput), exactly like an execution Err.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_execute(&elf, &input_data, program_id)
+                    run_execute(&elf, &input_data, program_id, po2)
                 }));
                 match outcome {
                     Ok(Ok((cycles, journal, duration_secs))) => {
@@ -794,12 +798,27 @@ impl KeccakAudit {
     }
 }
 
+/// The segment size a job is executed or proven at: the host's, or [`RISC0_DEFAULT_JOB_PO2`]. One
+/// outside [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`] is refused (an InvalidInput, by its "po2
+/// value" text): the host measures and proves a job at sizes in that range only.
+fn job_segment_po2(po2: Option<u8>) -> anyhow::Result<u8> {
+    let po2 = po2.unwrap_or(RISC0_DEFAULT_JOB_PO2);
+    if !(RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX).contains(&po2) {
+        anyhow::bail!(
+            "po2 value {po2} is outside the job range {RISC0_JOB_PO2_MIN}..={RISC0_JOB_PO2_MAX}"
+        );
+    }
+    Ok(po2)
+}
+
 fn run_execute(
     elf: &[u8],
     input_data: &[u8],
     program_id: Option<[u8; 32]>,
+    po2: Option<u8>,
 ) -> anyhow::Result<(u64, Vec<u8>, f64)> {
     use std::time::Instant;
+    let po2 = job_segment_po2(po2)?;
     // Bind the ELF to the job's programId before spending any execution on it (the pre-claim
     // measurement path runs UNCLAIMED, submitter-controlled ELFs).
     let image_id = verify_program_id(elf, program_id)?;
@@ -810,8 +829,9 @@ fn run_execute(
         env_builder.write_slice(input_data);
     }
     env_builder.random_seed(sys_rand_seed(&sys_rand_key(), &image_id, input_data));
-    // At the size the job will be proven at: the guest can tell (see `RISC0_SEGMENT_PO2`).
-    env_builder.segment_limit_po2(RISC0_SEGMENT_PO2 as u32);
+    // At the size the job will be proven at, on the card the host asked for: the guest can tell (see
+    // `RISC0_DEFAULT_JOB_PO2`).
+    env_builder.segment_limit_po2(po2 as u32);
     if let Some(limit) = execute_session_cycle_limit() {
         env_builder.session_limit(Some(limit));
     }
@@ -882,12 +902,12 @@ fn run_execute(
     // What proving costs, and reports as `total_cycles`: every segment padded to its power of two.
     // `SessionInfo::cycles()` counts user cycles only — no paging, no padding — and a guest that
     // pages heavily (each page-in costs hundreds of cycles) can make a proof 100x what it shows.
-    // Measured at `RISC0_SEGMENT_PO2`, the size the job proves at. Each keccak request is a further
+    // Measured at `po2`, the size the job proves at on its card. Each keccak request is a further
     // proof of its own (a 2^17-row keccak STARK, its lift and a join), priced here as a 2^20 segment.
     let cycles: u64 = session.segments.iter().map(|s| 1u64 << s.po2).sum::<u64>() + keccak.cycles;
     // The journal the guest committed here is byte-identical to the one the later proof
-    // would carry (both are a deterministic function of (ELF, input) at the one segment size both
-    // run at, which a guest can tell — `sys_rand` included, via the shared seed — and the image-id
+    // would carry at this segment size (both are a deterministic function of (ELF, input) at the size
+    // both run at, which a guest can tell — `sys_rand` included, via the shared seed — and the image-id
     // check makes measure-ELF == prove-ELF). The host checks the job's journal binding against it,
     // and screens a journal that would blow the fulfillJob payload cap, before committing
     // collateral and a full proof to it.
@@ -965,14 +985,10 @@ fn run_proof(
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
     // Bind the ELF to the job's programId ONCE, before the retry loop spends any GPU on it.
     let image_id = verify_program_id(elf, program_id)?;
-    // A job (bound to a programId) proves at the size it was measured at; other sizes are for
-    // benchmarks and calibration.
-    if let (Some(_), Some(p)) = (program_id, po2) {
-        if p != RISC0_SEGMENT_PO2 {
-            anyhow::bail!(
-                "po2 value {p} is not the segment size a job is measured at ({RISC0_SEGMENT_PO2})"
-            );
-        }
+    // A job (bound to a programId) proves at a size the host measured it at, which is always in the
+    // job range; other sizes are for benchmarks and calibration.
+    if program_id.is_some() {
+        job_segment_po2(po2)?;
     }
     // The seed the pre-claim measurement used, so every attempt runs the guest exactly as it did.
     let seed = sys_rand_seed(&sys_rand_key(), &image_id, input_data);
@@ -1081,9 +1097,9 @@ fn run_proof_once(
     let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
     env_builder.write_slice(input_data);
     env_builder.random_seed(seed);
-    // Never left to the SDK, which picks 21 on a 32 GB card: a job is measured at
-    // `RISC0_SEGMENT_PO2`, and the guest can tell the size it runs at.
-    let po2 = po2.unwrap_or(RISC0_SEGMENT_PO2);
+    // Never left to the SDK, which picks 21 on a 32 GB card: a job is measured at the size the host
+    // names here, and the guest can tell the size it runs at.
+    let po2 = po2.unwrap_or(RISC0_DEFAULT_JOB_PO2);
     if !(13..=24).contains(&po2) {
         anyhow::bail!("po2 value {po2} out of valid range 13..=24");
     }
@@ -1320,8 +1336,12 @@ fn benchmark_program(
     weight: f64,
     precompile: bool,
 ) -> Option<BenchmarkEntry> {
+    // At the size an uncalibrated card proves jobs at, so its throughput and host peak describe them.
+    // (Its first stage is a composite proof, for which the SDK never picks a size of its own, so this
+    // only says what the executor default already was.)
     let env = risc0_zkvm::ExecutorEnv::builder()
         .write_slice(input)
+        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32)
         .build()
         .ok()?;
 
@@ -1469,9 +1489,8 @@ fn benchmark_program(
 /// MUST produce a workload spanning several segments at PO2_MAX (2^24 cycles), otherwise
 /// the sweep carries NO po2 signal: if the program fits in one segment at every po2 then
 /// the measured differences are just warm-up and timer noise, and
-/// `zkminer_prover::benchmark::calibration_is_usable` discards the whole sweep (host-side
-/// `optimal_po2_for_job` is argmax(throughput), so adopting noise would pick a segment
-/// size at random).
+/// `zkminer_prover::benchmark::calibration_is_usable` refuses to pick the fastest size from it
+/// (argmax(throughput) over noise would pick a card's job size at random).
 ///
 /// Sizing: the fibonacci guest costs a MEASURED ~10.4 cycles/iteration — stable for
 /// n >= 100_000 (at small n the reported `total_cycles` is the padded segment size, not
@@ -1698,17 +1717,27 @@ mod retry_tests {
     }
 
     #[test]
-    fn a_job_proves_only_at_the_segment_size_it_was_measured_at() {
+    fn a_job_runs_only_at_a_size_in_the_job_range() {
+        assert_eq!(job_segment_po2(None).unwrap(), RISC0_DEFAULT_JOB_PO2);
+        for p in [RISC0_JOB_PO2_MIN, 19, RISC0_JOB_PO2_MAX] {
+            assert_eq!(job_segment_po2(Some(p)).unwrap(), p);
+        }
+        for p in [RISC0_JOB_PO2_MIN - 1, RISC0_JOB_PO2_MAX + 1] {
+            let err = job_segment_po2(Some(p)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(&format!("po2 value {p} is outside")),
+                "{err:#}"
+            );
+        }
         if FIBONACCI_ELF.is_empty() {
             return; // stubbed guests; nothing to validate
         }
         let image = verify_program_id(FIBONACCI_ELF, None).unwrap();
-        let po2 = RISC0_SEGMENT_PO2 - 1;
-        // Refused before any proving (or seeding): no GPU needed.
+        let po2 = RISC0_JOB_PO2_MIN - 1;
+        // Refused before any proving, executing or seeding: no GPU needed.
         let err = run_proof(FIBONACCI_ELF, &[], Some(po2), Some(image)).unwrap_err();
-        assert!(
-            format!("{err:#}").contains(&format!("po2 value {po2} is not the segment size")),
-            "{err:#}"
-        );
+        assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
+        let err = run_execute(FIBONACCI_ELF, &[], Some(image), Some(po2)).unwrap_err();
+        assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
     }
 }

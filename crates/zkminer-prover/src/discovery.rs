@@ -1053,9 +1053,8 @@ pub const MIN_AVAILABLE_VRAM_MB_ENV: &str = "ZKMINER_MIN_AVAILABLE_VRAM_MB";
 /// itself is the smaller tier's measured peak plus margin — 15,604 MiB — so a card that clears the
 /// floor has room for the configuration it will actually be given.
 ///
-/// risc0 and openvm have no floor here because they size per segment from `po2`, and that is a knob
-/// the dispatcher sets per run: see `find_optimal_po2`, which is given the available figure rather
-/// than the card's total so the segment shrinks instead of the work being refused.
+/// risc0 and openvm have no floor here: a risc0 card proves jobs at its own segment size
+/// (`benchmark::risc0_job_po2`), and one too small for any proves none.
 pub fn min_available_vram_bytes_for_backend(backend: &str) -> Option<u64> {
     let default = match backend {
         // Derived from the MEASURED tier table rather than from the installed-VRAM floor, so this and

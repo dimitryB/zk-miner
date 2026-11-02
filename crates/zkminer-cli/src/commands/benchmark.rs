@@ -103,9 +103,9 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     // issues real proofs over the same IPC. Skipped when interrupted.
     //
     // Not raced against signals: each step is bounded by `benchmark_timeout_secs`, and
-    // an interrupt during a step simply waits for that step before tearing down. The
-    // sweep is discarded unless it actually exercised segmentation — see
-    // `benchmark::calibration_is_usable`.
+    // an interrupt during a step simply waits for that step before tearing down. A card's
+    // fastest size is taken only from a sweep that exercised segmentation (see
+    // `benchmark::calibration_is_usable`); otherwise its ceiling is.
     let mut results = results;
     if !interrupted && calibrate {
         match results.take() {
@@ -154,15 +154,29 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     if calibrate {
         benchmark::save_benchmark(&results);
         if !json {
-            let calibrated = results
+            let calibrated: Vec<_> = results
                 .device_benchmarks
                 .iter()
                 .filter(|d| !d.po2_samples.is_empty())
-                .count();
+                .collect();
             println!(
-                "Saved benchmarks to {} ({calibrated} device(s) with usable po2 calibration)",
-                benchmark::benchmark_cache_path().display()
+                "Saved benchmarks to {} ({} device(s) calibrated)",
+                benchmark::benchmark_cache_path().display(),
+                calibrated.len()
             );
+            // Not the size a card proves jobs at, which also depends on its VRAM: the miner logs that
+            // ("risc0 job sizes"). The table's "po2" column is this value for a calibrated card, and
+            // a guess from VRAM for any other.
+            for d in calibrated {
+                if benchmark::calibration_is_usable(&d.po2_samples) {
+                    println!(
+                        "  {}: po2 ceiling {}, fastest {}",
+                        d.device_id, d.max_feasible_po2, d.optimal_po2
+                    );
+                } else {
+                    println!("  {}: po2 ceiling {}", d.device_id, d.max_feasible_po2);
+                }
+            }
         }
     }
 

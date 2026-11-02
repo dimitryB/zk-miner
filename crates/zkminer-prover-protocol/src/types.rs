@@ -20,14 +20,31 @@ use serde::{Deserialize, Serialize};
 /// refuses a job proof at any other, and executes with risc0's refusals of guests no proof of which
 /// can verify. A v8 worker would measure such a guest clean, and a v9 one refuses the po2 a v8 host
 /// may send.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// 10: `Execute` gained `po2`: the host measures a risc0 job at the segment size of each card that
+/// may prove it, and a job proof runs at its card's size, within [`RISC0_JOB_PO2_MIN`]..=
+/// [`RISC0_JOB_PO2_MAX`]. A v9 worker would measure every job at 20 whatever the host asked.
+pub const PROTOCOL_VERSION: u32 = 10;
 
-/// The segment size (po2) a risc0 worker both measures a job at and proves it at. A guest can tell
-/// the size it runs at: every split leaves the pc it suspended at in memory the guest can read (its
-/// own kernel, or a copy through the sha ecall). So a measurement at one size says nothing about a
-/// proof at another, where one that measured clean could exit, or commit, otherwise. Neither a
-/// calibrated pick nor an override, nor the SDK's own choice (21 on a 32 GB card), applies to a job.
-pub const RISC0_SEGMENT_PO2: u8 = 20;
+/// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
+///
+/// A guest can tell the size it runs at: every split leaves the pc it suspended at in memory the guest
+/// can read (its own kernel, or a copy through the sha ecall). So a measurement at one size says
+/// nothing about a proof at another, where one that measured clean could exit, or commit, otherwise.
+/// The host therefore measures a job at the size of every card that may prove it, and a card proves it
+/// at its own size; neither side leaves the size to the SDK (which picks 21 on a 32 GB card).
+pub const RISC0_DEFAULT_JOB_PO2: u8 = 20;
+
+/// The smallest segment size a risc0 job is measured or proven at. Below 16 the executor's segments
+/// hold little but their own overhead: at 15 a segment must split 25,000 cycles early to leave room
+/// for the longest instruction (a bigint2 ecall), leaving ~11% of it for the guest, and at 14 an
+/// instruction over 2,000 cycles past ~14,400 fails the execution outright. A job measured there would
+/// size every job far heavier than its other cards prove it, or refuse honest ones.
+pub const RISC0_JOB_PO2_MIN: u8 = 16;
+
+/// The largest segment size a risc0 job is measured or proven at: risc0's `DEFAULT_MAX_PO2`. The
+/// Groth16 prover refuses a larger segment ("segment po2 exceeds max on ProverOpts") although the
+/// executor runs it, so a job measured above it would fail every proof after its claim.
+pub const RISC0_JOB_PO2_MAX: u8 = 22;
 
 /// The longest journal an `ExecuteResult` carries. The router refuses a longer one on every fulfil
 /// path (`MAX_JOURNAL_BYTES`, `JournalTooLarge`), so a longer journal is reported by its length alone.
@@ -63,7 +80,7 @@ pub enum WorkerCommand {
         request_id: u64,
         elf: Vec<u8>,
         input_data: Vec<u8>,
-        /// Segment limit as log2 of rows. None = use SDK default.
+        /// Segment limit as log2 of rows. None = [`RISC0_DEFAULT_JOB_PO2`].
         /// Only meaningful for risc0; other backends accept but ignore.
         po2: Option<u8>,
         /// The job's on-chain `programId` (32 bytes), if the host knows it. For risc0 this is the
@@ -93,6 +110,10 @@ pub enum WorkerCommand {
         /// to the program they registered. `None` preserves the prior behaviour.
         #[serde(default)]
         program_id: Option<[u8; 32]>,
+        /// The segment size to execute at (risc0; other backends ignore it), which must be the size
+        /// the proof will run at. `None` = [`RISC0_DEFAULT_JOB_PO2`].
+        #[serde(default)]
+        po2: Option<u8>,
     },
     /// Cancel an in-flight proof. Worker should abort and send Cancelled or Error.
     Cancel { request_id: u64 },
@@ -1205,6 +1226,31 @@ mod tests {
                 assert_eq!(program_id, Some([7u8; 32]));
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn execute_carries_the_segment_size_to_measure_at() {
+        for po2 in [None, Some(RISC0_JOB_PO2_MIN), Some(19)] {
+            let cmd = WorkerCommand::Execute {
+                request_id: 7,
+                elf: vec![1],
+                input_data: vec![2],
+                program_id: Some([3u8; 32]),
+                po2,
+            };
+            let bytes = bincode::serialize(&cmd).unwrap();
+            match bincode::deserialize::<WorkerCommand>(&bytes).unwrap() {
+                WorkerCommand::Execute {
+                    po2: got,
+                    program_id,
+                    ..
+                } => {
+                    assert_eq!(got, po2);
+                    assert_eq!(program_id, Some([3u8; 32]));
+                }
+                _ => panic!("wrong variant"),
+            }
         }
     }
 

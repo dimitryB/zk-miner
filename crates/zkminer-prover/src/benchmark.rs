@@ -280,9 +280,9 @@ impl Po2Profile {
     /// calibrated pick was merely identical to the default (2.53s vs 2.53s).
     ///
     /// So an override is only worth making when the evidence is unambiguous. Below the
-    /// margin this yields `None`, `resolve_po2` falls through, and the SDK keeps
-    /// choosing — which is also what protects against adopting a noisy sweep on
-    /// hardware where po2 simply does not matter much.
+    /// margin this yields `None` — which is also what protects against adopting a noisy
+    /// sweep on hardware where po2 simply does not matter much. (Jobs do not use it: a
+    /// card proves every job at one size, see `risc0_job_po2`.)
     pub fn confident_po2_for_job(&self, cycles: u64) -> Option<u8> {
         /// Minimum relative throughput advantage over the runner-up before the SDK's
         /// own choice is overridden. Well above the ~1% run-to-run spread seen here.
@@ -325,6 +325,90 @@ impl Po2Profile {
         }
         best_po2
     }
+}
+
+/// Cards with less VRAM than this prove no risc0 job at the default segment size unless calibrated
+/// or overridden.
+///
+/// A po2-20 Groth16 proof peaked at 12,436 MiB on the 16 GB RTX 5080 (with the Groth16 cache
+/// released between proofs; see `tests/risc0_groth16_vram.rs`), which a 12 GB card cannot hold.
+/// Nothing smaller has been measured, so a smaller card's size has to come from its own calibration
+/// (`zkminer benchmark --calibrate`, real proofs at each size) or from the operator.
+pub const RISC0_JOB_MIN_VRAM_BYTES: u64 = 14 * 1024 * 1024 * 1024;
+
+/// The segment size (po2) a risc0 card measures and proves jobs at, or `None` for a card that proves
+/// none.
+///
+/// In order: the operator's size for the card (config or Settings); else, by default,
+/// [`RISC0_DEFAULT_JOB_PO2`] on a card with at least [`RISC0_JOB_MIN_VRAM_BYTES`] or whose VRAM is
+/// unknown (what every card proved at before), or nothing on a smaller one; a calibration (real
+/// Groth16 proofs at each size, see `calibrate_po2_for_suite`) can raise that default to its
+/// measured-fastest size or give a smaller card one, but never lowers it below a size it proved: its
+/// ceiling keeps a step of headroom below the highest size that succeeded, which on the 16 GB 5080 is
+/// 19 where 20 proves. A calibration that saw the default size fail stands.
+/// Always within [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`]. The size is the card's, not the
+/// job's: a guest can tell the size it runs at, so every job is measured at the size of each card that
+/// may prove it.
+///
+/// [`RISC0_DEFAULT_JOB_PO2`]: zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+/// [`RISC0_JOB_PO2_MIN`]: zkminer_prover_protocol::RISC0_JOB_PO2_MIN
+/// [`RISC0_JOB_PO2_MAX`]: zkminer_prover_protocol::RISC0_JOB_PO2_MAX
+pub fn risc0_job_po2(
+    override_po2: Option<u8>,
+    row: Option<&DeviceBenchmark>,
+    vram_bytes: Option<u64>,
+) -> Option<u8> {
+    use zkminer_prover_protocol::{RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
+    let in_range = |p: u8| p.clamp(RISC0_JOB_PO2_MIN, RISC0_JOB_PO2_MAX);
+    if let Some(p) = override_po2 {
+        return Some(in_range(p));
+    }
+    let default = match vram_bytes {
+        Some(v) if v < RISC0_JOB_MIN_VRAM_BYTES => None,
+        _ => Some(RISC0_DEFAULT_JOB_PO2),
+    };
+    match row.filter(|db| db.prover_backend == "risc0" && !db.po2_samples.is_empty()) {
+        Some(db) => {
+            let calibrated = in_range(db.optimal_po2.min(db.max_feasible_po2));
+            // Raised to the default only when the calibration proved the default size: its ceiling
+            // is a step below the highest size that proved when a larger one failed, so one at or
+            // above the default less one. A lower ceiling means the default size failed there (a
+            // display holding VRAM, or a card whose VRAM read failed), and the calibration stands.
+            let proved_default = default.filter(|d| db.max_feasible_po2.saturating_add(1) >= *d);
+            Some(proved_default.map_or(calibrated, |d| calibrated.max(d)))
+        }
+        None => default,
+    }
+}
+
+/// Throughput factor per segment-size step below the smallest size a row was measured at.
+///
+/// Recursion (lift/join) costs per segment, so it doubles per step down while the segments themselves
+/// barely change: a 62M-cycle proof on the 4090 took 44.0 / 57.6 / 87.2 s at po2 20 / 19 / 18 (×0.76,
+/// then ×0.66 per step). A step down therefore costs less than twice the time, so halving the rate is
+/// a bound, however far down.
+pub const RISC0_PO2_STEP_DOWN_FACTOR: f64 = 0.5;
+
+/// The throughput (cycles/s) to plan a risc0 job on this card at `po2`, the card's job size.
+///
+/// The row's throughput was measured at [`RISC0_DEFAULT_JOB_PO2`]. A calibrated card is held to the
+/// lower of that and its measured rate at `po2` (which includes the Groth16 wrap). Below the smallest
+/// size either was measured at, each step down is charged [`RISC0_PO2_STEP_DOWN_FACTOR`]; above it,
+/// nothing is credited.
+///
+/// [`RISC0_DEFAULT_JOB_PO2`]: zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+pub fn risc0_job_throughput(row: &DeviceBenchmark, po2: u8) -> f64 {
+    let (rate, lowest) = match Po2Profile::from_device_benchmark(row) {
+        Some(profile) => {
+            let lowest = profile.samples.iter().map(|s| s.po2).min().unwrap_or(po2);
+            (row.throughput.min(profile.throughput_at_po2(po2)), lowest)
+        }
+        None => (
+            row.throughput,
+            zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2,
+        ),
+    };
+    rate * RISC0_PO2_STEP_DOWN_FACTOR.powi(i32::from(lowest.saturating_sub(po2)))
 }
 
 impl DeviceBenchmark {
@@ -1775,19 +1859,17 @@ fn build_gpu_device_benchmarks_from_workers(
     benchmarks
 }
 
-/// True when a calibration sweep actually exercised segmentation and is therefore
-/// safe to adopt as a `Po2Profile`.
+/// True when a calibration sweep can say which size is FASTEST: at least two samples, one of them
+/// split into segments.
 ///
-/// `Po2Profile::optimal_po2_for_job` reduces to `argmax(throughput_at_po2)`, so a sweep
-/// whose workload fit in a SINGLE segment at every po2 carries no po2 signal at all —
-/// the throughput differences are warm-up and timer noise. Adopting such a sweep would
-/// make the miner pick a segment size essentially at random and override the SDK's own
-/// (currently working) choice on every job.
+/// The fastest is `argmax(throughput)`, so a sweep whose workload fit in a SINGLE segment at every
+/// po2 carries no po2 signal at all — the throughput differences are warm-up and timer noise.
+/// Adopting its argmax would pick a card's job size essentially at random. Such a sweep, or one
+/// sample, still says what FITS: `calibrate_po2_for_suite` then takes its ceiling as the size.
 ///
 /// This is not hypothetical: measured on an RTX 5090, the risc0 worker's built-in
 /// calibration workload is 32,768 cycles and reports `segment_count == 1` for every po2
-/// in 18..=24, with throughput varying 72K→624K purely from warm-up. Such a sweep is
-/// rejected here, leaving `po2_samples` empty so proving falls back to the SDK.
+/// in 18..=24, with throughput varying 72K→624K purely from warm-up.
 pub fn calibration_is_usable(samples: &[Po2Sample]) -> bool {
     samples.len() >= 2
         && samples.iter().any(|s| s.segment_count > 1)
@@ -1845,6 +1927,10 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
             .iter_mut()
             .find(|d| d.device_id == device_id && d.prover_backend == "risc0")
         else {
+            tracing::warn!(
+                "{key}: skipping po2 calibration — no risc0 benchmark row for this card (its \
+                 benchmark failed); give it a size in the config (`prover.risc0_job_po2`)"
+            );
             continue;
         };
 
@@ -1861,7 +1947,7 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         //
         // `max_feasible_po2` is derived from the card's total VRAM, so on a card with a display
         // attached the top of this range is sized for memory that is not there. Sweeping into it costs
-        // a full proof attempt per step, each one failing, and `hit_failure` then truncates the sweep
+        // a full proof attempt per step, each one failing, and the failure then ends the sweep
         // and CLAMPS `max_feasible_po2` down — recording the display's footprint as a permanent
         // property of the card, in a suite that persists to disk and prices every later job on it.
         //
@@ -1890,16 +1976,17 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
             }
             _ => db.max_feasible_po2.min(PO2_MAX),
         };
-        if max_po2 < PO2_MIN {
+        let max_po2 = max_po2.min(zkminer_prover_protocol::RISC0_JOB_PO2_MAX);
+        if max_po2 < zkminer_prover_protocol::RISC0_JOB_PO2_MIN {
             tracing::warn!(
-                "{key}: skipping po2 calibration — not enough free VRAM for even po2={PO2_MIN}"
+                "{key}: skipping po2 calibration — not enough free VRAM for even po2={}",
+                zkminer_prover_protocol::RISC0_JOB_PO2_MIN
             );
             continue;
         }
-        tracing::info!("{key}: calibrating po2 {PO2_MIN}..={max_po2}");
-        let mut samples = Vec::new();
-        let mut hit_failure = false;
-        for po2 in PO2_MIN..=max_po2 {
+        let start = PO2_MIN.min(max_po2);
+        tracing::info!("{key}: calibrating po2 from {start}, up to {max_po2}");
+        let (samples, ceiling) = sweep_po2(start, max_po2, |po2| {
             // Retry once on failure. A worker can be SIGKILLed out from under us
             // between `ensure_alive`'s liveness check and the response — the worker
             // inherits PR_SET_PDEATHSIG, which is THREAD-scoped, so a retired tokio
@@ -1929,118 +2016,152 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
                     }
                 }
             };
-            match sample {
-                Some(s) => {
-                    tracing::info!(
-                        "{key}: po2={} segments={} cycles={} {:.2}s → {:.0} c/s",
-                        s.po2,
-                        s.segment_count,
-                        s.total_cycles,
-                        s.duration_secs,
-                        s.throughput
-                    );
-                    samples.push(s);
-                }
-                // A partial sweep is still evaluated below; the usability gate
-                // requires >= 2 samples spanning a segmentation change.
-                None => {
-                    hit_failure = true;
+            if let Some(s) = &sample {
+                tracing::info!(
+                    "{key}: po2={} segments={} cycles={} {:.2}s → {:.0} c/s",
+                    s.po2,
+                    s.segment_count,
+                    s.total_cycles,
+                    s.duration_secs,
+                    s.throughput
+                );
+            }
+            sample
+        });
+        let Some(ceiling) = ceiling else {
+            tracing::warn!(
+                "{key}: DISCARDING po2 calibration — no size from {} up proved with a step of \
+                 headroom, so this card keeps its default size (none under 14 GiB of VRAM) \
+                 unless it is given one",
+                zkminer_prover_protocol::RISC0_JOB_PO2_MIN
+            );
+            continue;
+        };
+        // The ceiling is MEASURED, and replaces the heuristic: `estimate_po2_memory` predicts 4 GB for
+        // po2=22 against a real ~14 GB (on a 4090, po2=22 died with "allocation of 14159970304 bytes
+        // for evaluated failed"). An unmeasured size must not inherit a measured one's throughput and
+        // win the argmax, so no sample above it is kept either.
+        if ceiling != db.max_feasible_po2 {
+            tracing::info!(
+                "{key}: max_feasible_po2 {} → {ceiling} (measured)",
+                db.max_feasible_po2
+            );
+            db.max_feasible_po2 = ceiling;
+        }
+        // The MEASURED fastest size within it is the card's job size (see `risc0_job_po2`, which
+        // never lets it lower a default size the calibration proved) and what the TUI shows — when
+        // the samples can say which is fastest (`calibration_is_usable`). One sample, or samples that
+        // never split into segments, say only what fits: the ceiling is the size.
+        let usable = calibration_is_usable(&samples);
+        let best = if usable {
+            samples
+                .iter()
+                .max_by(|a, b| a.throughput.total_cmp(&b.throughput))
+                .map(|s| s.po2)
+        } else {
+            Some(ceiling)
+        };
+        if let Some(best) = best {
+            if db.optimal_po2 != best {
+                tracing::info!(
+                    "{key}: optimal_po2 {} → {best} ({})",
+                    db.optimal_po2,
+                    if usable {
+                        "measured fastest"
+                    } else {
+                        "its ceiling"
+                    }
+                );
+                db.optimal_po2 = best;
+            }
+            db.memory_usage_bytes = estimate_po2_memory(best, backend, true);
+        }
+        if usable {
+            tracing::info!("{key}: adopting {} po2 calibration samples", samples.len());
+        } else {
+            tracing::info!("{key}: adopting po2 {ceiling} as this card's ceiling");
+        }
+        db.po2_samples = samples;
+    }
+}
+
+/// A card's po2 sweep for `calibrate_po2_for_suite`: the samples it keeps, all at or below the
+/// returned ceiling, or no ceiling when no size in the job range proved with headroom.
+///
+/// Upward from `start` to the first failure (or to `top`, or to a sample at a smaller size than asked,
+/// which `calibrate_slot_po2` returns when the card's free VRAM is short); if `start` itself failed,
+/// downward to the first size that proves, so a card too small for `start` still gets a size.
+///
+/// The ceiling is ONE STEP below the highest size that proved, when a larger one failed. "Highest po2
+/// that calibrated once" is NOT "reliably safe". Measured on a 4090: po2=22 OOMed so the ceiling was
+/// clamped to 21, calibration at 21 then SUCCEEDED (38.5s on a 62M-cycle sweep) — yet a real
+/// 15.7M-cycle proof at po2=21 died with
+///   "failed to run groth16 prove operation: cudaMallocAsync ... out of memory".
+/// The calibration sweep and a live job do not see the same memory state (fragmentation, buffer pools,
+/// a second worker on the card), so the very top of the measured range is marginal. Each po2 step
+/// doubles the segment, so backing off one step buys ~2x headroom. A sweep that ran clean to a top set
+/// by the card's memory needs no backoff; one that reached `RISC0_JOB_PO2_MAX`, which no failure
+/// could show the card's limit at, does. When no sample lies at or below the ceiling, the ceiling
+/// itself is proved too.
+///
+/// `prove(p)` proves the calibration workload at `p` and returns its sample.
+fn sweep_po2(
+    start: u8,
+    top: u8,
+    mut prove: impl FnMut(u8) -> Option<Po2Sample>,
+) -> (Vec<Po2Sample>, Option<u8>) {
+    use zkminer_prover_protocol::RISC0_JOB_PO2_MIN;
+    fn keep(samples: &mut Vec<Po2Sample>, s: Po2Sample) {
+        if !samples.iter().any(|k| k.po2 == s.po2) {
+            samples.push(s);
+        }
+    }
+    let mut samples = Vec::new();
+    let mut failed = false;
+    for po2 in start..=top {
+        match prove(po2) {
+            Some(s) => {
+                let short = s.po2 < po2;
+                keep(&mut samples, s);
+                if short {
                     break;
                 }
             }
-        }
-
-        if calibration_is_usable(&samples) {
-            // Clamp max_feasible_po2 to the highest po2 that actually SUCCEEDED.
-            //
-            // A po2 that OOMed or was rejected produces no sample, so without this it
-            // simply vanishes from the profile — and `throughput_at_po2` CLAMPS above
-            // the measured range, meaning an unmeasured (failing) po2 inherits the
-            // throughput of the best measured one and can win the argmax. Measured on a
-            // 4090: po2=22 died with "allocation of 14159970304 bytes for evaluated
-            // failed", and only a marginal throughput difference kept selection off it.
-            //
-            // The heuristic is badly optimistic here — `estimate_po2_memory` predicts
-            // 4 GB for po2=22 against a real ~14 GB — so the measured ceiling wins.
-            let highest_ok = samples.iter().map(|s| s.po2).max().unwrap_or(PO2_MIN);
-            // Leave ONE STEP of headroom below an OBSERVED failure boundary.
-            //
-            // "Highest po2 that calibrated once" is NOT "reliably safe". Measured on a
-            // 4090: po2=22 OOMed so the ceiling was clamped to 21, calibration at 21
-            // then SUCCEEDED (38.5s on a 62M-cycle sweep) — yet a real 15.7M-cycle proof
-            // at po2=21 died with
-            //   "failed to run groth16 prove operation: cudaMallocAsync ... out of memory".
-            // The calibration sweep and a live job do not see the same memory state
-            // (fragmentation, buffer pools, a second worker on the card), so the very top
-            // of the measured range is marginal. Each po2 step doubles the segment, so
-            // backing off one step buys ~2x headroom.
-            //
-            // Only applied when a higher po2 was actually ATTEMPTED AND FAILED; a sweep
-            // that ran clean to the top needs no backoff.
-            let highest_ok = if hit_failure {
-                let backed_off = highest_ok.saturating_sub(1).max(PO2_MIN);
-                if backed_off < highest_ok {
-                    tracing::info!(
-                        "{key}: backing off po2 ceiling {highest_ok} → {backed_off} \
-                         (one step below the observed failure boundary)"
-                    );
-                }
-                backed_off
-            } else {
-                highest_ok
-            };
-            // Drop samples above the ceiling so the argmax and the Po2Profile agree with it.
-            samples.retain(|s| s.po2 <= highest_ok);
-            if !calibration_is_usable(&samples) {
-                tracing::warn!(
-                    "{key}: DISCARDING po2 calibration — too few usable samples remain \
-                     below the safe ceiling {highest_ok}"
-                );
-                continue;
+            None => {
+                failed = true;
+                break;
             }
-            if highest_ok < db.max_feasible_po2 {
-                tracing::warn!(
-                    "{key}: lowering max_feasible_po2 {} → {highest_ok} (higher po2 failed \
-                     to calibrate — OOM or rejected by the SDK)",
-                    db.max_feasible_po2
-                );
-                db.max_feasible_po2 = highest_ok;
-                if db.optimal_po2 > highest_ok {
-                    db.optimal_po2 = highest_ok;
-                }
-            }
-            // Prefer the MEASURED best over the heuristic for the advertised optimum.
-            // `optimal_po2` is what the TUI shows and defaults to; leaving it at the
-            // heuristic's value while holding samples that say otherwise is just
-            // misleading (measured on a 5090: heuristic said 22 after clamping, the
-            // measurement says 20). Per-job selection still goes through
-            // `Po2Profile::optimal_po2_for_job`; this only fixes the advertised value.
-            if let Some(best) = samples
-                .iter()
-                .max_by(|a, b| a.throughput.total_cmp(&b.throughput))
-            {
-                if db.optimal_po2 != best.po2 {
-                    tracing::info!(
-                        "{key}: optimal_po2 {} → {} (measured fastest: {:.2}M c/s)",
-                        db.optimal_po2,
-                        best.po2,
-                        best.throughput / 1_000_000.0
-                    );
-                    db.optimal_po2 = best.po2;
-                }
-                db.memory_usage_bytes = estimate_po2_memory(best.po2, backend, true);
-            }
-            tracing::info!("{key}: adopting {} po2 calibration samples", samples.len());
-            db.po2_samples = samples;
-        } else {
-            tracing::warn!(
-                "{key}: DISCARDING po2 calibration ({} samples) — the workload never \
-                 exceeded one segment, so the measurements carry no po2 signal. \
-                 Proving will keep letting the SDK choose the segment size.",
-                samples.len()
-            );
         }
     }
+    if samples.is_empty() {
+        for po2 in (RISC0_JOB_PO2_MIN..start).rev() {
+            if let Some(s) = prove(po2) {
+                keep(&mut samples, s);
+                break;
+            }
+        }
+    }
+    let Some(highest) = samples.iter().map(|s| s.po2).max() else {
+        return (Vec::new(), None);
+    };
+    // Reaching the job range's top proves nothing about headroom: the prover refuses anything larger,
+    // so no failure above it could be seen.
+    let ceiling = if failed || highest >= zkminer_prover_protocol::RISC0_JOB_PO2_MAX {
+        highest.saturating_sub(1)
+    } else {
+        highest
+    };
+    if ceiling < RISC0_JOB_PO2_MIN {
+        return (Vec::new(), None);
+    }
+    if !samples.iter().any(|s| s.po2 <= ceiling) {
+        match prove(ceiling) {
+            Some(s) if s.po2 <= ceiling => keep(&mut samples, s),
+            _ => return (Vec::new(), None),
+        }
+    }
+    samples.retain(|s| s.po2 <= ceiling);
+    (samples, Some(ceiling))
 }
 
 /// Run simulated benchmarks for all canonical programs.
@@ -4162,11 +4283,178 @@ mod tests {
         // total_time = cycles / throughput_at_po2, so selection is argmax(throughput).
         assert_eq!(profile.optimal_po2_for_job(50_000_000), 20);
 
-        // And an empty sweep (what the gate leaves behind today) yields no profile,
-        // so `resolve_po2` falls through to letting the SDK choose.
+        // And an empty sweep yields no profile: the card's job size comes from its VRAM
+        // (`risc0_job_po2`).
         let mut uncalibrated = db.clone();
         uncalibrated.po2_samples = Vec::new();
         assert!(Po2Profile::from_device_benchmark(&uncalibrated).is_none());
+    }
+
+    fn risc0_row(samples: Vec<Po2Sample>, optimal: u8, max: u8) -> DeviceBenchmark {
+        DeviceBenchmark {
+            program_stages: Vec::new(),
+            device_id: "gpu0".to_string(),
+            device_label: "GPU0 Test".to_string(),
+            prover_backend: "risc0".to_string(),
+            throughput: 2_000_000.0,
+            power_watts: 300.0,
+            optimal_po2: optimal,
+            memory_usage_bytes: 8 << 30,
+            max_feasible_po2: max,
+            program_throughputs: std::collections::HashMap::new(),
+            pci_bus_id: String::new(),
+            po2_samples: samples,
+            host_peak_bytes: None,
+        }
+    }
+
+    #[test]
+    fn a_card_proves_risc0_jobs_at_its_override_else_its_default_raised_by_calibration() {
+        use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
+        const GIB: u64 = 1 << 30;
+        let calibrated = |ceiling: u8| {
+            let samples = (18..=ceiling)
+                .map(|p| sample(p, 64 >> (p - 18), 1e6))
+                .collect();
+            risc0_row(samples, ceiling, ceiling)
+        };
+        // Its heuristic sizes say nothing about a card: never read without samples.
+        let heuristic = risc0_row(Vec::new(), 23, 24);
+
+        // By default: 20, unless the card is known too small for it.
+        assert_eq!(risc0_job_po2(None, None, None), Some(20));
+        assert_eq!(risc0_job_po2(None, None, Some(16 * GIB)), Some(20));
+        assert_eq!(
+            risc0_job_po2(None, None, Some(RISC0_JOB_MIN_VRAM_BYTES)),
+            Some(20)
+        );
+        assert_eq!(risc0_job_po2(None, None, Some(12 * GIB)), None);
+        assert_eq!(
+            risc0_job_po2(None, Some(&heuristic), Some(80 * GIB)),
+            Some(20)
+        );
+        assert_eq!(risc0_job_po2(None, Some(&heuristic), Some(8 * GIB)), None);
+        // A calibration gives a small card its measured size...
+        assert_eq!(
+            risc0_job_po2(None, Some(&calibrated(18)), Some(12 * GIB)),
+            Some(18)
+        );
+        // ...raises a big one above the default...
+        assert_eq!(
+            risc0_job_po2(None, Some(&calibrated(21)), Some(32 * GIB)),
+            Some(21)
+        );
+        // ...but never lowers it (its ceiling keeps a step below the highest size that proved).
+        assert_eq!(
+            risc0_job_po2(None, Some(&calibrated(19)), Some(16 * GIB)),
+            Some(20)
+        );
+        assert_eq!(risc0_job_po2(None, Some(&calibrated(19)), None), Some(20));
+        // A calibration that saw the default size fail (a ceiling of 18: 19 was its highest
+        // success) stands, whatever the card's VRAM (a display held some; the read failed).
+        assert_eq!(
+            risc0_job_po2(None, Some(&calibrated(18)), Some(16 * GIB)),
+            Some(18)
+        );
+        assert_eq!(risc0_job_po2(None, Some(&calibrated(18)), None), Some(18));
+        // Never above its ceiling, and within the job range (a cache from before the range).
+        let mut over = calibrated(19);
+        over.optimal_po2 = 21;
+        assert_eq!(risc0_job_po2(None, Some(&over), Some(12 * GIB)), Some(19));
+        let mut huge = calibrated(21);
+        (huge.optimal_po2, huge.max_feasible_po2) = (24, 24);
+        assert_eq!(
+            risc0_job_po2(None, Some(&huge), None),
+            Some(RISC0_JOB_PO2_MAX)
+        );
+        // Another backend's row is not this card's risc0 calibration.
+        let mut sp1 = calibrated(19);
+        sp1.prover_backend = "sp1".to_string();
+        assert_eq!(risc0_job_po2(None, Some(&sp1), Some(12 * GIB)), None);
+        // An override wins, held to the job range.
+        assert_eq!(
+            risc0_job_po2(Some(18), Some(&calibrated(21)), Some(8 * GIB)),
+            Some(18)
+        );
+        assert_eq!(risc0_job_po2(Some(23), None, None), Some(RISC0_JOB_PO2_MAX));
+        assert_eq!(risc0_job_po2(Some(14), None, None), Some(RISC0_JOB_PO2_MIN));
+    }
+
+    #[test]
+    fn a_card_is_planned_at_the_rate_of_its_job_size() {
+        let uncalibrated = risc0_row(Vec::new(), 18, 18);
+        assert_eq!(risc0_job_throughput(&uncalibrated, 20), 2_000_000.0);
+        assert_eq!(
+            risc0_job_throughput(&uncalibrated, 21),
+            2_000_000.0,
+            "nothing credited"
+        );
+        assert_eq!(risc0_job_throughput(&uncalibrated, 18), 2_000_000.0 * 0.25);
+        // Calibrated: the lower of the row and its rate at the size; halved per step below its
+        // samples.
+        let calibrated = risc0_row(vec![sample(19, 32, 1.5e6), sample(20, 16, 2.5e6)], 20, 20);
+        assert_eq!(risc0_job_throughput(&calibrated, 20), 2_000_000.0);
+        assert_eq!(risc0_job_throughput(&calibrated, 19), 1_500_000.0);
+        assert_eq!(risc0_job_throughput(&calibrated, 17), 1_500_000.0 * 0.25);
+    }
+
+    /// A sweep proving at each size per `fits` (the largest that fits; None fails all), recording what
+    /// it asked for.
+    fn sweep(start: u8, top: u8, fits: Option<u8>) -> (Vec<u8>, Option<u8>, Vec<u8>) {
+        let mut asked = Vec::new();
+        let (samples, ceiling) = sweep_po2(start, top, |p| {
+            asked.push(p);
+            fits.filter(|f| p <= *f).map(|_| sample(p, 4, 1e6))
+        });
+        (samples.iter().map(|s| s.po2).collect(), ceiling, asked)
+    }
+
+    #[test]
+    fn a_sweep_finds_each_cards_ceiling_with_a_step_of_headroom() {
+        // A 4090/5080-like card: 20 proves, 21 fails, so 19 (one step below the highest success).
+        assert_eq!(
+            sweep(18, 22, Some(20)),
+            (vec![18, 19], Some(19), vec![18, 19, 20, 21])
+        );
+        // A 12 GB card (20 fails): 18, from a single sample, which still says what fits.
+        assert_eq!(
+            sweep(18, 22, Some(19)),
+            (vec![18], Some(18), vec![18, 19, 20])
+        );
+        // A card that fails at the start: down to the first size that proves, then its headroom
+        // step, proved too.
+        assert_eq!(
+            sweep(18, 22, Some(17)),
+            (vec![16], Some(16), vec![18, 17, 16])
+        );
+        assert_eq!(
+            sweep(18, 22, Some(18)),
+            (vec![17], Some(17), vec![18, 19, 17])
+        );
+        // Nothing in the job range with headroom: no size.
+        assert_eq!(sweep(18, 22, Some(16)).1, None);
+        assert_eq!(sweep(18, 22, None), (vec![], None, vec![18, 17, 16]));
+        // Clean to a top set by the card's memory: no step back...
+        assert_eq!(
+            sweep(18, 20, Some(22)),
+            (vec![18, 19, 20], Some(20), vec![18, 19, 20])
+        );
+        // ...but clean to the job range's top, beyond which the prover refuses: one.
+        assert_eq!(
+            sweep(18, 22, Some(22)),
+            (vec![18, 19, 20, 21], Some(21), vec![18, 19, 20, 21, 22])
+        );
+        // A sample at a smaller size than asked (free VRAM short) ends the sweep without a failure.
+        let mut asked = Vec::new();
+        let (samples, ceiling) = sweep_po2(18, 22, |p| {
+            asked.push(p);
+            Some(sample(p.min(19), 4, 1e6))
+        });
+        assert_eq!(
+            samples.iter().map(|s| s.po2).collect::<Vec<_>>(),
+            vec![18, 19]
+        );
+        assert_eq!((ceiling, asked), (Some(19), vec![18, 19, 20]));
     }
 
     #[test]

@@ -1514,6 +1514,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // enforced host-side (registry byte-binding → measure-ELF == prove-ELF) and on the
                 // prove path's vkey gate instead. See `run_execute_sp1`.
                 program_id: _,
+                // risc0's segment size; SP1 shards on its own.
+                po2: _,
             } => {
                 // Real cycle measurement for SP1, matching risc0's Execute
                 // arm, so the miner sizes SP1 jobs on a measured count rather than the

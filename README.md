@@ -211,10 +211,37 @@ Worth knowing:
 - **Rebuild every worker with the miner.** A worker built for another protocol version is
   refused at start.
 
-`benchmark --calibrate` measures proving time at each segment size, for information: every
-risc0 job is measured and proven at po2 20. A guest can tell the segment size it runs at, so a
-proof at another size could run it otherwise than the measurement did; calibrated picks and
-the TUI's per-device overrides don't apply to jobs.
+Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
+- the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for
+  NVIDIA cards, `gpu-rocm0`, … for AMD, `gpu-intel0`, … for Intel):
+
+  ```toml
+  [prover.risc0_job_po2]
+  gpu1 = 19
+  ```
+
+  or a po2 under Settings → Advanced, which applies for the session while Advanced mode is on.
+  The config is read when the miner starts. The log lists each card's size whenever it changes,
+  and names a configured card that isn't here;
+- else po2 20, or none for a card with less than 14 GiB of VRAM (po2 20 peaks around 12.1 GiB).
+  A card whose VRAM isn't known gets 20: an Intel card, a CUDA query that failed, or the card
+  behind a risc0 worker named in `[prover.worker_binaries]` (which isn't pinned to a card);
+- `benchmark --calibrate` proves a 62M-cycle Groth16 job at each size, on a card whose VRAM
+  is known (NVIDIA; an AMD card under 14 GiB needs a size set for it). Run it with the miner
+  stopped. A card then uses its fastest size,
+  up to one step below the largest that proved when a larger one failed (or at 22, past which
+  the prover refuses). Calibration can raise a card above 20, or give a smaller card a size, but
+  never takes a card below 20 if 20 proved during calibration. A plain re-benchmark drops the
+  calibration. A slow card may need a larger `benchmark_timeout_secs` at sizes below 18.
+
+A guest can tell the segment size it runs at, so every job is measured at each card size on the
+rig before it's claimed. It's claimed only if it measures clean at all of them, with one
+journal. A rig whose cards share a size measures once. A claimed job is proven at a measured
+size that fits the card. If a restart or a re-benchmark has since moved every card below those
+sizes, each card proves the job at its own size rather than releasing it. If no enabled card has
+a size, the job waits for one (switch a card back on, or give one a po2 under Settings →
+Advanced; a config size or a calibration applies only after a restart, which releases it) and
+is released before its deadline.
 
 ## Layout
 

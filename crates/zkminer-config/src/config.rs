@@ -237,6 +237,14 @@ pub struct ProverConfig {
     /// the risc0 version in use. Defaults to the risc0 v3.0.x value when unset.
     #[serde(default)]
     pub risc0_groth16_selector: Option<String>,
+    /// The segment size (po2) a card measures and proves risc0 jobs at, keyed by its benchmark device
+    /// id (`gpu0`, `gpu1`, … for NVIDIA cards, `gpu-rocm0`, … for AMD; the log lists them), e.g.
+    /// `{ gpu1 = 19 }`: for a card the default (20, or nothing under 14 GiB of VRAM) or its
+    /// calibration doesn't suit. Held to 16..=22. The Settings screen's Advanced rows override it for
+    /// the session. Not written when empty, so `zkminer init` leaves no empty table at the end of the
+    /// file for a later line to land in.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub risc0_job_po2: HashMap<String, u8>,
     /// If true, the brain will proceed with a synthetic conservative
     /// benchmark profile when no cached benchmark is available, rather
     /// than waiting for the user to run `[b]` on the Benchmark screen.
@@ -310,6 +318,7 @@ impl Default for ProverConfig {
             worker_search_paths: Vec::new(),
             worker_binaries: HashMap::new(),
             risc0_groth16_selector: None,
+            risc0_job_po2: HashMap::new(),
             skip_benchmark_gate: default_skip_benchmark_gate(),
         }
     }

@@ -79,6 +79,10 @@ pub struct ExecuteMeasurement {
     pub duration_secs: f64,
 }
 
+/// A job's segment size (po2) on each slot, by slot key, or `None` for a slot that must not prove it
+/// (see `WorkerPool::prove_min_vram`).
+pub type SlotPo2<'a> = &'a dyn Fn(&str) -> Option<u8>;
+
 /// The journal an `ExecuteResult` reported, if it is the whole journal `journal_len` describes. The
 /// caller claims no journal-bound job on a measurement without one.
 fn whole_journal(journal: Option<Vec<u8>>, journal_len: u64) -> Option<Vec<u8>> {
@@ -627,6 +631,20 @@ fn gpu_vram_bytes(gpu_tag: &str, device_index: Option<u32>) -> Option<u64> {
     }
     let mib: u64 = stdout.trim().parse().ok()?;
     Some(mib * 1024 * 1024)
+}
+
+/// An AMD card's total VRAM in bytes, from the amdgpu driver's sysfs entry for its PCI bus id.
+fn amd_vram_bytes(pci_bus_id: &str) -> Option<u64> {
+    let path = format!(
+        "/sys/bus/pci/devices/{}/mem_info_vram_total",
+        pci_bus_id.to_ascii_lowercase()
+    );
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|v| *v > 0)
 }
 
 /// Bounded like `gpu_vram_bytes`, but tighter: these queries run on every GPU dispatch — two or three
@@ -2451,7 +2469,7 @@ impl WorkerPool {
         // were covered.
         //
         // Charged by the po2 being attempted, not a flat figure, for the same doubling reason: a
-        // sweep to po2 24 from a baseline of 21 is ~8x the baseline cost.
+        // sweep to po2 22 from a baseline of 20 is ~4x the baseline cost.
         let _memory_reservation = {
             let backend_of_slot = key.split(':').next().unwrap_or(key);
             let baseline = self
@@ -3583,6 +3601,9 @@ impl WorkerPool {
         // image id does not match, so the zero-cost pre-claim measurement path cannot be driven with
         // an ELF unrelated to the registered program.
         program_id: Option<[u8; 32]>,
+        // The segment size to execute at (risc0): the size of a card that may prove the job, since a
+        // guest can tell the size it runs at. `None` = the worker's default.
+        po2: Option<u8>,
     ) -> anyhow::Result<ExecuteMeasurement> {
         // Measure on the DEDICATED measure worker when one exists for this backend (SP1), NEVER on a
         // prove worker — so a measure wall-clock-watchdog SIGKILL (which group-kills the chosen
@@ -3848,6 +3869,7 @@ impl WorkerPool {
             elf: elf.to_vec(),
             input_data: input_data.to_vec(),
             program_id,
+            po2,
         }) {
             // The pipe is closed — the worker died (OOM-killed while idle between measurements, a
             // preempt kill that landed before the send, etc.). The live-candidate path selected this
@@ -4046,11 +4068,13 @@ impl WorkerPool {
         disabled: &[String],
         used_slot: &mut Option<String>,
         abort_at: Option<Instant>,
-        // Resolves the segment size (po2) for the slot that is ultimately chosen.
-        // Needed because the DEVICE is picked in here (VRAM floor, availability,
-        // exclusions) — the caller cannot know it in advance, and po2 is a
-        // per-device property. Consulted only when `po2` is None.
-        po2_resolver: Option<&dyn Fn(&str) -> Option<u8>>,
+        // For a job: the segment size each slot proves it at, by slot key, or `None` for a slot that
+        // must not prove it (its card's size is not one the job was measured at). A HARD filter, like
+        // `disabled`, applied before every preference and never restored: a guest can tell the size
+        // it runs at, so a proof at a size it was not measured at may fail where the measurement did
+        // not. The size is per card, which is why it is resolved here, where the card is chosen. Takes
+        // precedence over `po2`.
+        job_po2: Option<SlotPo2<'_>>,
         // The job's on-chain programId (risc0 image-id binding; see WorkerCommand::Prove).
         program_id: Option<[u8; 32]>,
         // Benchmark device id (e.g. "gpu1") of the card this job was sized/planned for at claim time.
@@ -4074,6 +4098,16 @@ impl WorkerPool {
                 bail!(
                     "every {backend} device is disabled in settings, so this job cannot be proved. \
                      Re-enable one on the Settings screen, or stop claiming {backend} jobs."
+                );
+            }
+        }
+        // The other hard filter: only cards at a size this job was measured at. See `job_po2`.
+        if let Some(size_of) = job_po2 {
+            all_keys.retain(|k| size_of(k).is_some());
+            if all_keys.is_empty() {
+                bail!(
+                    "no {backend} card proves at a segment size this job was measured at, so it \
+                     cannot be proved here"
                 );
             }
         }
@@ -4154,7 +4188,7 @@ impl WorkerPool {
                 timeout,
                 on_progress,
                 abort_at,
-                po2_resolver,
+                job_po2,
                 program_id,
                 execute_peak_bytes,
             );
@@ -4228,7 +4262,7 @@ impl WorkerPool {
                             timeout,
                             on_progress,
                             abort_at,
-                            po2_resolver,
+                            job_po2,
                             program_id,
                             execute_peak_bytes,
                         );
@@ -4288,7 +4322,7 @@ impl WorkerPool {
                             timeout,
                             on_progress,
                             abort_at,
-                            po2_resolver,
+                            job_po2,
                             program_id,
                             execute_peak_bytes,
                         );
@@ -4349,8 +4383,8 @@ impl WorkerPool {
     ///
     /// MUST stay in sync with the ids emitted by
     /// `benchmark::build_gpu_device_benchmarks_from_workers` (`format!("gpu{idx}")`)
-    /// and the CPU rows (`"cpu"`), otherwise a `Po2Profile` lookup silently misses and
-    /// proving quietly falls back to the SDK default.
+    /// and the CPU rows (`"cpu"`), otherwise a card's calibration row and Settings size silently miss
+    /// and its risc0 job size quietly falls back to the VRAM rule (`benchmark::risc0_job_po2`).
     fn benchmark_device_id(key: &str) -> String {
         let mut parts = key.split(':');
         let _backend = parts.next();
@@ -4460,8 +4494,8 @@ impl WorkerPool {
     /// As `expected_host_peak`, scaled to the segment size the proof will actually use.
     ///
     /// The budget is stored per backend and is otherwise po2-BLIND, while host memory doubles per po2
-    /// step. So a TUI `po2_overrides` entry raising risc0 from 21 to 24 multiplied the real cost
-    /// roughly eightfold with no change to any admission figure — and the `Critical` log line advised
+    /// step. So a TUI `po2_overrides` entry raising risc0 from 20 to 22 would quadruple the real cost
+    /// with no change to any admission figure — and the `Critical` log line advised
     /// lowering po2 as the remedy for a number po2 did not affect. `None` means the resolver had no
     /// opinion, in which case the stored figure already describes the default.
     pub fn expected_host_peak_at_po2(&self, backend: &str, po2: Option<u8>) -> u64 {
@@ -5369,6 +5403,31 @@ impl WorkerPool {
         self.workers.get(key).and_then(|e| e.vram_bytes)
     }
 
+    /// Every risc0 proving slot, sorted, as `(slot key, benchmark device id, card VRAM if known)`: what
+    /// a card's job segment size is decided from (`benchmark::risc0_job_po2`), its calibration row and
+    /// its Settings override being keyed by the device id. An AMD card's VRAM, which routing does not
+    /// know, is read from the driver here. Takes no slot lock.
+    pub fn risc0_slots(&self) -> Vec<(String, String, Option<u64>)> {
+        let mut slots: Vec<_> = self
+            .keys_for_prefix(zkminer_prover_protocol::BACKEND_RISC0)
+            .into_iter()
+            .map(|k| {
+                let device = Self::benchmark_device_id(&k);
+                let entry = self.workers.get(&k);
+                let vram = entry.and_then(|e| e.vram_bytes).or_else(|| {
+                    let rocm = k.split(':').nth(1) == Some("rocm");
+                    entry
+                        .and_then(|e| e.pci_bus_id.as_deref())
+                        .filter(|_| rocm)
+                        .and_then(amd_vram_bytes)
+                });
+                (k, device, vram)
+            })
+            .collect();
+        slots.sort();
+        slots
+    }
+
     /// This slot's card as the admission gate reads it, before it makes any room: what anything other
     /// than this slot's own worker holds — other processes and our OTHER workers on the card alike —
     /// and what is therefore available to the slot. `None` for a slot with no CUDA device or a card
@@ -6159,7 +6218,8 @@ impl WorkerPool {
         timeout: Option<Duration>,
         on_progress: Option<Box<dyn Fn(f64, &str) + Send>>,
         abort_at: Option<Instant>,
-        po2_resolver: Option<&dyn Fn(&str) -> Option<u8>>,
+        // A job's segment size on each slot; see `prove_min_vram`.
+        job_po2: Option<SlotPo2<'_>>,
         // The job's on-chain programId, forwarded to the worker so a risc0 worker can refuse an ELF
         // whose image id does not match (see WorkerCommand::Prove). None on the benchmark/calibration
         // paths and for backends where programId is not the ELF image.
@@ -6172,12 +6232,15 @@ impl WorkerPool {
         // path, non-SP1, or portable executor with no server-stacking) leaves the charge unchanged.
         execute_peak_bytes: u64,
     ) -> Result<ProofOutput> {
-        // Resolve the segment size now that the device is known. An explicit `po2`
-        // always wins; otherwise ask the resolver for THIS device. Derived from the
-        // slot key rather than the slot's fields so no lock is needed.
-        let po2 = match po2 {
-            Some(p) => Some(p),
-            None => po2_resolver.and_then(|f| f(&Self::benchmark_device_id(key))),
+        // Resolve the segment size now that the card is known: a job's size on THIS slot, else the
+        // caller's `po2`. A job never reaches a slot it has no size for (`prove_min_vram` filters
+        // those out); refused here too, for a caller that names the slot itself.
+        let po2 = match job_po2 {
+            Some(size_of) => match size_of(key) {
+                Some(p) => Some(p),
+                None => bail!("{key} does not prove at a segment size this job was measured at"),
+            },
+            None => po2,
         };
 
         // Per-physical-GPU guard (see `gpu_locks`): serialize proofs across different
@@ -7564,6 +7627,101 @@ mod tests {
         assert!(keys.is_empty());
     }
 
+    #[test]
+    fn risc0_slots_name_each_cards_device_and_vram() {
+        let mut pool = pool_with_keys(&["risc0:cuda:1", "risc0:cuda:0", "sp1:cuda:0"]);
+        pool.workers.get_mut("risc0:cuda:1").unwrap().vram_bytes = Some(12 << 30);
+        assert_eq!(
+            pool.risc0_slots(),
+            vec![
+                ("risc0:cuda:0".to_string(), "gpu0".to_string(), None),
+                (
+                    "risc0:cuda:1".to_string(),
+                    "gpu1".to_string(),
+                    Some(12 << 30)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_job_is_never_dispatched_to_a_slot_without_a_size_it_was_measured_at() {
+        let pool = pool_with_keys(&["risc0:cuda:0", "risc0:cuda:1"]);
+        let none = |_: &str| -> Option<u8> { None };
+        let mut used = None;
+        let err = pool
+            .prove_min_vram(
+                "risc0",
+                &[],
+                &[],
+                Some(20),
+                Some(Duration::from_secs(1)),
+                None,
+                None,
+                &[],
+                &[],
+                &mut used,
+                None,
+                Some(&none),
+                None,
+                None,
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no risc0 card proves at a segment size"),
+            "{err:#}"
+        );
+        assert_eq!(used, None, "refused before any slot is picked");
+        // A caller naming the slot itself is refused too, before taking any lock.
+        let err = pool
+            .prove_on_slot(
+                "risc0:cuda:0",
+                &[],
+                &[],
+                Some(20),
+                Some(Duration::from_secs(1)),
+                None,
+                None,
+                Some(&none),
+                None,
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not prove at a segment size"),
+            "{err:#}"
+        );
+        // With one slot sized for it, the job goes there and nowhere else, however often it is tried
+        // (the round-robin would otherwise alternate). Its worker here is /dev/null, so it fails there,
+        // and later tries find it backing off and wait it out rather than take the other slot.
+        let only_one = |k: &str| (k == "risc0:cuda:1").then_some(19);
+        for attempt in 0..3 {
+            let mut used = None;
+            let _ = pool.prove_min_vram(
+                "risc0",
+                &[],
+                &[],
+                Some(20),
+                Some(Duration::from_secs(1)),
+                None,
+                None,
+                &[],
+                &[],
+                &mut used,
+                None,
+                Some(&only_one),
+                None,
+                None,
+                0,
+            );
+            if attempt == 0 {
+                assert_eq!(used.as_deref(), Some("risc0:cuda:1"));
+            }
+            assert_ne!(used.as_deref(), Some("risc0:cuda:0"));
+        }
+    }
+
     // ---- gpu_env tests ----
 
     #[test]
@@ -8674,7 +8832,7 @@ mod tests {
         assert!(!pool.has_idle_or_revivable_worker("sp1"));
 
         let err = pool
-            .execute_cycles("risc0", &[], &[], Some(Duration::from_secs(1)), None)
+            .execute_cycles("risc0", &[], &[], Some(Duration::from_secs(1)), None, None)
             .expect_err("respawn of /dev/null fails, so nothing can measure");
         assert!(
             format!("{err:#}").contains("down and not revivable"),
@@ -9425,9 +9583,9 @@ mod tests {
     fn benchmark_device_id_matches_benchmark_module_ids() {
         // These strings are a CONTRACT with benchmark.rs: CUDA rows are built as
         // format!("gpu{idx}") from the slot key's device index, CPU rows are "cpu".
-        // If this drifts, `resolve_po2` looks up a device that does not exist in the
-        // suite, silently returns None, and po2 selection quietly stops working —
-        // with no error anywhere.
+        // If this drifts, a card's calibration row and Settings size are looked up under a device
+        // that does not exist in the suite, and its risc0 job size quietly falls back to the VRAM
+        // rule — with no error anywhere.
         assert_eq!(WorkerPool::benchmark_device_id("risc0:cuda:0"), "gpu0");
         assert_eq!(WorkerPool::benchmark_device_id("risc0:cuda:1"), "gpu1");
         assert_eq!(WorkerPool::benchmark_device_id("sp1:generic"), "cpu");

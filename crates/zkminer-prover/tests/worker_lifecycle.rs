@@ -398,7 +398,7 @@ fn cycle_measurement_skips_a_recycled_slot() {
             "the other worker is idle and live"
         );
         let m = pool
-            .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None)
+            .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None, None)
             .expect("measurement must move on to the live worker");
         assert_eq!(m.cycles, 1000);
         // Bring it back for the next round.
@@ -511,7 +511,7 @@ fn a_committed_proof_preempts_an_inflight_measurement_end_to_end() {
         let pool = Arc::clone(&pool);
         std::thread::spawn(move || {
             // A generous watchdog budget that we never reach — the preemption kills it first.
-            pool.execute_cycles("mock", &[], &[], Some(Duration::from_secs(120)), None)
+            pool.execute_cycles("mock", &[], &[], Some(Duration::from_secs(120)), None, None)
         })
     };
 
@@ -561,6 +561,48 @@ fn a_committed_proof_preempts_an_inflight_measurement_end_to_end() {
     );
 }
 
+/// The segment size a job is measured at, and the size its slot proves it at, reach the worker.
+#[test]
+fn the_segment_size_reaches_the_worker() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    let m = pool
+        .execute_cycles(
+            "mock",
+            &[],
+            &[],
+            Some(Duration::from_secs(10)),
+            None,
+            Some(18),
+        )
+        .expect("measurement should succeed");
+    assert_eq!(m.cycles, 1018);
+    // A job's size on its slot wins over the caller's `po2`.
+    let size_on = |k: &str| (k == "mock:generic").then_some(19);
+    let mut used = None;
+    let out = pool
+        .prove_min_vram(
+            "mock",
+            &[],
+            &[],
+            Some(20),
+            Some(Duration::from_secs(10)),
+            None,
+            None,
+            &[],
+            &[],
+            &mut used,
+            None,
+            Some(&size_on),
+            None,
+            None,
+            0,
+        )
+        .expect("proof should succeed");
+    assert_eq!((out.cycles, used.as_deref()), (1019, Some("mock:generic")));
+}
+
 /// A measurement that completes NORMALLY deregisters itself and leaves its slot healthy — the
 /// preemptible window is exactly the in-flight duration, nothing lingers in the registry.
 #[test]
@@ -570,7 +612,7 @@ fn a_normal_measurement_leaves_no_inflight_registration() {
         .expect("failed to spawn mock worker");
 
     let m = pool
-        .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None)
+        .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None, None)
         .expect("measurement should succeed");
     assert_eq!(m.cycles, 1000);
     // The mock commits nothing: an empty journal, reported whole.

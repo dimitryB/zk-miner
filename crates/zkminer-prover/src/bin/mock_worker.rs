@@ -90,7 +90,7 @@ fn main() {
                 request_id,
                 elf: _,
                 input_data: _,
-                po2: _,
+                po2,
                 program_id: _,
             } => {
                 if crash_on == "prove" || crash_on == "both" {
@@ -102,19 +102,23 @@ fn main() {
                     }
                 }
                 std::thread::sleep(prove_delay);
+                // 1,000 cycles, plus the segment size asked for, so a test can see which arrived.
                 let resp = WorkerResponse::ProofResult {
                     request_id,
                     journal: journal.clone(),
                     seal: seal.clone(),
                     duration_secs: 0.01,
-                    cycles: 1000,
+                    cycles: 1000 + u64::from(po2.unwrap_or(0)),
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }
 
-            // Measures nothing: answers like a guest of 1,000 cycles that commits `journal`, so a
-            // caller sees a well-formed reply rather than a hang.
-            WorkerCommand::Execute { request_id, .. } => {
+            // Measures nothing: answers like a guest of 1,000 cycles (plus the segment size asked
+            // for, so a test can see which arrived) that commits `journal`, so a caller sees a
+            // well-formed reply rather than a hang.
+            WorkerCommand::Execute {
+                request_id, po2, ..
+            } => {
                 if crash_on == "execute" || crash_on == "both" {
                     std::process::exit(1);
                 }
@@ -129,7 +133,7 @@ fn main() {
                 }
                 let resp = WorkerResponse::ExecuteResult {
                     request_id,
-                    cycles: 1000,
+                    cycles: 1000 + u64::from(po2.unwrap_or(0)),
                     duration_secs: 0.01,
                     journal_len: journal.len() as u64,
                     peak_host_bytes: 0,

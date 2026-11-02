@@ -70,7 +70,7 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
         3 // just border + "no combos" message
     };
     let pm_h = (param_count as u16 + 2).max(3);
-    // In advanced mode, a line above the rows says jobs do not use them.
+    // In advanced mode, a line above the rows says what a risc0 row sets.
     let adv_lines = advanced_count + usize::from(state.runtime_settings.advanced_mode);
     let adv_h = (adv_lines as u16 + 2).max(3);
     let tuning_h = gpu_tuning_height(state);
@@ -446,12 +446,9 @@ fn render_advanced(f: &mut Frame, area: Rect, state: &MinerState, focused: bool)
             theme::dim(),
         )));
     } else {
-        // Jobs no longer read these (see `RISC0_SEGMENT_PO2`): say so where they are set.
+        // What a risc0 row sets: the size that card measures and proves jobs at.
         lines.push(Line::from(Span::styled(
-            format!(
-                "  risc0 jobs prove at po2 {}, the size they are measured at: these are not used",
-                zkminer_prover_protocol::RISC0_SEGMENT_PO2
-            ),
+            "  risc0: each card proves jobs at its po2; every job is measured at each before a claim",
             theme::dim(),
         )));
         let pairs = fully_enabled_pairs(state);
@@ -461,13 +458,28 @@ fn render_advanced(f: &mut Frame, area: Rect, state: &MinerState, focused: bool)
                 && ui.active_section == SettingsSection::Advanced
                 && ui.row_index == row_idx;
 
-            let current_po2 = rs
-                .po2_overrides
-                .get(&(dev.clone(), bk.clone()))
-                .copied()
-                .unwrap_or_else(|| optimal_po2_for(state, dev, bk));
-
-            let optimal = optimal_po2_for(state, dev, bk);
+            let over = rs.po2_overrides.get(&(dev.clone(), bk.clone())).copied();
+            let current_po2 = over.unwrap_or_else(|| default_po2_for(state, dev, bk));
+            // For risc0, the size its jobs run at (or that it proves none); the calibrated optimum
+            // otherwise.
+            let hint = if bk == zkminer_prover_protocol::BACKEND_RISC0 {
+                match risc0_job_po2_for(state, dev) {
+                    Some(Some(p)) => format!("   (jobs: {p})"),
+                    Some(None) => "   (no risc0 jobs: give it a size)".to_string(),
+                    None => String::new(),
+                }
+            } else {
+                // Only risc0 has a segment size; the others shard on their own.
+                "   (not used)".to_string()
+            };
+            let shown = if bk == zkminer_prover_protocol::BACKEND_RISC0
+                && over.is_none()
+                && risc0_job_po2_for(state, dev) == Some(None)
+            {
+                "--".to_string()
+            } else {
+                current_po2.to_string()
+            };
 
             let dev_label = format!("{:<5}", dev.to_uppercase());
             let bk_label = format!("{:<10}", bk);
@@ -487,9 +499,9 @@ fn render_advanced(f: &mut Frame, area: Rect, state: &MinerState, focused: bool)
                 Span::styled(bk_label, theme::accent()),
                 Span::styled("po2: ".to_string(), theme::dim()),
                 Span::styled("\u{25c2} ".to_string(), Style::default().fg(theme::peach())),
-                Span::styled(format!("{}", current_po2), theme::metric()),
+                Span::styled(shown, theme::metric()),
                 Span::styled(" \u{25b8}".to_string(), Style::default().fg(theme::peach())),
-                Span::styled(format!("   (optimal: {})", optimal), theme::dim()),
+                Span::styled(hint, theme::dim()),
             ];
 
             if sel {
@@ -1246,6 +1258,28 @@ fn fully_enabled_pairs(state: &MinerState) -> Vec<(String, String)> {
     pairs
 }
 
+/// The size a card's risc0 jobs run at as the miner published it: `Some(None)` for a card that proves
+/// none, `None` before the miner has said.
+fn risc0_job_po2_for(state: &MinerState, device: &str) -> Option<Option<u8>> {
+    state
+        .risc0_job_po2s
+        .iter()
+        .find(|(d, _)| d == device)
+        .map(|(_, p)| *p)
+}
+
+/// A row's po2 with no override: for risc0 the size its jobs run at, or the default size for a card
+/// that proves none or before the miner has said (never the VRAM heuristic's guess, which runs to 23
+/// on a 12 GB card), so an adjustment starts there; the calibrated optimum otherwise.
+fn default_po2_for(state: &MinerState, device: &str, backend: &str) -> u8 {
+    if backend == zkminer_prover_protocol::BACKEND_RISC0 {
+        return risc0_job_po2_for(state, device)
+            .flatten()
+            .unwrap_or(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2);
+    }
+    optimal_po2_for(state, device, backend)
+}
+
 fn optimal_po2_for(state: &MinerState, device: &str, backend: &str) -> u8 {
     if let Some(suite) = &state.benchmark_results {
         for db in &suite.device_benchmarks {
@@ -1886,6 +1920,11 @@ fn adjust_param(state: &mut MinerState, dir: i32) {
 // ---------------------------------------------------------------------------
 
 fn adjust_po2(state: &mut MinerState, dir: i32) {
+    // The rows, and the overrides they set, exist only in Advanced mode; the row this key lands on
+    // otherwise is the line that says so.
+    if !state.runtime_settings.advanced_mode {
+        return;
+    }
     let pairs = fully_enabled_pairs(state);
     let pair_idx = state.settings_ui.row_index.saturating_sub(1);
     if pair_idx >= pairs.len() {
@@ -1899,9 +1938,12 @@ fn adjust_po2(state: &mut MinerState, dir: i32) {
         .po2_overrides
         .get(&key)
         .copied()
-        .unwrap_or_else(|| optimal_po2_for(state, dev, bk));
+        .unwrap_or_else(|| default_po2_for(state, dev, bk));
 
-    let new_val = (current as i32 + dir).clamp(14, 24) as u8;
+    let new_val = (current as i32 + dir).clamp(
+        i32::from(zkminer_prover_protocol::RISC0_JOB_PO2_MIN),
+        i32::from(zkminer_prover_protocol::RISC0_JOB_PO2_MAX),
+    ) as u8;
     state.runtime_settings.po2_overrides.insert(key, new_val);
 }
 
@@ -1974,6 +2016,39 @@ mod param_row_tests {
         assert_eq!(
             st.runtime_settings.queue_horizon_secs, 1800,
             "clamps at 30 minutes"
+        );
+    }
+
+    /// A risc0 row is edited only in Advanced mode, and from the size its jobs run at (the default
+    /// size before the miner says), never from the VRAM heuristic's guess.
+    #[test]
+    fn a_risc0_size_is_edited_only_in_advanced_mode_from_its_job_size() {
+        let mut st = MinerState::default();
+        let key = ("cpu".to_string(), "risc0".to_string());
+        st.settings_ui.row_index = 1; // the first pair, cpu / risc0
+        adjust_po2(&mut st, -1);
+        assert!(
+            st.runtime_settings.po2_overrides.is_empty(),
+            "not in Advanced mode"
+        );
+
+        st.runtime_settings.advanced_mode = true;
+        adjust_po2(&mut st, -1);
+        assert_eq!(st.runtime_settings.po2_overrides.get(&key), Some(&19));
+
+        st.runtime_settings.po2_overrides.clear();
+        st.risc0_job_po2s = vec![("cpu".to_string(), Some(18))];
+        adjust_po2(&mut st, 1);
+        assert_eq!(st.runtime_settings.po2_overrides.get(&key), Some(&19));
+
+        // Held to the job range.
+        st.runtime_settings
+            .po2_overrides
+            .insert(key.clone(), zkminer_prover_protocol::RISC0_JOB_PO2_MAX);
+        adjust_po2(&mut st, 1);
+        assert_eq!(
+            st.runtime_settings.po2_overrides.get(&key),
+            Some(&zkminer_prover_protocol::RISC0_JOB_PO2_MAX)
         );
     }
 }

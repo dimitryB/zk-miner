@@ -72,10 +72,10 @@ enum Commands {
         /// Output results as JSON instead of a formatted table
         #[arg(long)]
         json: bool,
-        /// Additionally measure proving throughput at each segment size (po2) and
-        /// save the results, so the miner can pick a segment size per job instead
-        /// of deferring to the SDK. Costs one extra proof per po2 step per GPU.
-        /// A sweep is discarded unless it actually exercises segmentation.
+        /// Additionally prove at each segment size (po2) on each card whose VRAM is known
+        /// (NVIDIA) and save the results: a card then proves risc0 jobs at the fastest
+        /// size that fit with a step of headroom, never below 20 if 20 proved. Costs one
+        /// extra proof per po2 step per GPU. Run it with the miner stopped.
         #[arg(long)]
         calibrate: bool,
     },
