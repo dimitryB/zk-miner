@@ -13,9 +13,17 @@ name = "zkminer-prove-risc0-rocm"
 path = "src/main.rs"
 required-features = ["rocm"]
 
+[[bin]]
+name = "zkminer-prove-risc0-intel"
+path = "src/main.rs"
+required-features = ["intel"]
+
 [features]
 cuda = ["risc0-zkvm/cuda", "risc0-groth16/cuda"]
 rocm = ["risc0-zkvm/rocm", "risc0-groth16/rocm"]
+# Intel Arc / Data Center GPUs through SYCL on Level Zero. Built with oneAPI's `icpx` (see the README's
+# Intel section); the kernels' shared libraries are found next to the binary (`$ORIGIN`, set in build.rs).
+intel = ["risc0-zkvm/intel", "risc0-groth16/intel"]
 
 [dependencies]
 zkminer-prover-protocol = { workspace = true }

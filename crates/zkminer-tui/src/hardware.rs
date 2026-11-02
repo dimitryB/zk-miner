@@ -1139,7 +1139,16 @@ fn is_intel_discrete_gpu(base: &str) -> bool {
 /// Detect Intel GPU VRAM size. The xe driver exposes this via tile0/physical_vram_size_bytes
 /// or the hwmon/i915 driver can expose it via other paths.
 fn detect_intel_vram(base: &str) -> u64 {
-    // xe driver: tile0/physical_vram_size_bytes
+    // xe driver: its own memory-regions query, the only answer on current kernels. BAR2 below is the
+    // aperture, not the memory (16 GiB on a 12 GB Arc B580).
+    if let Some((total, _)) = fs::canonicalize(base)
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .and_then(|bus| zkminer_prover::discovery::intel_vram(&bus))
+    {
+        return total;
+    }
+    // older xe: tile0/physical_vram_size_bytes
     if let Some(vram) = read_u64(&format!("{}/tile0/physical_vram_size_bytes", base)) {
         return vram;
     }

@@ -876,7 +876,7 @@ impl std::fmt::Display for WorkerProofError {
 impl std::error::Error for WorkerProofError {}
 
 /// True if a worker error message indicates a GPU out-of-memory / device
-/// allocation failure (CUDA or HIP/ROCm). Workers use this to tag such errors as
+/// allocation failure (CUDA, HIP/ROCm or Level Zero/SYCL). Workers use this to tag such errors as
 /// [`ErrorKind::ResourceExhausted`] so the dispatcher kills + respawns the worker
 /// with a clean GPU context instead of reusing a wedged one. Match is
 /// case-insensitive and covers the phrasings seen from the risc0/sp1 GPU stacks
@@ -892,6 +892,10 @@ pub fn is_gpu_oom(message: &str) -> bool {
         || m.contains("hip_error_out_of_memory")
         || m.contains("cudamalloc")
         || m.contains("hsa_status_error_out_of_resources")
+        // Level Zero and SYCL's Unified Runtime: ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY,
+        // UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ("Native API returns: 39"), and SYCL's own wording.
+        || m.contains("out_of_device_memory")
+        || m.contains("out of device memory")
 }
 
 /// A single benchmark measurement from a worker.
@@ -1192,6 +1196,12 @@ mod tests {
         assert!(is_gpu_oom("CUDA_ERROR_OUT_OF_MEMORY"));
         assert!(is_gpu_oom("hipErrorOutOfMemory"));
         assert!(is_gpu_oom("cudaMalloc failed"));
+        assert!(is_gpu_oom(
+            "Native API failed. Native API returns: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)"
+        ));
+        assert!(is_gpu_oom(
+            "zeMemAllocDevice: ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY"
+        ));
         // Non-OOM proof failures must NOT be misclassified as ResourceExhausted.
         assert!(!is_gpu_oom(
             "Proof verification FAILED — SP1 proof is invalid"

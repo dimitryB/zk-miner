@@ -378,11 +378,17 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::Warmup { request_id } => {
-                // Nothing to set up before a first proof.
-                let resp = WorkerResponse::WarmupDone {
-                    request_id,
-                    summary: "nothing to warm up".to_string(),
-                    groth16_helper: false,
+                let resp = match warm_up() {
+                    Ok(summary) => WorkerResponse::WarmupDone {
+                        request_id,
+                        summary,
+                        groth16_helper: false,
+                    },
+                    Err(e) => WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::Internal,
+                        message: format!("warm-up failed: {e:#}"),
+                    },
                 };
                 write_message(&mut stdout, &resp)?;
             }
@@ -451,6 +457,39 @@ fn detect_gpu() -> (bool, Option<String>) {
         // Fallback: check sysfs for any AMD GPU
         if std::path::Path::new("/dev/kfd").exists() {
             return (true, Some("AMD GPU".to_string()));
+        }
+    }
+    #[cfg(feature = "intel")]
+    {
+        // The host pins this worker to one card through ZE_AFFINITY_MASK, which sysfs does not see;
+        // name the card only when the box has exactly one Intel GPU, so the name is never another
+        // card's. The host names its slots from its own discovery either way.
+        let names: Vec<String> = std::fs::read_dir("/sys/class/drm")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with("card") && !n.contains('-')
+            })
+            .filter_map(|e| {
+                let dev = e.path().join("device");
+                let vendor = std::fs::read_to_string(dev.join("vendor")).ok()?;
+                (vendor.trim().eq_ignore_ascii_case("0x8086") && dev.join("tile0").is_dir()).then(
+                    || {
+                        std::fs::read_to_string(dev.join("label"))
+                            .ok()
+                            .map(|l| l.trim().to_string())
+                            .filter(|l| !l.is_empty())
+                            .unwrap_or_else(|| "Intel GPU".to_string())
+                    },
+                )
+            })
+            .collect();
+        match names.as_slice() {
+            [] => {}
+            [one] => return (true, Some(one.clone())),
+            _ => return (true, Some("Intel GPU".to_string())),
         }
     }
     (false, None)
@@ -1472,6 +1511,37 @@ fn benchmark_program(
 /// Cost: this is a real proof per po2 step, so a full sweep is minutes per GPU. That is
 /// why calibration is opt-in (`zkminer benchmark --calibrate`), never a default run.
 const CALIBRATION_ITERS: u32 = 6_000_000;
+
+/// The one-time setup before a first proof (`WorkerCommand::Warmup`). Nothing on CUDA or ROCm, whose
+/// kernels are compiled in. On Intel, SYCL compiles the kernels shipped as SPIR-V (the zkp and Groth16
+/// ones) for the device on first use, which took ~8 minutes on an Arc B580, longer than a benchmark's
+/// whole budget; the driver caches the result on disk (`~/.cache/libsycl_cache`,
+/// `~/.cache/neo_compiler_cache`), so one small proof through the full Groth16 pipeline compiles
+/// everything once for every later process. It is verified, so a broken card fails here, not on a job.
+#[cfg(feature = "intel")]
+fn warm_up() -> Result<String> {
+    let start = Instant::now();
+    let env = risc0_zkvm::ExecutorEnv::builder()
+        .write_slice(&1000u32.to_le_bytes())
+        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32)
+        .build()?;
+    let opts = risc0_zkvm::ProverOpts::groth16().with_dev_mode(false);
+    let proved = local_prover().prove_with_opts(env, FIBONACCI_ELF, &opts);
+    release_groth16_cache_if_tight();
+    proved?
+        .receipt
+        .verify(FIBONACCI_ID)
+        .context("the warm-up proof does not verify")?;
+    Ok(format!(
+        "compiled and cached the Intel GPU kernels with a verified Groth16 proof in {:.0} s",
+        start.elapsed().as_secs_f64()
+    ))
+}
+
+#[cfg(not(feature = "intel"))]
+fn warm_up() -> Result<String> {
+    Ok("nothing to warm up".to_string())
+}
 
 /// Run a po2 calibration: prove fibonacci at the specified segment po2 and measure throughput.
 fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {

@@ -607,6 +607,11 @@ fn gpu_vram_bytes(
         // an AMD card as they size a CUDA one.
         return amd_vram_bytes(pci_bus_id?);
     }
+    if gpu_tag == "intel" {
+        // The xe driver's own count of the card's device memory (sysfs has none): see
+        // `discovery::intel_vram`. Unknown on i915, which keeps the unsized behaviour.
+        return crate::discovery::intel_vram(pci_bus_id?).map(|(total, _)| total);
+    }
     if gpu_tag != "cuda" {
         return None;
     }
@@ -1742,13 +1747,25 @@ impl WorkerPool {
                 }
             }
             "intel" => {
-                // Use a SINGLE selection mechanism. ZE_AFFINITY_MASK filters at the
+                // Use a SINGLE device selection mechanism. ZE_AFFINITY_MASK filters at the
                 // Level Zero layer AND renumbers the surviving device(s) to start at 0,
                 // so ALSO setting ONEAPI_DEVICE_SELECTOR=level_zero:N (N>0) would select
                 // index N from the already-masked, renumbered list and find nothing.
                 // The affinity mask alone correctly pins to the intended device.
                 if let Some(i) = device_index {
                     env.insert("ZE_AFFINITY_MASK".into(), i.to_string());
+                    // The mask counts Level Zero's devices, in the driver's order unless told to
+                    // use PCI order, which is the order discovery numbers cards in.
+                    if std::env::var_os("ZE_ENABLE_PCI_ID_DEVICE_ORDER").is_none() {
+                        env.insert("ZE_ENABLE_PCI_ID_DEVICE_ORDER".into(), "1".into());
+                    }
+                    // The backend, not a device: `level_zero:*` keeps every device the mask left
+                    // and drops the same card's OpenCL device, which SYCL's GPU selector could
+                    // otherwise pick (risc0's Groth16 prover takes `gpu_selector_v`) when the
+                    // compute runtime's OpenCL ICD is installed beside Level Zero.
+                    if std::env::var_os("ONEAPI_DEVICE_SELECTOR").is_none() {
+                        env.insert("ONEAPI_DEVICE_SELECTOR".into(), "level_zero:*".into());
+                    }
                 }
             }
             _ => {}
@@ -2630,24 +2647,43 @@ impl WorkerPool {
         Ok(summary)
     }
 
-    /// Warms `key`'s backend up first if it has not been, for a path that would otherwise do the
-    /// setup itself inside its own watchdog (a benchmark proves Groth16 too).
+    /// Warms `key` up first if it needs it, for a path that would otherwise do the setup inside its
+    /// own watchdog: SP1's backend (a benchmark proves Groth16 too), and each Intel card, whose SYCL
+    /// kernels are compiled for the device on first use (about 8 minutes on an Arc B580, longer than
+    /// a benchmark's whole budget) and cached on disk for every later process.
     fn ensure_warmed(&self, key: &str) -> Result<()> {
         let backend = key.split(':').next().unwrap_or(key);
-        if self.backend_warmed(backend) {
+        let intel = key.split(':').nth(1) == Some("intel");
+        let backend_ready = self.backend_warmed(backend);
+        let slot_ready = !intel
+            || self
+                .warmed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(key);
+        if backend_ready && slot_ready {
             return Ok(());
         }
         let summary = self.warm_up_slot(key, WARMUP_TIMEOUT)?;
-        self.warmed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(backend.to_string());
+        {
+            let mut warmed = self.warmed.lock().unwrap_or_else(|e| e.into_inner());
+            warmed.insert(backend.to_string());
+            if intel {
+                warmed.insert(key.to_string());
+            }
+        }
         tracing::info!("{key} warmed up: {summary}");
         Ok(())
     }
 
     fn warm_up_slot(&self, key: &str, timeout: Duration) -> Result<String> {
         let backend = key.split(':').next().unwrap_or(key);
+        // An Intel card's warm-up is a proof (see `ensure_warmed`), so it takes the card's guard like
+        // any other work on it.
+        let gpu_lock = (key.split(':').nth(1) == Some("intel"))
+            .then(|| self.gpu_lock_for(key))
+            .flatten();
+        let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, None, Some(timeout))?;
         let entry = self
             .workers
             .get(key)
@@ -3009,10 +3045,10 @@ impl WorkerPool {
                 }
             }
 
-            // After benchmarking a GPU-specific worker (cuda/rocm), shut it down
+            // After benchmarking a GPU-specific worker (cuda/rocm/intel), shut it down
             // to free VRAM. GPU prover processes hold buffer pools that prevent
             // other backends from using the same GPU.
-            if !card_was_busy && (gpu_tag == "cuda" || gpu_tag == "rocm") {
+            if !card_was_busy && matches!(gpu_tag.as_str(), "cuda" | "rocm" | "intel") {
                 if let Some(entry) = self.workers.get(&key) {
                     // Under the card's guard. Without it — `benchmark_slot*` has already released it —
                     // a proof waiting for this card could take it in between and start beside the
@@ -3412,7 +3448,7 @@ impl WorkerPool {
                 }
             }
 
-            if !card_was_busy && (gpu_tag == "cuda" || gpu_tag == "rocm") {
+            if !card_was_busy && matches!(gpu_tag.as_str(), "cuda" | "rocm" | "intel") {
                 if let Some(entry) = self.workers.get(&key) {
                     // Under the card's guard. Without it — `benchmark_slot*` has already released it —
                     // a proof waiting for this card could take it in between and start beside the
@@ -6279,6 +6315,12 @@ impl WorkerPool {
             None => po2,
         };
 
+        // A card whose kernels are compiled on first use (Intel) is warmed up before its first proof,
+        // outside this proof's watchdog; a no-op for every other slot and for a warmed one.
+        if key.split(':').nth(1) == Some("intel") {
+            self.ensure_warmed(key)?;
+        }
+
         // Per-physical-GPU guard (see `gpu_locks`): serialize proofs across different
         // backends pinned to the SAME physical GPU (e.g. risc0:cuda:0 vs sp1:cuda:0)
         // so they don't double-book VRAM. Acquired BEFORE the slot Mutex; each call
@@ -7789,11 +7831,17 @@ mod tests {
 
     #[test]
     fn gpu_env_intel() {
-        // Single selection mechanism only: ZE_AFFINITY_MASK. Also setting
-        // ONEAPI_DEVICE_SELECTOR would double-filter and select nothing for index>0.
+        // Single device selection mechanism only: ZE_AFFINITY_MASK. ONEAPI_DEVICE_SELECTOR names
+        // the backend alone (`level_zero:*`): a device index there would double-filter and select
+        // nothing for index>0.
         let env = WorkerPool::gpu_env("risc0", "intel", None, Some(1));
         assert_eq!(env.get("ZE_AFFINITY_MASK").unwrap(), "1");
-        assert!(env.get("ONEAPI_DEVICE_SELECTOR").is_none());
+        if std::env::var_os("ONEAPI_DEVICE_SELECTOR").is_none() {
+            assert_eq!(env.get("ONEAPI_DEVICE_SELECTOR").unwrap(), "level_zero:*");
+        }
+        if std::env::var_os("ZE_ENABLE_PCI_ID_DEVICE_ORDER").is_none() {
+            assert_eq!(env.get("ZE_ENABLE_PCI_ID_DEVICE_ORDER").unwrap(), "1");
+        }
     }
 
     /// SP1 waits for its one-time setup before its first proof; nothing else has one.

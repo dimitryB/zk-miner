@@ -376,6 +376,96 @@ fn detect_intel_gpus() -> Vec<DetectedGpu> {
     gpus
 }
 
+/// An Intel discrete card's device memory as the xe driver reports it: `(total, used)` in bytes over
+/// its VRAM regions.
+///
+/// sysfs has no answer on current xe kernels (`tile0/physical_vram_size_bytes` is gone, and BAR2 is the
+/// aperture, not the memory: 16 GiB on a 12 GB Arc B580), so this asks the driver directly, through
+/// `DRM_IOCTL_XE_DEVICE_QUERY` / `DRM_XE_DEVICE_QUERY_MEM_REGIONS` on the card's render node, which any
+/// user that may compute on the card can open. `None` for a card the xe driver does not drive (i915
+/// has another query), a card with no render node, or a query that fails.
+#[cfg(target_os = "linux")]
+pub fn intel_vram(pci_bus_id: &str) -> Option<(u64, u64)> {
+    use std::os::fd::AsRawFd;
+
+    /// `struct drm_xe_device_query` (uapi/drm/xe_drm.h).
+    #[repr(C)]
+    struct DeviceQuery {
+        extensions: u64,
+        query: u32,
+        size: u32,
+        data: u64,
+        reserved: [u64; 2],
+    }
+    // _IOWR('d', DRM_COMMAND_BASE + DRM_XE_DEVICE_QUERY, struct drm_xe_device_query)
+    const DRM_IOCTL_XE_DEVICE_QUERY: u64 = (3 << 30) | (40 << 16) | ((b'd' as u64) << 8) | 0x40;
+    const DRM_XE_DEVICE_QUERY_MEM_REGIONS: u32 = 1;
+    const _: () = assert!(std::mem::size_of::<DeviceQuery>() == 40);
+
+    let dev = Path::new("/sys/bus/pci/devices").join(pci_bus_id.to_ascii_lowercase());
+    let driver = std::fs::read_link(dev.join("driver")).ok()?;
+    if driver.file_name()? != "xe" {
+        return None;
+    }
+    let render = std::fs::read_dir(dev.join("drm"))
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("renderD"))?;
+    let node = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(Path::new("/dev/dri").join(render))
+        .ok()?;
+    let mut q = DeviceQuery {
+        extensions: 0,
+        query: DRM_XE_DEVICE_QUERY_MEM_REGIONS,
+        size: 0,
+        data: 0,
+        reserved: [0; 2],
+    };
+    // SAFETY: `q` is a live, correctly laid out `drm_xe_device_query`; with `size == 0` the driver
+    // only writes the size it needs into it.
+    if unsafe { libc::ioctl(node.as_raw_fd(), DRM_IOCTL_XE_DEVICE_QUERY as _, &mut q) } != 0 {
+        return None;
+    }
+    if q.size == 0 || q.size > 1 << 16 {
+        return None;
+    }
+    let mut buf = vec![0u64; (q.size as usize).div_ceil(8)];
+    q.data = buf.as_mut_ptr() as u64;
+    // SAFETY: `data` points at `buf`, which holds at least the `size` bytes the driver asked for.
+    if unsafe { libc::ioctl(node.as_raw_fd(), DRM_IOCTL_XE_DEVICE_QUERY as _, &mut q) } != 0 {
+        return None;
+    }
+    // SAFETY: `buf` is `size.div_ceil(8) * 8 >= size` initialized bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), q.size as usize) };
+    parse_xe_mem_regions(bytes)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn intel_vram(_pci_bus_id: &str) -> Option<(u64, u64)> {
+    None
+}
+
+/// `(total, used)` over the VRAM regions of a `struct drm_xe_query_mem_regions`: a `u32` count and a
+/// `u32` pad, then that many 88-byte `struct drm_xe_mem_region` (`u16 mem_class`, `u16 instance`,
+/// `u32 min_page_size`, `u64 total_size`, `u64 used`, ...). `None` when it is cut short or has no VRAM.
+fn parse_xe_mem_regions(b: &[u8]) -> Option<(u64, u64)> {
+    const REGION: usize = 88;
+    const DRM_XE_MEM_REGION_CLASS_VRAM: u16 = 1;
+    let n = u32::from_ne_bytes(b.get(0..4)?.try_into().ok()?) as usize;
+    let (mut total, mut used) = (0u64, 0u64);
+    for i in 0..n {
+        let r = b.get(8 + i * REGION..8 + (i + 1) * REGION)?;
+        if u16::from_ne_bytes(r[0..2].try_into().ok()?) == DRM_XE_MEM_REGION_CLASS_VRAM {
+            total += u64::from_ne_bytes(r[8..16].try_into().ok()?);
+            used += u64::from_ne_bytes(r[16..24].try_into().ok()?);
+        }
+    }
+    (total > 0).then_some((total, used))
+}
+
 /// Read Intel GPU name from sysfs, with fallbacks.
 fn read_intel_gpu_name(device_dir: &Path) -> String {
     // Try product_name (available on some cards via xe driver)
@@ -1172,6 +1262,36 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The layout an Arc B580 returned on xe (kernel 7.0): system memory, then one VRAM region.
+    #[test]
+    fn xe_mem_regions_sum_only_vram() {
+        fn region(class: u16, instance: u16, total: u64, used: u64) -> Vec<u8> {
+            let mut r = Vec::new();
+            r.extend(class.to_ne_bytes());
+            r.extend(instance.to_ne_bytes());
+            r.extend(4096u32.to_ne_bytes());
+            r.extend(total.to_ne_bytes());
+            r.extend(used.to_ne_bytes());
+            r.extend([0u8; 88 - 24]);
+            r
+        }
+        let mut b = Vec::new();
+        b.extend(2u32.to_ne_bytes());
+        b.extend(0u32.to_ne_bytes());
+        b.extend(region(0, 0, 98_776_000_000, 0));
+        b.extend(region(1, 1, 12_809_404_416, 20 << 20));
+        assert_eq!(b.len(), 184);
+        assert_eq!(parse_xe_mem_regions(&b), Some((12_809_404_416, 20 << 20)));
+        // Cut short: no answer rather than a partial sum.
+        assert_eq!(parse_xe_mem_regions(&b[..100]), None);
+        // System memory only (an integrated GPU): no VRAM, no answer.
+        let mut igpu = Vec::new();
+        igpu.extend(1u32.to_ne_bytes());
+        igpu.extend(0u32.to_ne_bytes());
+        igpu.extend(region(0, 0, 1 << 34, 0));
+        assert_eq!(parse_xe_mem_regions(&igpu), None);
+    }
 
     #[test]
     fn worker_binary_names() {

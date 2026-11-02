@@ -8,7 +8,7 @@ worth taking, claims the ones that are, generates the proof on a local GPU, and 
 it on-chain. Proving runs in separate worker processes — one per GPU — so a wedged or
 OOM-killed prover can't take the miner down with it.
 
-Backends: **RISC Zero** (CUDA and ROCm), **SP1**, **OpenVM**.
+Backends: **RISC Zero** (CUDA, ROCm and Intel), **SP1**, **OpenVM**.
 
 ## Requirements
 
@@ -18,6 +18,7 @@ Backends: **RISC Zero** (CUDA and ROCm), **SP1**, **OpenVM**.
 | RISC Zero toolchain | `rzup`, see below — **required to build, and to prove** |
 | CUDA | toolkit with `nvcc` (12.8–13.x tested) for NVIDIA workers |
 | ROCm | 6.4+ with `hipcc` for AMD workers |
+| oneAPI | DPC++/C++ compiler `icpx` (2026.0 tested) and `ocloc` (the `intel-ocloc` package, the same version as the installed compute runtime) for Intel workers; at run time the Level Zero loader, the compute runtime and `intel-ocloc` |
 | Build deps | `build-essential cmake pkg-config protobuf-compiler libclang-dev` (+ `libhipcub-dev librocthrust-dev` for ROCm) |
 | Foundry | `cast` — only for the example job submitters under `examples/` |
 
@@ -56,7 +57,22 @@ env NVCC=/usr/local/cuda/bin/nvcc HIPCC=off \
 env HIPCC=/opt/rocm/bin/hipcc NVCC=off RISC0_HIP_ARCH="gfx1100" \
     cargo build --release -p zkminer-prove-risc0 --features rocm \
                 --bin zkminer-prove-risc0-rocm --target-dir target/release-rocm
+
+# Intel (Arc / Data Center GPUs, through SYCL on Level Zero). Source oneAPI first; name your
+# cards' ahead-of-time targets (intel_gpu_bmg_g21 = Arc B580/B570, intel_gpu_bmg_g31 = Arc Pro
+# B60/B70; the default adds spir64 and a second, slower build for others).
+source /opt/intel/oneapi/setvars.sh
+env NVCC=off HIPCC=off RISC0_INTEL_SYCL_TARGETS=intel_gpu_bmg_g21 \
+    cargo build --release -j 4 -p zkminer-prove-risc0 --features intel \
+                --bin zkminer-prove-risc0-intel --target-dir target/release-intel
+scripts/stage-intel-worker-libs.sh target/release-intel/release/zkminer-prove-risc0-intel
 ```
+
+The Intel build takes 1–2 hours the first time (the kernels are compiled ahead of time with
+`ocloc`) and needs about 11 GB of RAM at `-j 4`. `scripts/stage-intel-worker-libs.sh` copies the
+libraries the worker needs and the system lacks (the risc0 kernel libraries the build leaves in
+its target dir, and oneAPI's SYCL runtime) into `zkminer-intel/lib/` beside the binary, which the
+binary looks in first; it then runs without `LD_LIBRARY_PATH`.
 
 Each `-gencode` adds a GPU family the worker can run on, so name your card's. The miner
 reads which families a worker binary carries (for SP1, its `sp1-gpu-server`) and will not
@@ -78,6 +94,8 @@ no error.**
 ~/.zkminer/provers/
 ├── zkminer-prove-risc0-cuda
 ├── zkminer-prove-risc0-rocm
+├── zkminer-prove-risc0-intel
+├── zkminer-intel/lib/          (the Intel worker's libraries, see Build)
 ├── zkminer-prove-sp1
 ├── sp1-gpu-server
 ├── libcudart.so.12
@@ -102,6 +120,12 @@ no error.**
   the miner starts, before it claims any SP1 job; until then SP1 jobs are skipped. A download cut
   short is detected and redone. Final Groth16 proofs on one host take turns through lock files in
   `~/.zkminer/locks/` (hemilabs/sp1 v6.8.1 and later).
+
+**Intel**: copy `zkminer-intel/` together with `zkminer-prove-risc0-intel`. Some of its kernels are
+compiled for the card on first use, which took about 8 minutes on an Arc B580; the driver caches them
+under `~/.cache/` (`libsycl_cache`, `neo_compiler_cache`) for every later process. The miner warms
+each Intel card up with one small verified proof before its first benchmark or proof, outside their
+time limits. Discovery reads an Intel card's memory from the xe driver.
 
 If a worker needs environment the miner's own process won't have (a systemd unit or cron
 job does *not* source `~/.bashrc`), install a small wrapper script under the expected
