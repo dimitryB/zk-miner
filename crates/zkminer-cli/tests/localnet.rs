@@ -63,6 +63,8 @@
 //!   (for a host whose capacity or memory gates refuse every claim).
 //! - `ZKMINER_LOCALNET_MINE=1`, `ZKMINER_LOCALNET_MINE_TIMEOUT_SECS` (default 1800): the mining
 //!   test. It honours `CUDA_VISIBLE_DEVICES` (see `mines_the_claimable_jobs`).
+//! - `ZKMINER_LOCALNET_PROVER_STAKE` (HEMI, default 1000): the prover's stake. Every job here locks at
+//!   least 100 HEMI, so the default holds ten jobs at once.
 //! - `ZKMINER_LOCALNET_FIB_N` (default 10): the fibonacci jobs' input. A larger one makes each proof
 //!   last long enough for several cards to prove at once.
 #![cfg(unix)]
@@ -125,6 +127,17 @@ const FIXTURE_SEAL_HEX: &str = concat!(
 /// Every job but [`Case::HighCollateral`]'s is fixed-price at this.
 const JOB_PRICE: u128 = 5 * HEMI;
 const PROVER_STAKE: u128 = 1_000 * HEMI;
+
+/// The stake the prover is given: `PROVER_STAKE`, or `ZKMINER_LOCALNET_PROVER_STAKE` HEMI. A job on
+/// 743111 locks at least its 100 HEMI floor whatever its price, so `PROVER_STAKE` covers ten at once:
+/// a run measuring how far ahead the miner claims needs more. The high-collateral case is sized
+/// against `PROVER_STAKE` and is not one of the cases such a run submits.
+fn prover_stake() -> u128 {
+    std::env::var("ZKMINER_LOCALNET_PROVER_STAKE")
+        .ok()
+        .and_then(|s| s.trim().parse::<u128>().ok())
+        .map_or(PROVER_STAKE, |hemi| hemi * HEMI)
+}
 /// [`Case::HighCollateral`]'s price, and its collateral rate: `MAX_COLLATERAL_BPS` (500%), the most a
 /// submitter may ask (zkmarket c8333aa, `src/libraries/Constants.sol`).
 const HIGH_COLLATERAL_PRICE: u128 = 250 * HEMI;
@@ -819,20 +832,20 @@ impl World {
         );
         mined!(
             token
-                .mint(prover.address(), U256::from(PROVER_STAKE))
+                .mint(prover.address(), U256::from(prover_stake()))
                 .from(token_owner),
             "mint tHEMI to the prover"
         );
 
         mined!(
             erc20
-                .approve(DEPLOYMENT.staking, U256::from(PROVER_STAKE))
+                .approve(DEPLOYMENT.staking, U256::from(prover_stake()))
                 .from(prover.address()),
             "approve the stake"
         );
         mined!(
             IHemiProveStaking::new(DEPLOYMENT.staking, &provider)
-                .stake(prover.address(), PROVER_STAKE)
+                .stake(prover.address(), prover_stake())
                 .from(prover.address()),
             "stake"
         );
@@ -2924,11 +2937,11 @@ async fn check_settlement(
             hemi(stake.lockedCollateral)
         ));
     }
-    if stake.totalStaked != PROVER_STAKE {
+    if stake.totalStaked != prover_stake() {
         failures.push(format!(
             "the stake is {} HEMI, not the {} HEMI staked",
             hemi(stake.totalStaked),
-            hemi(PROVER_STAKE)
+            hemi(prover_stake())
         ));
     }
     // Nothing else is sent in a clean run: no release, no resend at a new nonce, no nonce-gap fill.
