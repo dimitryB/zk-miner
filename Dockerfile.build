@@ -581,7 +581,8 @@ RUN build-intel-gpu-runtime.sh /opt/zkminer-intel-gpu && rm -rf /tmp/intel-gpu-s
 # ===========================================================================
 # Stage: intel-toolchain — Ubuntu 22.04 + Rust + oneAPI DPC++ + the Intel GPU stack + RISC Zero
 # ===========================================================================
-# oneAPI from Intel's apt repository (key checked against its hash), the compiler alone. The kernels
+# oneAPI from Intel's apt repository (key checked against its hash), the compiler alone, and Python,
+# which the risc0 Intel kernels' build scripts run (standard library only). The kernels
 # are compiled ahead of time with the ocloc built above, the same version the release ships, which
 # icpx finds on PATH; the Level Zero headers and loader come from there too.
 FROM rust-base AS intel-toolchain
@@ -596,7 +597,7 @@ RUN install -d /etc/apt/keyrings \
     && echo "deb [signed-by=/etc/apt/keyrings/intel-oneapi.asc] https://apt.repos.intel.com/oneapi all main" \
         > /etc/apt/sources.list.d/oneapi.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends libclang-dev file \
+    && apt-get install -y --no-install-recommends libclang-dev file python3 \
         intel-oneapi-compiler-dpcpp-cpp-${ONEAPI_VERSION}=${ONEAPI_PKG_VERSION} \
     && rm -rf /var/lib/apt/lists/*
 
