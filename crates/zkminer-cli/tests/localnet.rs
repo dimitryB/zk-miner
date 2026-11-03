@@ -127,6 +127,8 @@ const FIXTURE_SEAL_HEX: &str = concat!(
 /// Every job but [`Case::HighCollateral`]'s is fixed-price at this.
 const JOB_PRICE: u128 = 5 * HEMI;
 const PROVER_STAKE: u128 = 1_000 * HEMI;
+/// How many times `World::submit_job` tries one job before failing the run.
+const SUBMIT_TRIES: u32 = 6;
 
 /// The stake the prover is given: `PROVER_STAKE`, or `ZKMINER_LOCALNET_PROVER_STAKE` HEMI. A job on
 /// 743111 locks at least its 100 HEMI floor whatever its price, so `PROVER_STAKE` covers ten at once:
@@ -535,6 +537,9 @@ fn start_anvil(dir: &Path) -> Anvil {
     let mut cmd = Command::new(std::env::var("ANVIL").unwrap_or_else(|_| "anvil".into()));
     cmd.args(["--fork-url", &fork_url])
         .args(["--chain-id", &DEPLOYMENT.chain_id.to_string()])
+        // Known, so anvil need not ask the upstream RPC for it before it can start (it failed to,
+        // on a flaky RPC, and exited).
+        .args(["--fork-chain-id", &DEPLOYMENT.chain_id.to_string()])
         .args(["--host", "127.0.0.1", "--port", &port.to_string()])
         .args(["--block-time", "1"])
         // Every setup transaction is sent from an address anvil signs for.
@@ -652,10 +657,24 @@ macro_rules! mined {
     ($call:expr, $what:expr) => {{
         let what = $what;
         let receipt = tokio::time::timeout(SETUP_TX_TIMEOUT, async {
-            $call
-                .send()
-                .await
-                .unwrap_or_else(|e| panic!("{what}: {e}"))
+            // A refused SEND is retried: anvil simulates before it accepts a transaction, and that
+            // simulation reads storage it has not cached from the fork's upstream RPC, which can
+            // fail (429, a Cloudflare 520). Nothing was sent then. A missing receipt is not retried.
+            let mut tries = 0;
+            let pending = loop {
+                match $call.send().await {
+                    Ok(pending) => break pending,
+                    Err(e) => {
+                        tries += 1;
+                        if tries >= SUBMIT_TRIES {
+                            panic!("{what} ({tries} tries): {e}");
+                        }
+                        eprintln!("localnet: {what} was refused, trying again in 10 s: {e}");
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                }
+            };
+            pending
                 .get_receipt()
                 .await
                 .unwrap_or_else(|e| panic!("{what}: no receipt: {e}"))
@@ -1072,9 +1091,17 @@ impl World {
     }
 
     /// Submit a job of `case` for the world's `program`-th program, the `copy`-th of its kind.
+    /// A failure is retried a few times first: the fork reads storage it has not cached from the
+    /// upstream RPC, which can refuse (429) or drop a request mid-setup.
     async fn submit_job(&mut self, case: Case, program: usize, copy: usize) {
-        if let Err(e) = self.try_submit_job(case, program, copy).await {
-            panic!("submit the {case:?} job: {e}");
+        let mut tries = 0;
+        while let Err(e) = self.try_submit_job(case, program, copy).await {
+            tries += 1;
+            if tries >= SUBMIT_TRIES {
+                panic!("submit the {case:?} job ({tries} tries): {e}");
+            }
+            eprintln!("localnet: submitting the {case:?} job failed, trying again in 20 s: {e}");
+            tokio::time::sleep(Duration::from_secs(20)).await;
         }
     }
 
