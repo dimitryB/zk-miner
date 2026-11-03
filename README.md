@@ -138,10 +138,10 @@ publishes (`.github/workflows/release.yml`).
   short is detected and redone. Final Groth16 proofs on one host take turns through lock files in
   `~/.zkminer/locks/` (hemilabs/sp1 v6.8.1 and later).
 
-**Intel**: copy `zkminer-intel/` together with `zkminer-prove-risc0-intel`. A release's kernels are
-compiled in advance for the Arc B580/B570, the B-series Pro cards and the A770/A750/A580; on any other
-Intel card, and in a build without them, some are compiled on first use, which took about 8 minutes
-on an Arc B580. The driver caches them
+**Intel**: copy `zkminer-intel/` together with `zkminer-prove-risc0-intel`. A release built on a large
+CI runner has the kernels compiled in advance for the Arc B580/B570, the B-series Pro cards and the
+A770/A750/A580; otherwise, and on any other Intel card, they are compiled for the card on first use,
+which took about 8 minutes on an Arc B580. The driver caches them
 under `~/.cache/` (`libsycl_cache`, `neo_compiler_cache`) for every later process. The miner warms
 each Intel card up with one small verified proof before its first benchmark or proof, outside their
 time limits. Discovery reads an Intel card's memory from the xe driver.

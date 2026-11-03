@@ -211,8 +211,15 @@ jobs:
           # 2.4 hours (risc0-circuit-rv32im-sys, 2026-11-03). Cargo's jobs cannot go below four
           # instead (risc0's build scripts deadlock on its jobserver at 1 to 3).
           NVCC_THREADS: ${{ (matrix.large && vars.ZKMINER_LARGE_RUNNER) && '4' || '1' }}
+          # The Intel risc0 kernels compiled ahead of time: every target Dockerfile.build lists on a
+          # large runner; none on a standard one, where those four (three cards and SPIR-V) ran past
+          # the six hours (run 41633120773). There the kernels ship as SPIR-V alone, which the
+          # shipped compiler (the same IGC that compiles them ahead of time) builds for the card in
+          # the worker's warm-up, once, before the miner claims a risc0 job, and caches on disk.
+          INTEL_TARGETS: ${{ (matrix.large && vars.ZKMINER_LARGE_RUNNER) && 'all' || 'spir64' }}
         run: |
           set -euo pipefail
+          [ "$INTEL_TARGETS" = all ] && INTEL_TARGETS=
           from=(--cache-from "type=registry,ref=$CACHE:$TARGET")
           for also in $ALSO; do from+=(--cache-from "type=registry,ref=$CACHE:$also"); done
           for stage in $CHECKPOINTS; do
@@ -224,6 +231,7 @@ jobs:
             shift
             docker buildx build -f Dockerfile.build --target "$stage" \
               --build-arg NVCC_THREADS="$NVCC_THREADS" \
+              ${INTEL_TARGETS:+--build-arg RISC0_INTEL_SYCL_TARGETS="$INTEL_TARGETS"} \
               --secret id=github_token,env=GITHUB_TOKEN \
               "${from[@]}" "$@" .
           }
