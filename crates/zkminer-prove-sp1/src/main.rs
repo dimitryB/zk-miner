@@ -265,17 +265,14 @@ fn main() {
     if warmup::drives_cuda() {
         ensure_cuda12_on_library_path();
     } else {
-        // The HIP or SYCL build's own libraries, installed beside it (see `bundled_server`): put
-        // them on the library path the server inherits from this process.
-        if let Ok(server) = warmup::server_path() {
-            let lib = server.with_file_name(format!("{}-lib", warmup::server_name()));
-            if lib.is_dir() {
-                let path = match std::env::var("LD_LIBRARY_PATH") {
-                    Ok(p) if !p.is_empty() => format!("{}:{p}", lib.display()),
-                    _ => lib.display().to_string(),
-                };
-                std::env::set_var("LD_LIBRARY_PATH", path);
-            }
+        // The HIP or SYCL build's own libraries (`bundled_server::server_lib_dir`): put them first
+        // on the library path the server inherits from this process.
+        if let Some(lib) = bundled_server::server_lib_dir() {
+            let path = match std::env::var("LD_LIBRARY_PATH") {
+                Ok(p) if !p.is_empty() => format!("{}:{p}", lib.display()),
+                _ => lib.display().to_string(),
+            };
+            std::env::set_var("LD_LIBRARY_PATH", path);
         }
     }
 

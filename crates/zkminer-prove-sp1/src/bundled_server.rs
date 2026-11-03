@@ -14,7 +14,7 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -44,23 +44,8 @@ pub(crate) fn install_bundled_server() {
             return;
         }
     };
-    // A build with libraries of its own (SYCL: `libsp1_gpu_sycl.so` and the oneAPI runtime) ships
-    // them in `<name>-lib/` beside it; they go to the same place beside the installed server, which
-    // `main` puts on the library path the server inherits.
-    let lib_dir = bundled.with_file_name(format!("{name}-lib"));
-    if lib_dir.is_dir() {
-        let to_dir = target.with_file_name(format!("{name}-lib"));
-        for entry in fs::read_dir(&lib_dir).into_iter().flatten().flatten() {
-            let to = to_dir.join(entry.file_name());
-            if let Err(e) = install(&entry.path(), &to) {
-                tracing::warn!(
-                    "could not install {} as {} ({e:#})",
-                    entry.path().display(),
-                    to.display()
-                );
-            }
-        }
-    }
+    // A build with libraries of its own ships them in `<name>-lib/` beside it, which is used where it
+    // is (`server_lib_dir`), not copied: it is the whole ROCm or Intel runtime, in subdirectories.
     match install(&bundled, &target) {
         Ok(true) => tracing::info!("installed {} as {}", bundled.display(), target.display()),
         Ok(false) => tracing::debug!("{} is already installed", bundled.display()),
@@ -71,6 +56,42 @@ pub(crate) fn install_bundled_server() {
             target.display()
         ),
     }
+}
+
+/// The directory of libraries the server for this worker's card needs and a host does not have, if
+/// there is one: the HIP build's ROCm runtime, or the SYCL build's `libsp1_gpu_sycl.so`, oneAPI
+/// runtime and Intel driver stack. `main` puts it first on the library path the server inherits.
+///
+/// The release ships it beside this worker as `<name>-lib/`, a link to `zkminer-rocm/lib` or
+/// `zkminer-intel/lib`, which the risc0 workers load from too; it is used in place. Without one, or
+/// with installing turned off (a server managed by hand), it is `<name>-lib/` beside the installed
+/// server.
+pub(crate) fn server_lib_dir() -> Option<PathBuf> {
+    let installing = !std::env::var(INSTALL_ENV).is_ok_and(|value| value.trim() == "0");
+    let exe = std::env::current_exe().ok();
+    lib_dir_for(
+        &crate::warmup::server_name(),
+        exe.as_deref().and_then(Path::parent),
+        crate::warmup::server_path().ok().as_deref(),
+        installing,
+    )
+}
+
+/// [`server_lib_dir`] for a server called `name`, a worker in `worker_dir` and the server installed
+/// at `server`.
+fn lib_dir_for(
+    name: &str,
+    worker_dir: Option<&Path>,
+    server: Option<&Path>,
+    installing: bool,
+) -> Option<PathBuf> {
+    let lib = format!("{name}-lib");
+    let shipped = worker_dir.filter(|_| installing).map(|dir| dir.join(&lib));
+    let installed = server.map(|server| server.with_file_name(&lib));
+    shipped
+        .into_iter()
+        .chain(installed)
+        .find(|dir| dir.is_dir())
 }
 
 /// Copies `from` to `to`, executable, unless `to` already has the same contents. Whether it
@@ -134,6 +155,34 @@ mod tests {
     use super::*;
     use crate::warmup::TestDir;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_shipped_lib_dir_is_used_in_place_unless_installing_is_off() {
+        let root = TestDir::new();
+        let worker = root.path().join("provers");
+        let sp1_bin = root.path().join(".sp1/bin");
+        let server = sp1_bin.join("sp1-gpu-server-hip");
+        std::fs::create_dir_all(&worker).unwrap();
+        std::fs::create_dir_all(&sp1_bin).unwrap();
+        let find = |installing| {
+            lib_dir_for(
+                "sp1-gpu-server-hip",
+                Some(&worker),
+                Some(&server),
+                installing,
+            )
+        };
+
+        assert_eq!(find(true), None, "no directory anywhere");
+        std::fs::create_dir(sp1_bin.join("sp1-gpu-server-hip-lib")).unwrap();
+        assert_eq!(find(true), Some(sp1_bin.join("sp1-gpu-server-hip-lib")));
+        // The release's: a link to the runtime the risc0 worker uses.
+        std::fs::create_dir(worker.join("zkminer-rocm")).unwrap();
+        std::os::unix::fs::symlink("zkminer-rocm", worker.join("sp1-gpu-server-hip-lib")).unwrap();
+        assert_eq!(find(true), Some(worker.join("sp1-gpu-server-hip-lib")));
+        // A server managed by hand keeps its own libraries.
+        assert_eq!(find(false), Some(sp1_bin.join("sp1-gpu-server-hip-lib")));
+    }
 
     #[test]
     fn installs_when_missing_or_different_and_not_otherwise() {
