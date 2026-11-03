@@ -420,7 +420,7 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
         GpuVendor::Unknown => (" GPU ", theme::overlay()),
     };
 
-    // Per-GPU zkOP/s: scale from best GPU throughput relative to best CPU throughput
+    // Per-GPU zkOP/s: the suite's score, scaled by this card's best throughput over the suite's mean
     let zkops_str = if let Some(suite) = &state.benchmark_results {
         // Join on physical identity, NOT on `gpu.index`. `gpu.index` is a display
         // ordinal over all DRM cards; benchmark rows are keyed in the prover's
@@ -439,14 +439,10 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
                     .fold(0.0_f64, f64::max)
             })
             .unwrap_or(0.0);
-        let best_cpu_tp = suite
-            .device_benchmarks
-            .iter()
-            .filter(|d| d.device_id == "cpu")
-            .map(|d| d.throughput)
-            .fold(0.0_f64, f64::max);
-        if best_gpu_tp > 0.0 && best_cpu_tp > 0.0 && suite.zkops > 0.0 {
-            let gpu_zkops = best_gpu_tp / best_cpu_tp * suite.zkops;
+        // The mean the CPU rows used to carry (they were that mean times a per-backend factor).
+        let mean_tp = suite.average_throughput();
+        if best_gpu_tp > 0.0 && mean_tp > 0.0 && suite.zkops > 0.0 {
+            let gpu_zkops = best_gpu_tp / mean_tp * suite.zkops;
             format_compact(gpu_zkops)
         } else {
             "--".to_string()
