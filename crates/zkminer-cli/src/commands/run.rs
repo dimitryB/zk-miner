@@ -4248,6 +4248,101 @@ fn with_observed(
     rows
 }
 
+/// How many of the jobs held (`in_flight`) still need a card: those whose proving is not over
+/// (`proved`). Counted, not subtracted, so an entry `proved` keeps for a job no longer held cannot
+/// make it read low or wrap.
+fn needing_card(
+    in_flight: &HashMap<B256, u128>,
+    proved: &std::collections::HashSet<B256>,
+) -> usize {
+    in_flight.keys().filter(|j| !proved.contains(*j)).count()
+}
+
+/// One candidate's position at the admission step, for `AdmissionTally::note`.
+struct Candidate<'a> {
+    /// The evaluator would claim it (profit, risk and deadline).
+    recommended: bool,
+    /// Its cycles are measured, which every claim requires.
+    measurable: bool,
+    planner_active: bool,
+    /// Every job still needing a card is in the planner's model; the planner is used only then.
+    model_complete: bool,
+    /// The planner admitted it.
+    planned: bool,
+    /// Why the planner did not, when it was asked.
+    rejection: Option<&'a zkminer_strategy::queue::Rejection>,
+    /// Without the planner, there is a card for it now.
+    bypass_room: bool,
+}
+
+/// How a brain pass's candidates fared at admission: claimed by the planner or without it, or why
+/// not. Each candidate that reaches the step is counted once, under its first reason.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct AdmissionTally {
+    reached: usize,
+    planned: usize,
+    bypassed: usize,
+    not_recommended: usize,
+    not_measured: usize,
+    /// Planner on, but a job needing a card is outside its model (claimed without it, or recovered),
+    /// so it is not asked, and without it nothing may be claimed either.
+    model_incomplete: usize,
+    horizon_full: usize,
+    deadline: usize,
+    no_device: usize,
+    /// Planner off, and every card has its job.
+    no_room: usize,
+}
+
+impl AdmissionTally {
+    fn note(&mut self, c: Candidate<'_>) {
+        use zkminer_strategy::queue::Rejection;
+        self.reached += 1;
+        let count = if !c.recommended {
+            &mut self.not_recommended
+        } else if !c.measurable {
+            &mut self.not_measured
+        } else if c.planned {
+            &mut self.planned
+        } else if c.planner_active && !c.model_complete {
+            &mut self.model_incomplete
+        } else if c.planner_active {
+            match c.rejection {
+                Some(Rejection::HorizonFull) => &mut self.horizon_full,
+                Some(Rejection::DeadlineInfeasible) => &mut self.deadline,
+                Some(Rejection::NoUsableDevice) | None => &mut self.no_device,
+            }
+        } else if c.bypass_room {
+            &mut self.bypassed
+        } else {
+            &mut self.no_room
+        };
+        *count += 1;
+    }
+}
+
+impl std::fmt::Display for AdmissionTally {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at admission", self.reached)?;
+        for (n, what) in [
+            (self.planned, "planned"),
+            (self.bypassed, "claimed without the planner"),
+            (self.not_recommended, "not recommended"),
+            (self.not_measured, "not measured"),
+            (self.model_incomplete, "planner skipped (model incomplete)"),
+            (self.horizon_full, "horizon full"),
+            (self.deadline, "deadline infeasible"),
+            (self.no_device, "no usable device"),
+            (self.no_room, "no free card"),
+        ] {
+            if n > 0 {
+                write!(f, ", {n} {what}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `cpu_info` of the synthetic placeholder suite (`synthetic_conservative_benchmark`), which is how
 /// a suite read back from the shared state is told apart from a measured one.
 const SYNTHETIC_SUITE_CPU: &str = "(unbenchmarked placeholder)";
@@ -4638,6 +4733,9 @@ async fn miner_brain(
     // prove. They still hold collateral until fulfilled or released, but not a GPU, so card capacity
     // (`max_concurrent`, the claim ceiling, the planner's model) counts `in_flight` less these.
     let mut proved: std::collections::HashSet<B256> = std::collections::HashSet::new();
+    // Each claimed job's measured cycles and backend, for placing it in the planner's model when the
+    // planner did not admit it (see the repair below).
+    let mut inflight_work: HashMap<B256, (u64, &'static str)> = HashMap::new();
 
     // The recovery room checks judge locks against chain time: read a header first, so the startup
     // pass does not fall back to the bare wall clock.
@@ -4950,6 +5048,7 @@ async fn miner_brain(
         while let Ok(jid) = done_rx.try_recv() {
             in_flight.remove(&jid);
             proved.remove(&jid);
+            inflight_work.remove(&jid);
             queue_model.settle(&jid.0);
         }
         // And jobs done with their card: no longer a card's work, in the budget or in the model.
@@ -4958,6 +5057,11 @@ async fn miner_brain(
                 queue_model.settle(&jid.0);
             }
         }
+        // Only jobs still held. Every path that reaps one removes it here too, but an entry left
+        // behind would read as one card fewer needed for as long as the miner ran: it did, from a
+        // recovery pass's own reap, and the planner's model then never matched again.
+        proved.retain(|j| in_flight.contains_key(j));
+        inflight_work.retain(|j, _| in_flight.contains_key(j));
         {
             // Advance the backlog model by real elapsed time, not by tick count: the brain
             // loop awaits `recover_claimed_jobs` inline and can stall for minutes, and a
@@ -5235,6 +5339,8 @@ async fn miner_brain(
                     // not count as live, or the pass skips the very job the request was for.
                     while let Ok(jid) = done_rx.try_recv() {
                         in_flight.remove(&jid);
+                        proved.remove(&jid);
+                        inflight_work.remove(&jid);
                         queue_model.settle(&jid.0);
                     }
                     let owned: std::collections::HashSet<B256> = in_flight.keys().copied().collect();
@@ -5253,6 +5359,8 @@ async fn miner_brain(
                     let mut rearm = false;
                     while let Ok(jid) = done_rx.try_recv() {
                         in_flight.remove(&jid);
+                        proved.remove(&jid);
+                        inflight_work.remove(&jid);
                         queue_model.settle(&jid.0);
                         // Ended during the pass, after `owned` was taken: the pass skipped it.
                         rearm |= journal_has(&journal, jid);
@@ -5549,7 +5657,7 @@ async fn miner_brain(
             // mis-estimate cannot run away and lock unbounded collateral.
             max_concurrent.saturating_mul(3)
         };
-        if in_flight.len() - proved.len() >= claim_ceiling {
+        if needing_card(&in_flight, &proved) >= claim_ceiling {
             continue;
         }
 
@@ -5887,6 +5995,31 @@ async fn miner_brain(
             }
             v
         };
+        // The planner models only the jobs it placed, and is used only while that covers every job
+        // still needing a card. A job it did not place (claimed while it was off, before any card's
+        // rate was known, or recovered after a restart) therefore stopped ALL claims until every such
+        // job had proved: the moment it switched on, the cards drained empty ("model 0/3"). Place them
+        // as it would have, by measured cycles, or as a horizon of work when unknown.
+        if planner_active {
+            for jid in in_flight.keys() {
+                if proved.contains(jid) || queue_model.contains(&jid.0) {
+                    continue;
+                }
+                let (cycles, backend) = inflight_work
+                    .get(jid)
+                    .copied()
+                    .unwrap_or((0, zkminer_prover_protocol::BACKEND_RISC0));
+                let slots = queue_model.slots(&planner_throughputs_for_backend(
+                    &device_backend_throughputs,
+                    backend,
+                ));
+                if let Some((device, finishes_in)) =
+                    zkminer_strategy::queue::place(&slots, cycles, queue_horizon)
+                {
+                    queue_model.commit(jid.0, &device, finishes_in);
+                }
+            }
+        }
 
         // Available collateral for NEW claims this tick = on-chain available MINUS our
         // in-flight reservations. This is deliberately FAIL-SAFE (it can under-count but
@@ -5968,6 +6101,8 @@ async fn miner_brain(
         // job we had to skip purely for lack of available collateral — so an idle
         // miner tells the operator WHY (the per-job eval reason is DEBUG-only).
         let mut claimed_this_tick = false;
+        // How this pass's candidates fared at admission, for the `queue:` debug summary below.
+        let mut tally = AdmissionTally::default();
         // Collateral reserved by claims made THIS tick. `stake_info` is a
         // tick-start snapshot and is never re-read, so it does not reflect them; pairing it
         // with a post-claim `in_flight.len()` would count each claim twice.
@@ -6366,7 +6501,7 @@ async fn miner_brain(
                             if !pool.backend_fits_for_claim(
                                 want,
                                 backend,
-                                in_flight.len() - proved.len(),
+                                needing_card(&in_flight, &proved),
                                 max_concurrent,
                             ) {
                                 // Rate-limited to once per backend per tick. On the market this
@@ -7028,7 +7163,8 @@ async fn miner_brain(
             // model then UNDER-reports that device and the planner would place a later job as
             // though the card were idle — void at depth 1, not just depth 2. Refuse to plan
             // against a model we know is incomplete rather than plan against a fiction.
-            let model_complete = queue_model.outstanding() == in_flight.len() - proved.len();
+            let model_complete = queue_model.outstanding() == needing_card(&in_flight, &proved);
+            let mut plan_rejection = None;
             let admission = if planner_active
                 && measurable
                 && model_complete
@@ -7083,6 +7219,7 @@ async fn miner_brain(
                 ) {
                     Ok(a) => Some(a),
                     Err(reason) => {
+                        plan_rejection = Some(reason.clone());
                         // HorizonFull is the healthy saturated state; log the others, which
                         // mean we are being offered work this rig cannot serve.
                         if !matches!(reason, zkminer_strategy::queue::Rejection::HorizonFull) {
@@ -7126,7 +7263,7 @@ async fn miner_brain(
             // card).
             let risc0_job = backend_opt == Some(zkminer_prover_protocol::BACKEND_RISC0);
             let bypass_room = risc0_bypass_room(
-                in_flight.len() - proved.len(),
+                needing_card(&in_flight, &proved),
                 other_backend_in_flight
                     .iter()
                     .filter(|j| !proved.contains(*j))
@@ -7136,6 +7273,15 @@ async fn miner_brain(
                 risc0_cards.len(),
             );
             let would_commit = admission.is_some() || (queue_bypass && measurable && bypass_room);
+            tally.note(Candidate {
+                recommended: matches!(eval.recommendation, Recommendation::Claim),
+                measurable,
+                planner_active,
+                model_complete,
+                planned: admission.is_some(),
+                rejection: plan_rejection.as_ref(),
+                bypass_room,
+            });
             // The share of the speed premium a fulfil can still earn falls with every exit from a
             // lock (a release or slash, which count as reopens, and a pause's grace release, which
             // doesn't), and the job view doesn't carry it. Read it only for a job about to take a
@@ -7170,6 +7316,7 @@ async fn miner_brain(
                 if backend_opt == Some(zkminer_prover_protocol::BACKEND_SP1) {
                     sp1_in_flight.insert(jid);
                 }
+                inflight_work.insert(jid, (params.estimated_cycles, backend_opt.unwrap_or("")));
                 // Commit the admission to the backlog model, paired with the
                 // `in_flight` insert so the two can never disagree about what is outstanding.
                 // Without this the backlog stays at zero, every device looks idle, and the
@@ -7206,11 +7353,45 @@ async fn miner_brain(
                 // Bound to free proving slots (never lock more than we can prove before
                 // their deadlines) and to the contract's MAX_BATCH_SIZE. in_flight now
                 // includes this tick's collected jobs, so its length is the capacity gate.
-                if in_flight.len() - proved.len() >= claim_ceiling || batch.len() >= MAX_CLAIM_BATCH
+                if needing_card(&in_flight, &proved) >= claim_ceiling
+                    || batch.len() >= MAX_CLAIM_BATCH
                 {
                     break;
                 }
             }
+        }
+
+        // What admission saw this pass: why work that was offered was or was not claimed, and how
+        // busy the planner thinks each card is. Debug only (`zkminer -v`).
+        if tracing::enabled!(tracing::Level::DEBUG) && (tally.reached > 0 || !open_jobs.is_empty())
+        {
+            let slots = queue_model
+                .slots(&planner_throughputs_for_backend(
+                    &device_backend_throughputs,
+                    zkminer_prover_protocol::BACKEND_RISC0,
+                ))
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{} {:.0}s@{:.1}M",
+                        s.device_id,
+                        s.backlog.as_secs_f64(),
+                        s.throughput / 1e6
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::debug!(
+                "queue: pass {tick_count}{}: planner {}, model {}/{} needing a card ({} held, \
+                 ceiling {claim_ceiling}), {} open; {}; risc0 cards: {slots}",
+                if ticked { "" } else { " (card freed)" },
+                if planner_active { "on" } else { "off" },
+                queue_model.outstanding(),
+                needing_card(&in_flight, &proved),
+                in_flight.len(),
+                open_jobs.len(),
+                tally,
+            );
         }
 
         // ── Dispatch the collected claim batch ───────────────────────────────────
@@ -7291,7 +7472,7 @@ async fn miner_brain(
                     "CLAIM {} (price {}, in_flight {}/{}, {} held in all)",
                     short_id(jid),
                     job.current_price,
-                    in_flight.len() - proved.len(),
+                    needing_card(&in_flight, &proved),
                     max_concurrent,
                     in_flight.len(),
                 );
@@ -14883,6 +15064,86 @@ mod r2_sizing_tests {
         let mut measured = zkminer_prover::benchmark::BenchmarkSuite::default();
         measured.cpu_info = "AMD Ryzen Threadripper 3970X 32-Core Processor".to_string();
         assert!(!is_synthetic_suite(&measured));
+    }
+
+    /// Each candidate lands under its first reason, and the summary names only what happened.
+    #[test]
+    fn the_admission_tally_names_why_work_was_not_claimed() {
+        use zkminer_strategy::queue::Rejection;
+        let base = Candidate {
+            recommended: true,
+            measurable: true,
+            planner_active: true,
+            model_complete: true,
+            planned: false,
+            rejection: None,
+            bypass_room: false,
+        };
+        let mut t = AdmissionTally::default();
+        t.note(Candidate {
+            planned: true,
+            ..base
+        });
+        t.note(Candidate {
+            model_complete: false,
+            ..base
+        });
+        t.note(Candidate {
+            rejection: Some(&Rejection::HorizonFull),
+            ..base
+        });
+        t.note(Candidate {
+            rejection: Some(&Rejection::DeadlineInfeasible),
+            ..base
+        });
+        t.note(Candidate {
+            recommended: false,
+            planned: true,
+            ..base
+        });
+        t.note(Candidate {
+            planner_active: false,
+            bypass_room: true,
+            ..base
+        });
+        t.note(Candidate {
+            planner_active: false,
+            ..base
+        });
+        assert_eq!(
+            t,
+            AdmissionTally {
+                reached: 7,
+                planned: 1,
+                bypassed: 1,
+                not_recommended: 1,
+                model_incomplete: 1,
+                horizon_full: 1,
+                deadline: 1,
+                no_room: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            t.to_string(),
+            "7 at admission, 1 planned, 1 claimed without the planner, 1 not recommended, \
+             1 planner skipped (model incomplete), 1 horizon full, 1 deadline infeasible, \
+             1 no free card"
+        );
+    }
+
+    /// A job no longer held never counts as needing a card, nor makes the count wrap.
+    #[test]
+    fn only_held_jobs_count_as_needing_a_card() {
+        let (a, b, c) = (
+            B256::repeat_byte(1),
+            B256::repeat_byte(2),
+            B256::repeat_byte(3),
+        );
+        let in_flight: HashMap<B256, u128> = [(a, 0), (b, 0)].into_iter().collect();
+        let proved: std::collections::HashSet<B256> = [b, c].into_iter().collect();
+        assert_eq!(needing_card(&in_flight, &proved), 1);
+        assert_eq!(needing_card(&HashMap::new(), &proved), 0);
     }
 
     /// A job hands its card back exactly once, whether released explicitly or by dropping.
