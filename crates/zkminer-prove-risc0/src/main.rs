@@ -14,7 +14,7 @@ compile_error!("macos mode cannot be combined with CUDA or ROCm");
 #[cfg(feature = "macos")]
 mod macos;
 #[cfg(feature = "macos-metal")]
-mod macos_metal;
+compile_error!("macos-metal is retired; use macos-rv32im-metal with RISC0_SEGMENT_HAL=metal");
 
 use anyhow::{Context, Result};
 #[cfg(not(feature = "macos"))]
@@ -38,18 +38,10 @@ fn main() {
             Err(error) => { eprintln!("recursion Metal probe failed: {error:#}"); std::process::exit(1); }
         }
     }
-    // Isolated, bounded capability probe: no IPC, guest, helper or network path.
-    #[cfg(feature = "macos-metal")]
+    #[cfg(feature = "macos")]
     if std::env::args().nth(1).as_deref() == Some("--macos-metal-probe") {
-        let result = (|| -> anyhow::Result<serde_json::Value> {
-            let budget: usize = std::env::args().nth(2)
-                .context("missing Metal staging budget")?.parse()?;
-            macos_metal::probe(budget)
-        })();
-        match result {
-            Ok(value) => { println!("{value}"); return; }
-            Err(error) => { eprintln!("Metal probe failed: {error:#}"); std::process::exit(1); }
-        }
+        eprintln!("The fold-only Metal probe is retired; use RISC0_SEGMENT_HAL=metal on a macos-rv32im-metal worker");
+        std::process::exit(2);
     }
     tracing_subscriber::fmt()
         .with_writer(io::stderr)

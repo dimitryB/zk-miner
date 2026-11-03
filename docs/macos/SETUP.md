@@ -1,10 +1,56 @@
 # Reproduce macOS proving paths
 
 For the resident RV32IM Metal worker, use the current
-[integration and validation guide](RV32IM_METAL_WORKER.md). Its published engine
-checkpoint is `cef3559d6805769c5b33fb4040abe548e670e268`. Historical CPU/hybrid
+[integration and validation guide](RV32IM_METAL_WORKER.md). The validated review engine
+checkpoint is `dcbe9f4b9140a48d4792ffcd3a3eba19897be175`; the original resident-port
+publication was `cef3559d6805769c5b33fb4040abe548e670e268`. Historical CPU/hybrid
 measurements below retain their original commit references; the
 [authorship map](evidence/authorship-rewrite.json) records their rewritten IDs.
+
+
+## Current resident Metal worker
+
+Build with `build-worker.py --mode native-rv32im-metal` and the exact reviewed
+engine SHA. Select the stages with `RISC0_SEGMENT_HAL=metal` and
+`RISC0_RECURSION_HAL=metal`, together with `ZKMINER_RISC0_WRAP=native`.
+CPU segment selection is `RISC0_SEGMENT_HAL=cpu`; unset selectors default to CPU.
+The former `ZKMINER_RISC0_MODE=metal`, `macos-metal` build and staging probe now
+fail with migration guidance. The old mode variable is unnecessary; `cpu` and
+`auto` are accepted only as deprecated compatibility inputs.
+
+Use [RV32IM_METAL_WORKER.md](RV32IM_METAL_WORKER.md) for the original validated
+checkpoint, [engine refresh evidence](evidence/engine-refresh-validation.json)
+for the post-merge regression, and [HANDOFF.md](HANDOFF.md) for current follow-up
+status. Fresh current-tip correctness, the 46M stretch, Metal profiles and the
+five-sample hashing median have passed on retirement checkpoint `dcbe9f4b9`.
+The five-pair arithmetic gate is complete: 3.645× median speedup and
+5/5 faster pairs. Both 10M usefulness fixtures also pass their five-sample warm
+median targets. See [paired evidence](evidence/rv32im-five-pair-validation.json) and the
+[current handoff](HANDOFF.md). Earlier partial attempts remain separate; the
+corrected runner budgets all twelve comparison requests and their watchdogs.
+
+This regression retains two warm workers. The committed CPU baseline's idle
+physical footprint rose from 4.5 GiB after warm-up to about 8–9 GiB after later
+10M requests, in addition to the resident Metal worker. Allow extra headroom
+beyond the single-worker admission requirement before starting the comparison.
+
+## Resident Metal hardware guidance
+
+The current po2-20 resident Metal configuration is intended for a **64 GiB-class
+Apple Silicon Mac or larger**. Validation has used an Apple M5 Max with 128 GiB;
+64 GiB capacity itself has not been tested. The default admission calculation
+requires approximately **40 GiB available** before accounting for resident worker
+credit: a 24 GiB initial proof budget plus a 16 GiB host reserve. Installed RAM
+alone does not establish admission when other applications or VMs use memory.
+
+The original campaign's largest worker/helper footprint was 16.305 GiB; the
+review's warmed proof groups reached 19.783 GiB. These observations exclude
+other retained workers and host processes; they are not worst-case bounds.
+The 32 GiB worker/helper ceiling, kernel pressure check and existing headroom
+floor still apply. The post-refresh serial regression used an explicitly recorded
+12 GiB reserve; the production default remains 16 GiB. A smaller-machine po2-18
+profile has not been validated. Lowering the segment cap alone is not documented
+as establishing support for a 32 GiB Mac.
 
 ## Native macOS wrapping
 
@@ -216,7 +262,7 @@ python3 scripts/macos/test-native-worker.py --engine "$ENGINE_DIR" --worker-kind
 The build lives in `target/macos/worker-native-recursion-metal`; the measured
 CPU worker is preserved under `target/macos/native-wrap/step4-cpu-baseline`.
 Use `RISC0_RECURSION_HAL=metal` explicitly with this worker; the default is CPU.
-Set `ZKMINER_RISC0_MODE=cpu` for segment proving; the recursion setting selects
+Set `RISC0_SEGMENT_HAL=cpu` for CPU segment proving; the recursion setting selects
 the separate Poseidon2 Metal stage.
 Unsupported/invalid requests fail startup. Device preflight is bounded; runtime
 shader compilation is included in the first proof rather than the handshake.
@@ -247,6 +293,15 @@ candidate's source unchanged. Zero-output hash shapes are intentionally rejected
 by both CPU and GPU; their caught panics in the test log are expected.
 The initial Metal admission budget is 20 GiB; CPU remains 16 GiB. Measured
 calibration, host reserve and physical-footprint watchdog policies still apply.
+
+## Historical CPU/Docker and fold-only experiments (retired)
+
+The following records describe earlier checkpoints. Fold-only builds, probes and
+worker selection are retired in current tooling. Reproduce historical experiments
+from their recorded commits; use the resident worker above for current proving.
+
+<details>
+<summary>Historical setup and benchmark commands</summary>
 
 ## Prerequisites and source
 
@@ -672,3 +727,5 @@ the dedicated context. Stop only the dedicated profile with
 removing the dedicated Colima profile would remove its helper image/cache.
 Those destructive cleanup operations were not performed. No global shell,
 wallet, upstream checkout or default VM cleanup is needed.
+
+</details>

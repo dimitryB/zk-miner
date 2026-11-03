@@ -11,6 +11,19 @@ from proof_provenance import ROOT, sha, verify_build
 from worker_provenance import verify_build as verify_worker, paths
 
 
+def suite_budget(args):
+    """Bound the whole sequence, including each comparison warm-up and wait."""
+    if args.limit_controls:
+        requests, admission_waits = 0, 0
+    elif args.thread_cases:
+        requests = len(args.thread_cases.split(',')) * (args.samples + 1)
+        admission_waits = requests
+    else:
+        requests = args.repeat + int(args.warmup) + (4 if not args.proof_only else 0)
+        admission_waits = 0
+    return requests, requests * args.timeout_seconds + admission_waits * 600 + 600
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", type=Path, required=True)
@@ -35,7 +48,13 @@ def main():
     parser.add_argument("--timeout-seconds", type=int, default=600, help="per-proof watchdog, 30..3600 seconds")
     parser.add_argument("--min-guest-cycles", type=int, default=1)
     parser.add_argument("--warmup", action="store_true", help="one extra complete proof before the measured repeats")
+    parser.add_argument("--paired-baseline", type=Path, help="frozen step-5 worker for a counterbalanced CPU-segment/resident-Metal comparison")
     args = parser.parse_args()
+    if args.paired_baseline:
+        if args.worker_kind != "native-rv32im-metal" or args.segment_hal != "metal" or args.recursion_hal != "metal":
+            parser.error("paired baseline requires the resident worker with segment and recursion Metal")
+        args.paired_baseline = args.paired_baseline.resolve(strict=True)
+        args.thread_cases = "18:18,18:18"
     if args.segment_hal == "metal" and args.worker_kind != "native-rv32im-metal":
         parser.error("segment Metal requires the native-rv32im-metal worker")
     if args.segment_check_cpu and args.segment_hal != "metal":parser.error("CPU differential requires segment Metal")
@@ -50,6 +69,7 @@ def main():
         parser.error("invalid session limit or watchdog")
     if not 1 <= args.min_guest_cycles <= args.session_limit:
         parser.error("minimum guest cycles must fit session limit")
+    planned_requests, suite_timeout = suite_budget(args)
     worker_manifest = verify_worker(args.worker_kind, args.engine)
     verifier_manifest = verify_build("verifier")
     spec = importlib.util.spec_from_file_location("worker_acceptance", Path(__file__).with_name("test-worker.py"))
@@ -68,7 +88,7 @@ def main():
     (directory / "input.bin").write_bytes(data)
     program = ROOT / "target/macos/guest-build/riscv32im-risc0-zkvm-elf/release" / (args.workload + ".bin")
     env = dict(os.environ, ZKMINER_RISC0_WRAP="native", ZKMINER_RISC0_NATIVE_DIR=str(base / "assets"),
-               ZKMINER_RISC0_MODE="cpu", ZKMINER_RISC0_WORK_ROOT=str(directory / "work"),
+               ZKMINER_RISC0_WORK_ROOT=str(directory / "work"),
                ZKMINER_RISC0_EVIDENCE_DIR=str(directory / "sidecars"),
                ZKMINER_MACOS_WORKER=str(paths(args.worker_kind)["binary"]), ZKMINER_MACOS_WORKER_KIND="native",
                RISC0_RECURSION_HAL=args.recursion_hal,
@@ -90,6 +110,9 @@ def main():
                PATH=str(directory / "bin") + os.pathsep + os.environ["PATH"])
     if args.thread_cases:
         env.update(ZKMINER_MACOS_THREAD_CASES=args.thread_cases, ZKMINER_MACOS_THREAD_SAMPLES=str(args.samples))
+    if args.paired_baseline:
+        env.update(ZKMINER_RISC0_MODE="cpu", ZKMINER_MACOS_SEGMENT_CASES="cpu,metal",
+            ZKMINER_MACOS_WORKER_BINARIES=json.dumps([str(args.paired_baseline), str(paths(args.worker_kind)["binary"])]))
     if args.recursion_cases:
         env["ZKMINER_MACOS_RECURSION_CASES"] = args.recursion_cases
     if args.calibration:
@@ -99,8 +122,11 @@ def main():
               "bundle": json.loads((base / "assets/manifest.json").read_text()), "workload": args.workload, "rayon_threads":args.rayon_threads, "gomaxprocs":args.go_threads,
               "iterations":args.iterations,"po2":po2,"session_guest_cycle_limit":args.session_limit,
               "proof_watchdog_seconds":args.timeout_seconds,"warmup_count":int(args.warmup),"measured_repeats":args.repeat,
+              "planned_proof_requests":planned_requests,"suite_timeout_seconds":suite_timeout,
               "min_guest_cycles":args.min_guest_cycles,"program_sha256":sha(program),"input_sha256":sha(directory / "input.bin")}
     report.update(worker_kind=args.worker_kind, segment_hal=args.segment_hal, segment_check_cpu=args.segment_check_cpu, recursion_hal=args.recursion_hal, recursion_cases=args.recursion_cases)
+    if args.paired_baseline:
+        report["paired_baseline"] = {"path":str(args.paired_baseline), "sha256":sha(args.paired_baseline)}
     if args.calibration:
         report["calibration"] = {"path":str(args.calibration), "sha256":sha(args.calibration)}
     print(directory, flush=True)
@@ -110,9 +136,11 @@ def main():
             test = "native_workload_limit_controls" if args.limit_controls else "native_thread_comparison" if args.thread_cases else "native_worker_proofs_failure_restart_and_shutdown"
             subprocess.run([str(binary), test, "--exact", "--ignored", "--nocapture"],
                            env=env, stdout=log, stderr=subprocess.STDOUT, check=True,
-                           timeout=(args.repeat + int(args.warmup) + (4 if not args.proof_only else 0))*args.timeout_seconds + 600)
+                           timeout=suite_timeout)
         if verify_worker(args.worker_kind, args.engine) != worker_manifest:
             raise RuntimeError("native worker build changed during acceptance")
+        if args.paired_baseline and sha(args.paired_baseline) != report["paired_baseline"]["sha256"]:
+            raise RuntimeError("baseline worker changed during acceptance")
         if sha(binary) != build["binary_sha256"] or acceptance.test_sources() != build["source_inputs"]:
             raise RuntimeError("WorkerPool acceptance sources changed during the run")
         if args.calibration and sha(args.calibration) != report["calibration"]["sha256"]:

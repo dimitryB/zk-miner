@@ -66,6 +66,8 @@ def main():
     parser.add_argument("--po2", type=int, default=18)
     parser.add_argument("--workload", choices=["fibonacci", "sha256-chain", "segment-boundary"], default="fibonacci")
     args = parser.parse_args()
+    if args.mode == "metal":
+        parser.error("the fold-only smoke path is retired; use test-native-worker.py with the resident Metal worker")
     if args.mode == "metal" and args.engine is None:
         parser.error("--engine is required for a source-bound Metal proof")
     if not (1 <= args.repeat <= 100 and 1 <= args.timeout <= 7200 and 1 <= args.rss_gib <= 48 and 13 <= args.po2 <= 20):

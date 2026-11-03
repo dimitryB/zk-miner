@@ -1,5 +1,64 @@
 # Resident RV32IM Metal worker — integration and validation
 
+
+## Post-publication review follow-up
+
+The original `cef3559d6` campaign is preserved in its own section below. The subsequent
+`c6b67b15e` parent merge passed an additional eight proofs, 24 negative checks
+and 29 unit/differential tests; see [refresh evidence](evidence/engine-refresh-validation.json).
+The retirement checkpoint `dcbe9f4b9` has now passed fresh smoke,
+full-domain real-witness CPU differential, 10M hashing and a 46M stretch:
+four proofs plus twelve negative checks, with 31 focused tests passing.
+See [current-tip validation](evidence/rv32im-current-tip-validation.json).
+
+The stretch proved 46,003,116 guest cycles in 46 segments in **484.740 seconds**,
+including independent verification, with a **15.401 GiB** guarded group peak.
+Pressure remained normal and the default 16 GiB reserve was used. This is one
+complete observation and meets the proposed 600-second stretch target.
+
+Two additional verified diagnostic 10M proofs establish the current Metal split:
+
+| Segment phase | Arithmetic | Hashing |
+|---|---:|---:|
+| Constraints | 63.70% | 62.01% |
+| Polynomial transforms | 20.11% | 19.54% |
+| Merkle commitments | 4.28% | 4.16% |
+| CPU witness generation | 1.98% | 4.01% |
+| CPU accumulation | 7.27% | 7.64% |
+| Other segment protocol | 2.66% | 2.64% |
+
+Segment prover totals were 88.658/91.054 seconds of 127.653/128.682 seconds
+complete time. These are synchronous phase wall times, not GPU occupancy or
+hardware-cycle counters. The historical CPU 51/31/11 split is superseded for
+this backend. Constraints remain the first optimization candidate; no evaluator
+occupancy or kernel changes were made. See [Metal profile evidence](evidence/rv32im-metal-current-profile.json).
+
+Five warm 10M hashing samples passed, with complete times of 124.663, 122.647,
+120.800, 120.176 and 120.173 seconds: **120.800 seconds median**, below the
+600-second usefulness bar. The excluded warm-up verified in 130.704 seconds.
+See [warm hashing evidence](evidence/rv32im-warm-hash-validation.json).
+
+The formal five-pair gate passed: complete medians of **427.192 seconds
+step-5 baseline / 117.192 seconds resident Metal**, **3.645×** speedup,
+with 5/5 faster pairs. One warm-up per mode was excluded; all twelve proofs
+and 36 negative checks passed on unchanged worker identities. Fresh-campaign
+admission waits were zero. The arithmetic median and the hashing median above
+both meet the 600-second usefulness target. This compares the entire refreshed
+stack, including parent changes; it does not isolate Metal-only gains. See
+[paired evidence](evidence/rv32im-five-pair-validation.json) and
+[proof CSV](evidence/rv32im-five-pair-proofs.csv).
+
+Current-tip validation totals 22 proofs and 66 negative checks, plus the
+31 focused checks. Earlier admission refusals and the interrupted partial run
+remain recorded separately in [HANDOFF.md](HANDOFF.md). The largest review
+worker/helper peak, including warmed proofs, is **19.783 GiB**; see the
+[machine floor](SETUP.md). The clean engine checkpoint is `dcbe9f4b9`.
+The owner authorized publication to both personal forks on 2026-11-03; the
+[review publication record](evidence/rv32im-review-publication.json) binds this
+miner commit to the validated engine, runtime files and existing proof results.
+
+## Original resident-port checkpoint (`cef3559d6`)
+
 The opt-in worker now uses shared Metal buffers for RV32IM transforms,
 commitments and constraint evaluation. Poseidon2 lift/join remains Metal;
 CPU witness generation, accumulation, scatter, prefix products, zeroization,
@@ -34,10 +93,10 @@ rejects mixing resident Metal with CUDA, ROCm, Intel or the legacy fold-only
 segment backend, and rejects the feature outside Apple Silicon macOS.
 
 Runtime selection is explicit through `RISC0_SEGMENT_HAL=metal`. CPU is the
-default, and invalid or unsupported values fail. Use `ZKMINER_RISC0_MODE=cpu`
-to disable the separate legacy fold-only selector; use
-`RISC0_RECURSION_HAL=metal` and `ZKMINER_RISC0_WRAP=native` for the validated
-combination. The acceptance runner supplies these settings and the supervisor's
+default, and invalid or unsupported values fail. Current tooling retires the
+legacy fold-only backend, so `ZKMINER_RISC0_MODE` is no longer needed. Use
+`RISC0_RECURSION_HAL=metal` and `ZKMINER_RISC0_WRAP=native` with resident Metal.
+The old `metal` mode, build and probe fail with migration guidance. The acceptance runner supplies these settings and the supervisor's
 native-helper lease. Select `--segment-hal cpu` on the same worker for a CPU
 segment control.
 
@@ -162,7 +221,8 @@ flags. They have not been rewritten to imply a new proof campaign. The
 rewrite, and the [publication record](evidence/rv32im-publication.json) binds the
 tested files and binaries to the committed engine checkpoint and rebuilt seals.
 
-An integrated performance claim still needs a controlled comparison against
-the committed step-5 baseline with identical fixtures and resource settings.
+At the original checkpoint, an integrated performance claim still needed a
+controlled comparison against the committed step-5 baseline. The completed
+review comparison above now records that gate with identical fixtures and settings.
 GPU witness/accumulation, larger segment caps and overlapping segments remain
 outside this implementation.

@@ -28,6 +28,15 @@ def check_lock_delta(original, local):
             b["dependencies"] = [d for d in b.get("dependencies", []) if d != "risc0-build-kernel"]
         if key[0] == "risc0-circuit-rv32im" and "metal" not in a.get("dependencies", []):
             b["dependencies"] = [d for d in b.get("dependencies", []) if d != "metal"]
+        # Reviewed release-3.0 additions use packages already present in the
+        # pinned lock; package versions and every other edge remain checked.
+        parent_edges = {
+            ("risc0-build-kernel", "2.1.0"): "jobserver",
+            ("risc0-groth16-sys", "0.1.0"): "risc0-sys",
+        }
+        dependency = parent_edges.get(key)
+        if dependency and dependency not in a.get("dependencies", []):
+            b["dependencies"] = [d for d in b.get("dependencies", []) if d != dependency]
         valid = valid and a == b
     return valid
 
@@ -40,6 +49,8 @@ def main():
     parser.add_argument("--mode", choices=["cpu", "metal", "native", "native-recursion-metal", "native-rv32im-metal"], default="cpu")
     parser.add_argument("--tests", action="store_true", help="run the selected worker unit tests before sealing")
     args = parser.parse_args()
+    if args.mode == "metal":
+        parser.error("the fold-only metal build is retired; use --mode native-rv32im-metal")
     root = Path(__file__).resolve().parents[2]
     output = root / "target/macos"
     config, engine = args.config.resolve(), args.engine.resolve()

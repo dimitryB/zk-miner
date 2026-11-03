@@ -227,6 +227,8 @@ def main():
     parser.add_argument("--failure-timeout", type=int, default=70)
     parser.add_argument("--staging-bytes", type=int, default=524288)
     args = parser.parse_args()
+    if args.worker_kind == "metal":
+        parser.error("the fold-only worker is retired; use test-native-worker.py --worker-kind native-rv32im-metal --segment-hal metal")
     input_data, expected_journal, default_po2, minimum_segments = workload(args.workload)
     args.po2 = default_po2 if args.po2 is None else args.po2
     if not (1 <= args.repeat <= 100 and 1 <= args.timeout <= 14400 and 1 <= args.failure_timeout <= 300

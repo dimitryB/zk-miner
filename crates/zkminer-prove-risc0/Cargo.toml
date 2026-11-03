@@ -20,10 +20,8 @@ required-features = ["rocm"]
 
 [features]
 macos = ["risc0-zkvm/disable-dev-mode", "dep:serde_json", "dep:sha2"]
-# The local build script also enables risc0-zkvm/metal-hybrid explicitly.
-# Do not reference that local-only engine feature here: the unchanged Git pin
-# must still resolve for existing CPU/CUDA/ROCm builds.
-macos-metal = ["macos", "dep:risc0-zkp", "dep:metal"]
+# Deprecated compatibility name: compilation emits migration guidance.
+macos-metal = ["macos"]
 # Build tooling also selects the local engine's native-groth16 feature.
 macos-native-wrap = ["macos"]
 # Build tooling also enables the local engine's metal-recursion feature.

@@ -219,6 +219,15 @@ fn native_thread_comparison() {
         .parse()
         .unwrap();
     assert!((1..=5).contains(&samples));
+    let binaries: Option<Vec<PathBuf>> = std::env::var("ZKMINER_MACOS_WORKER_BINARIES")
+        .ok().map(|s| serde_json::from_str(&s).unwrap());
+    let segment_cases: Option<Vec<String>> = std::env::var("ZKMINER_MACOS_SEGMENT_CASES")
+        .ok().map(|s| s.split(',').map(str::to_owned).collect());
+    if let Some(cases) = &segment_cases {
+        assert_eq!(cases, &["cpu", "metal"]);
+        assert_eq!(cases.len(), settings.len());
+        assert_eq!(binaries.as_ref().unwrap().len(), settings.len());
+    }
     let mut pools = Vec::new();
     for (index, &(rayon, go)) in settings.iter().enumerate() {
         let mut pool = WorkerPool::new(HashMap::new(), vec![], Some(proof_timeout()));
@@ -229,8 +238,12 @@ fn native_thread_comparison() {
         if let Some(cases) = &recursion_cases {
             overrides.insert("RISC0_RECURSION_HAL".into(), cases[index].clone());
         }
-        pool.insert_test_worker(KEY, "risc0", required("ZKMINER_MACOS_WORKER"), overrides)
-            .unwrap();
+        if let Some(cases) = &segment_cases {
+            overrides.insert("RISC0_SEGMENT_HAL".into(), cases[index].clone());
+        }
+        let binary = binaries.as_ref().map(|v| v[index].clone())
+            .unwrap_or_else(|| required("ZKMINER_MACOS_WORKER"));
+        pool.insert_test_worker(KEY, "risc0", binary, overrides).unwrap();
         pools.push(pool);
     }
     let mut rows = Vec::new();
@@ -241,13 +254,46 @@ fn native_thread_comparison() {
         }
         for index in order {
             let before = sidecar_paths();
-            let (result, mut resources) = measured_prove(&pools[index], &elf, &workload);
+            let mut admission_wait_ms = 0.0;
+            let (outcome, mut resources) = loop {
+                let attempt = Instant::now();
+                let worker_pid = pools[index].worker_pid(KEY);
+                let (result, resources) = measured_prove(&pools[index], &elf, &workload);
+                match result {
+                    Ok(outcome) => break (outcome, resources),
+                    Err(error) if error.downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>().is_some() => {
+                        // No request was dispatched. Retain both warm workers,
+                        // keep the production policy intact, and record the wait
+                        // separately from successful prove-call timing.
+                        assert_eq!(sidecar_paths(), before, "admission refusal dispatched work");
+                        assert_eq!(pools[index].worker_pid(KEY), worker_pid,
+                            "admission refusal changed the warm worker identity");
+                        if admission_wait_ms == 0.0 {
+                            ledger(&evidence, &json!({"event":"admission_wait_started",
+                                "round":round,"case":index,"worker_pid":worker_pid,
+                                "error":format!("{error:#}")}));
+                        }
+                        assert!(admission_wait_ms < 600_000.0,
+                            "host admission remained unavailable for ten minutes: {error:#}");
+                        std::thread::sleep(Duration::from_secs(5));
+                        admission_wait_ms += attempt.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    Err(error) => panic!("proof failed without retry: {error:#}"),
+                }
+            };
+            if admission_wait_ms > 0.0 {
+                ledger(&evidence, &json!({"event":"admission_wait_finished",
+                    "round":round,"case":index,"admission_wait_ms":admission_wait_ms}));
+            }
             let directory = evidence.join(format!("round-{round}-case-{index}"));
-            let outcome = result.unwrap();
             let (_, record) = require_sidecar(&before);
             assert_eq!(record["rayon_threads"], settings[index].0);
             assert_eq!(record["gomaxprocs"], settings[index].1);
             assert_eq!(record["helper_arch"], "darwin/arm64");
+            if let Some(cases) = &segment_cases {
+                assert_eq!(record["segment_hal"].as_str().unwrap_or("cpu"), cases[index]);
+                assert_eq!(record["observed_mode"], cases[index]);
+            }
             if let Some(cases) = &recursion_cases {
                 assert_eq!(record["recursion_hal"], cases[index]);
             }
@@ -270,7 +316,7 @@ fn native_thread_comparison() {
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
             let row = json!({"round":round,"warmup":round==0,"case":index,"rayon_threads":settings[index].0,
-                "gomaxprocs":settings[index].1,"worker":record,"resources":resources,"timings":timing,"thermal":thermal});
+                "gomaxprocs":settings[index].1,"admission_wait_ms":admission_wait_ms,"worker":record,"resources":resources,"timings":timing,"thermal":thermal});
             ledger(&evidence, &row);
             rows.push(row);
         }
@@ -282,7 +328,7 @@ fn native_thread_comparison() {
     fs::write(
         evidence.join("complete.json"),
         serde_json::to_vec_pretty(&json!({"status":"complete_independently_verified",
-        "samples_per_case":samples,"settings":settings,"recursion_cases":recursion_cases,"rows":rows}))
+        "samples_per_case":samples,"settings":settings,"recursion_cases":recursion_cases,"segment_cases":segment_cases,"worker_binaries":binaries,"rows":rows}))
         .unwrap(),
     )
     .unwrap();
@@ -395,10 +441,15 @@ fn positive(value: &Value, field: &str) -> u64 {
         .unwrap_or_else(|| panic!("missing positive {field}: {value}"))
 }
 fn validate_stage(record: &Value, workload: &Workload) {
+    let observed = if std::env::var_os("ZKMINER_MACOS_SEGMENT_CASES").is_some() {
+        // The paired test independently checks this against each configured
+        // worker's case before calling the common cryptographic verifier.
+        if record["segment_hal"] == "metal" { "metal".to_owned() } else { "cpu".to_owned() }
+    } else { observed_mode() };
     assert_eq!(record["schema_version"], 1);
     assert_eq!(record["operation"], "prove");
     assert_eq!(record["requested_mode"], mode());
-    assert_eq!(record["observed_mode"], observed_mode());
+    assert_eq!(record["observed_mode"], observed.clone());
     assert_eq!(record["elf_sha256"], workload.elf_sha256);
     assert_eq!(record["input_sha256"], hash(&workload.input));
     if record["phase"] == "complete" {
@@ -406,12 +457,6 @@ fn validate_stage(record: &Value, workload: &Workload) {
         assert_eq!(record["journal_sha256"], hash(&workload.expected));
     }
     assert_eq!(record["po2"], workload.po2);
-    if mode() == "auto" && observed_mode() == "cpu" {
-        assert!(
-            !record["fallback_reason"].as_str().unwrap_or("").is_empty(),
-            "auto CPU fallback needs a reason"
-        );
-    }
     let count = positive(&record["stats"], "segments");
     let recursion = if let Ok(cases) = std::env::var("ZKMINER_MACOS_RECURSION_CASES") {
         let actual = record["recursion_hal"].as_str().unwrap();
@@ -440,7 +485,7 @@ fn validate_stage(record: &Value, workload: &Workload) {
     );
     let stage = &record["observed_stages"]["metal_stage"];
     if record["segment_hal"] == "metal" {
-        assert_eq!(observed_mode(), "metal");
+        assert_eq!(observed.clone(), "metal");
         assert_eq!(record["observed_stages"]["segment"], "metal");
         assert_eq!(record["observed_stages"]["other_segment_operations"], "metal_shared_buffers");
         let rv = &record["observed_stages"]["rv32im_metal"];
@@ -456,42 +501,11 @@ fn validate_stage(record: &Value, workload: &Workload) {
         assert!(stage.is_null(), "resident segment mode unexpectedly used the legacy fold-only path");
         return;
     }
-    if observed_mode() == "cpu" {
+    if observed.clone() == "cpu" {
         assert!(stage.is_null(), "CPU segment mode unexpectedly executed a Metal fold");
         return;
     }
-    assert_eq!(stage["name"], "segment_poseidon2_merkle_fold");
-    let segments = stage["segments"]
-        .as_array()
-        .expect("missing per-segment GPU evidence");
-    assert_eq!(segments.len() as u64, count);
-    let mut dispatches = 0;
-    for (index, segment) in segments.iter().enumerate() {
-        assert_eq!(segment["segment_index"], index as u64);
-        let done = positive(segment, "completed_dispatches");
-        assert!(done >= positive(segment, "fold_calls"));
-        dispatches += done;
-        assert_eq!(
-            positive(segment, "input_digests"),
-            2 * positive(segment, "output_digests")
-        );
-        let budget = positive(segment, "staging_limit_bytes");
-        assert!((4096..=16 * 1024 * 1024).contains(&budget));
-        assert_eq!(
-            segment["staging_limit_bytes"],
-            record["staging_limit_bytes"]
-        );
-        let requested: u64 = std::env::var("ZKMINER_RISC0_METAL_STAGING_BYTES")
-            .unwrap_or_else(|_| "524288".into())
-            .parse()
-            .unwrap();
-        assert_eq!(
-            budget, requested,
-            "worker did not use the requested staging budget"
-        );
-        assert!(positive(segment, "peak_staging_bytes") <= budget);
-    }
-    assert_eq!(stage["completed_dispatches"], dispatches);
+    panic!("fold-only Metal proof validation is retired");
 }
 fn ledger(evidence: &Path, value: &Value) {
     let mut file = OpenOptions::new()
@@ -867,7 +881,7 @@ fn verify(
         dir.display(),
         proof.cycles,
         proof.duration.as_secs_f64(),
-        observed_mode()
+        record["observed_mode"].as_str().unwrap()
     );
     external_verifier_ms
 }

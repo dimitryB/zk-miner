@@ -5,7 +5,15 @@ steps 1–4 before proceeding with Poseidon2 lift/join recursion Metal. Native
 wrapping, resource tuning, workload expansion and the resident RV32IM integration
 have since passed their recorded validation. On 2026-11-02 the owner authorized
 committing and publishing all completed local work to the personal forks.
-Current engine checkpoint: `cef3559d6805769c5b33fb4040abe548e670e268`.
+Original published engine checkpoint: `cef3559d6805769c5b33fb4040abe548e670e268`.
+The subsequent parent refresh and retirement checkpoint `dcbe9f4b9`
+passed fresh correctness, CPU differentials, 31 focused checks, both 10M warm
+usefulness medians, the 46M stretch and the five-pair whole-stack gate
+(3.645× median speedup; 5/5 faster pairs). See [current handoff](HANDOFF.md)
+and [paired evidence](evidence/rv32im-five-pair-validation.json). On 2026-11-03
+the owner authorized committing and publishing the review follow-up to both
+personal forks. The [review publication record](evidence/rv32im-review-publication.json)
+binds this miner commit to the unchanged validated engine and binaries.
 Historical commit IDs remain in measurement records; see the
 [authorship map](evidence/authorship-rewrite.json) and
 [publication record](evidence/rv32im-publication.json).

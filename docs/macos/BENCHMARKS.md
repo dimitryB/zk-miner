@@ -1,5 +1,37 @@
 # macOS proving measurements
 
+## Refreshed resident worker — warm gates completed 2026-11-03
+
+The predeclared five-pair arithmetic comparison passed: **3.645× median
+speedup**, with **5/5 faster pairs**. Metric: successful WorkerPool call
+plus the unchanged independent verifier. Each mode used one persistent worker,
+one excluded warm-up and five measured proofs; request order alternated. All
+twelve proofs and 36 negative checks passed. The fresh run had no admission
+waits or proof failures. Both cases used identical ELF, input, 10,003,116 guest
+cycles, ten po2-20 segments, and 18 Rayon / 18 Go threads.
+
+| Complete seconds, n=5 | Median | Minimum–maximum |
+|---|---:|---:|
+| Committed step-5 baseline | 427.192 | 420.829–432.260 |
+| Refreshed resident Metal | 117.192 | 117.177–118.000 |
+| Resident Metal hashing | 120.800 | 120.173–124.663 |
+
+Both usefulness medians are below 600 seconds. The separate 46M arithmetic
+observation verified in 484.740 seconds with 46 segments and a 15.401 GiB
+guarded group peak. Largest observed review peak across warmed proof groups is
+19.783 GiB. Default admission/reserve and Colima state were unchanged. The
+fresh comparison began after Brave closed; earlier partial timings are retained
+separately and are not pooled. This is a fixed-fixture, whole-stack comparison
+including parent changes, not isolated Metal attribution or statistical significance.
+
+See [paired JSON](evidence/rv32im-five-pair-validation.json),
+[all paired proof rows](evidence/rv32im-five-pair-proofs.csv),
+[warm hashing](evidence/rv32im-warm-hash-validation.json),
+[stretch](evidence/rv32im-current-tip-validation.json), and
+[current Metal profiles](evidence/rv32im-metal-current-profile.json).
+The [review publication record](evidence/rv32im-review-publication.json) binds
+these measurements to this miner commit and engine checkpoint `dcbe9f4b9`.
+
 ## Resident RV32IM worker validated 2026-11-02
 
 The candidate, uncommitted at measurement time, passed 28 complete proofs and 84 negative
@@ -19,7 +51,8 @@ For the twenty tiny requests, idle worker footprint ranged 3.859–3.948 GiB;
 first/last were 3.873/3.860 GiB. Their median request latency was 19.212 seconds,
 with range 19.133–26.185 seconds including the first request. This is stability
 evidence on tiny jobs, not a 10M warm median or controlled speedup comparison.
-The 46M Metal stretch and proposed whole-job 2× gate remain unmeasured.
+At this original checkpoint the 46M Metal stretch and whole-job 2× gate were
+unmeasured; the subsequent results are recorded above.
 
 See [integration report](RV32IM_METAL_WORKER.md),
 [validation JSON](evidence/rv32im-worker-validation.json) and

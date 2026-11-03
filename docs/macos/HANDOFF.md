@@ -1,6 +1,89 @@
 # macOS proving handoff
 
-## Current implementation direction
+## Review follow-up — validation complete
+
+The refreshed pipeline is validated at the clean engine checkpoint
+`dcbe9f4b9`, descending from parent `8007a9972`, merge `c6b67b15e`, and published
+documentation checkpoint `3747d12ff`. On 2026-11-03 the owner authorized committing
+and publishing this review follow-up to both personal forks' `codex/hemi-macos-metal`
+branches. The [review publication record](evidence/rv32im-review-publication.json)
+binds this miner commit and the unchanged engine checkpoint to the validated
+source inputs and binaries. Measurement-time records retain their original IDs.
+The owner's explicit parent-refresh request superseded the earlier instruction
+against merging a newer default branch merely to publish the port.
+
+The predeclared five-pair 10M arithmetic gate passed: **427.192 seconds
+baseline / 117.192 seconds resident Metal** median complete latency,
+**3.645×** speedup, with **5/5 faster pairs**. The required
+thresholds were 2× median speedup and four faster pairs. Both workers retained
+their identities for six proofs each; one warm-up per worker was excluded and
+request order alternated. All twelve proofs verified independently and passed
+36 negative checks. No fresh-campaign admission wait or proof failure occurred.
+See [paired gate](evidence/rv32im-five-pair-validation.json) and
+[all proof rows](evidence/rv32im-five-pair-proofs.csv).
+
+The comparison uses the exact archived committed step-5 worker. All 18 miner
+inputs and its engine delta match the committed checkpoints; see
+[baseline bridge](evidence/step5-baseline-bridge.json). It compares the whole
+refreshed stack, including upstream changes, rather than attributing the entire
+gain to Metal. The fixed fixture executes 10,003,116 guest cycles in ten segments
+at po2 20, with 18 Rayon / 18 Go threads. No statistical-significance claim is made.
+
+Both agreed usefulness fixtures now pass five-sample warm medians including
+independent verification: **117.192 seconds arithmetic** and
+**120.800 seconds hashing**, each below 600 seconds.
+See [warm hashing](evidence/rv32im-warm-hash-validation.json). The 46M stretch
+also passed: 46,003,116 guest cycles in 46 segments, **484.740 seconds** complete,
+**15.401 GiB** guarded group peak, and normal pressure throughout. This is a
+single stretch observation, not a five-sample median; see
+[current-tip correctness and stretch](evidence/rv32im-current-tip-validation.json).
+
+Current-tip validation totals **22 complete proofs and 66 negative checks**,
+including four current-candidate proofs from the interrupted attempt. The 31
+focused checks cover both worker unit suites, 18 Metal primitives, the recursion
+CPU differential and two padding tests. The merge itself had already passed
+eight proofs and 24 negative checks; their original artifacts are recorded in
+[engine refresh validation](evidence/engine-refresh-validation.json).
+
+Current arithmetic/hash 10M profiles put constraints at 62–64% of segment wall
+time, transforms near 20%, Merkle commitments near 4%, and CPU accumulation at
+7–8%. These supersede the CPU-only split for this backend. They measure synchronous
+phase wall time, not GPU occupancy. No further kernel optimization has started.
+See [Metal profiles](evidence/rv32im-metal-current-profile.json).
+
+The production fold-only path and staging probe are retired. Old build, forced
+mode and probe requests fail with migration guidance; the SDK's `metal-hybrid`
+compatibility feature also fails explicitly. Use `RISC0_SEGMENT_HAL=metal` and
+`RISC0_RECURSION_HAL=metal` with native wrapping. The old mode variable is
+unnecessary, and CPU remains the default. The worker runtime patch is archived
+in [review worker patch](evidence/rv32im-review-worker.patch).
+
+The default 16 GiB host reserve, 24 GiB initial resident-prover budget and 32 GiB
+worker/helper ceiling remain unchanged. Largest observed review proof-group
+peak is **19.783 GiB**, including warmed proofs; this excludes the other retained
+worker. The configuration is intended for a 64 GiB-class Mac or larger; validation
+used 128 GiB. See [hardware guidance](SETUP.md). Colima was left running throughout.
+
+Earlier attempts remain separate: the first refused admission before measured
+pairs; the next verified seven proofs and two pairs, then an incorrectly computed
+outer suite timeout interrupted the next CPU proof. The owner quit Brave during
+that attempt's recorded 132-second admission wait. The fresh campaign started
+after Brave closed and does not pool those partial measurements. The runner now
+budgets every comparison request, its unchanged proof watchdog and permitted
+admission waits. Five suite-budget checks pass. See
+[initial refusal](evidence/rv32im-paired-attempt.json) and
+[interrupted attempt](evidence/rv32im-paired-interrupted.json).
+
+Three separate draft PRs are open against `hemilabs/risc0:release-3.0`:
+[padding + tests](https://github.com/hemilabs/risc0/pull/30),
+[locked Circom install](https://github.com/hemilabs/risc0/pull/31), and
+[native helper lifetime flags](https://github.com/hemilabs/risc0/pull/32).
+Their correctly authored single commits are based directly on parent `8007a9972`.
+Isolated padding and native-helper lifecycle checks pass; the Dockerfile matches
+the previously validated ARM64 build. See [PR evidence](evidence/upstream-macos-prs.json)
+and [status snapshot](evidence/upstream-macos-pr-status.json).
+
+## Original resident-port publication (historical)
 
 Resident RV32IM worker integration and full-proof validation are complete and
 recorded in this miner publication checkpoint. The engine commit is

@@ -15,13 +15,14 @@ from worker_provenance import verify_build as verify_worker
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine',type=Path,required=True)
+    parser.add_argument('--worker-kind',choices=['native-recursion-metal','native-rv32im-metal'],default='native-recursion-metal')
     args=parser.parse_args()
-    worker=verify_worker('native-recursion-metal',args.engine)
+    worker=verify_worker(args.worker_kind,args.engine)
     verifier=verify_build('verifier')
     directory=ROOT/'target/macos/step6-assessment/profile-runs'/uuid.uuid4().hex
     directory.mkdir(parents=True)
     common=[sys.executable,str(ROOT/'scripts/macos/test-native-worker.py'),'--engine',str(args.engine),
-        '--worker-kind','native-recursion-metal','--recursion-hal','metal','--po2','20',
+        '--worker-kind',args.worker_kind,'--segment-hal','metal' if args.worker_kind=='native-rv32im-metal' else 'cpu','--recursion-hal','metal','--po2','20',
         '--repeat','1','--proof-only','--min-guest-cycles','10000000','--timeout-seconds','1800']
     cases=[('arithmetic-10m',['--workload','fibonacci','--iterations','1000000']),
            ('hash-10m',['--workload','sha256-chain','--iterations','2262'])]
@@ -45,7 +46,7 @@ def main():
             assert result['results']['verified_proofs']==1
             case.update(status='passed',run=str(run),result_sha256=sha(run/'result.json'))
             print(case['name'],'passed',flush=True)
-        assert verify_worker('native-recursion-metal',args.engine)==worker
+        assert verify_worker(args.worker_kind,args.engine)==worker
         assert verify_build('verifier')==verifier
         report['status']='completed'
     except BaseException as error:
