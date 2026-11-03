@@ -9042,8 +9042,10 @@ async fn process_job_lifecycle(
             } else {
                 None
             };
-            // Cloned for the progress callback below, which runs on the blocking thread.
+            // Cloned for the progress callback below, which runs on the blocking thread, and the
+            // runtime it hands the state update to.
             let state_for_prove_progress = state.clone();
+            let runtime_for_prove_progress = tokio::runtime::Handle::current();
             // Cloned per attempt: the closure below moves into `spawn_blocking`, and the retry loop
             // needs the list again next time round.
             let disabled_for_prove = disabled_slots.clone();
@@ -9064,52 +9066,53 @@ async fn process_job_lifecycle(
                 // work. Until now `on_progress` was unused and the status was set to
                 // `Proving { progress: 0.0 }` at CLAIM time, so a job waiting for a card was
                 // indistinguishable from one running on it — which is exactly the thing
-                // look-ahead queueing makes common. This runs on the blocking thread, so a
-                // blocking write is correct here; `try_write` and skip on contention, because
-                // a missed cosmetic transition must never stall a proof.
+                // look-ahead queueing makes common. This runs on the proving thread, which a
+                // label must never stall: see below for how the update gets there.
                 let started_state = state_for_prove_progress.clone();
                 let started_id = job_id;
                 // Exactly ONE Progress message is sent per proof (at start), so unlike a
-                // progress STREAM a single missed lock strands the job in `Queued` for its
-                // whole run with no second chance. Retry briefly rather than fire-and-forget.
-                // Deliberately NOT `blocking_write()`: we are on a blocking thread so it would
-                // be legal, but if any async holder of this lock is itself awaiting this proof
-                // we would deadlock a real proof to fix a cosmetic label. A bounded retry
-                // cannot deadlock and lands the transition in practice.
+                // progress STREAM a single missed update strands the job in `Queued`, on no
+                // card, for its whole run. So the update is handed to the runtime, which waits
+                // for the lock there: it cannot be lost, and this thread never blocks on it.
+                // Deliberately NOT `blocking_write()` here: if any async holder of this lock is
+                // itself awaiting this proof, that would deadlock a real proof over a label. It
+                // was a bounded `try_write` retry (40 x 5 ms) before, which a busy miner
+                // outlasted: an RTX 4070 proved risc0 jobs back to back while its dashboard row
+                // read "Idle", the jobs never attributed to it.
                 let started_pool = pool;
+                let started_runtime = runtime_for_prove_progress;
                 let mark_started = move |_p: f64, slot_key: &str| {
                     // Which physical card took this job. Resolved through the pool
                     // rather than any index, so the dashboard can attribute the job
                     // to the right GPU row on a mixed-vendor box.
                     let bus = started_pool.bus_id_for_slot(slot_key);
-                    for _ in 0..40 {
-                        if let Ok(mut st) = started_state.try_write() {
-                            if let Some(j) = st
-                                .active_jobs
-                                .iter_mut()
-                                .find(|j| j.info.job_id == started_id)
-                            {
-                                if matches!(j.status, zkminer_tui::state::MinerJobStatus::Queued) {
-                                    j.status = zkminer_tui::state::MinerJobStatus::Proving {
-                                        progress: 0.0,
-                                        elapsed_secs: 0,
-                                    };
-                                }
-                                // Overwrite UNCONDITIONALLY. `is_none()` made the attribution sticky, so after the GPU-OOM arm
-                                // rerouted a job to a bigger card the dashboard kept naming the card it had failed on — and this
-                                // is the only signal an operator has for which card a job is on. The callback carries the
-                                // authoritative slot key for the attempt that is actually starting.
-                                j.gpu_bus_id = bus.clone();
-                                // And WHICH SLOT. `prover_backend` was set only after a proof
-                                // succeeded, so while work was running the dashboard showed the card
-                                // but not the backend — and with two slots per card that is the one
-                                // thing an operator checking their routing needs to see.
-                                j.prover_backend = slot_key.to_string();
+                    let slot_key = slot_key.to_string();
+                    let started_state = started_state.clone();
+                    started_runtime.spawn(async move {
+                        let mut st = started_state.write().await;
+                        if let Some(j) = st
+                            .active_jobs
+                            .iter_mut()
+                            .find(|j| j.info.job_id == started_id)
+                        {
+                            if matches!(j.status, zkminer_tui::state::MinerJobStatus::Queued) {
+                                j.status = zkminer_tui::state::MinerJobStatus::Proving {
+                                    progress: 0.0,
+                                    elapsed_secs: 0,
+                                };
                             }
-                            return;
+                            // Overwrite UNCONDITIONALLY. `is_none()` made the attribution sticky, so after the GPU-OOM arm
+                            // rerouted a job to a bigger card the dashboard kept naming the card it had failed on — and this
+                            // is the only signal an operator has for which card a job is on. The callback carries the
+                            // authoritative slot key for the attempt that is actually starting.
+                            j.gpu_bus_id = bus;
+                            // And WHICH SLOT. `prover_backend` was set only after a proof
+                            // succeeded, so while work was running the dashboard showed the card
+                            // but not the backend — and with two slots per card that is the one
+                            // thing an operator checking their routing needs to see.
+                            j.prover_backend = slot_key;
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
+                    });
                 };
                 let size_on = |slot: &str| job_sizes.as_ref().and_then(|s| s.get(slot).copied());
                 let r = pool.prove_min_vram(
