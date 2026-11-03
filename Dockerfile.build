@@ -30,6 +30,13 @@ ARG CARGO_CHEF_VERSION=0.1.78
 ARG ROCM_VERSION=10.1
 ARG ROCM_PKG_VERSION=10.1.0-3
 ARG AMD_GPU_TARGETS=gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
+# The risc0 prover, compiled with ROCm 7.1, covers the same cards with three code objects instead of
+# five: gfx11-generic, which every RX 7000 (and RDNA3 APU) runs, and the two RX 9000 targets exactly,
+# because risc0's eval_check uses the gfx1200/gfx1201 matrix units (V_WMMA) and a gfx1201 register
+# bound only when compiled for those chips; its RX 7000 code uses nothing chip-specific (__GFX11__
+# only). Five exact targets with ROCm 7.1 took over five hours on a standard runner; generic code
+# objects run on ROCm 6.2 and later runtimes (checked on an RX 7900 XTX with 7.1 and 10.1).
+ARG RISC0_AMD_GPU_TARGETS=gfx11-generic,gfx1200,gfx1201
 # Intel: oneAPI DPC++ 2026.0, and the GPUs the risc0 kernels are compiled for ahead of time: Battlemage
 # (bmg_g21: Arc B580/B570; bmg_g31: B-series Pro) and Alchemist (acm_g10: Arc A770/A750/A580), plus
 # SPIR-V, which the shipped compiler builds on first use for any other Intel GPU (A380, A310). SP1's
@@ -489,10 +496,10 @@ WORKDIR /build
 # (crates/zkminer-prove-risc0/build.rs, staged below).
 FROM rocm71-toolchain AS cook-rocm
 ARG CARGO_CHEF_VERSION
-ARG AMD_GPU_TARGETS
+ARG RISC0_AMD_GPU_TARGETS
 ENV HIPCC=/opt/rocm/bin/hipcc \
     NVCC=off \
-    RISC0_HIP_ARCH=${AMD_GPU_TARGETS} \
+    RISC0_HIP_ARCH=${RISC0_AMD_GPU_TARGETS} \
     HIPCC_COMPILE_FLAGS_APPEND="-DNDEBUG -mprintf-kind=buffered"
 
 RUN cargo install cargo-chef --locked --version ${CARGO_CHEF_VERSION}
