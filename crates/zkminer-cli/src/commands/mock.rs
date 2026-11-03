@@ -61,6 +61,7 @@ fn seed_state(state: &mut zkminer_tui::state::MinerState) {
         unstake_amount: 0,
         unstake_request_time: 0,
         deposit_block: 1_000_000,
+        read_block: None,
     });
     state.prover_stats = Some(ProverStatistics {
         jobs_fulfilled: 0,

@@ -1016,6 +1016,7 @@ mod headroom_verdict_tests {
             unstake_amount: 0,
             unstake_request_time: 0,
             deposit_block: 0,
+            read_block: None,
         });
         state.collateral_headroom = headroom;
         state

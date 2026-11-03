@@ -21,6 +21,10 @@ pub struct StakeInfo {
     /// unix timestamp). Claim eligibility is `block.number > deposit_block`;
     /// there is no wall-clock staking-age gate.
     pub deposit_block: u64,
+    /// The block these figures were read at, when known (the refresh multicall reads its head in
+    /// the same call). `available_collateral` already nets out every lock mined by this block, which
+    /// is how the claim gate tells a reservation already counted on-chain from one that is not yet.
+    pub read_block: Option<u64>,
 }
 
 /// Prover performance statistics.
@@ -57,6 +61,8 @@ impl ChainClient {
             unstake_amount: stake.unstakeAmount,
             unstake_request_time: stake.unstakeRequestTime.to::<u64>(),
             deposit_block: stake.depositBlock.to::<u64>(),
+            // Two separate reads, at whatever blocks the node served them: unknown.
+            read_block: None,
         })
     }
 

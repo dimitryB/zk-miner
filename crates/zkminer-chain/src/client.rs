@@ -1550,6 +1550,8 @@ impl ChainClient {
                 unstake_amount: s.unstakeAmount,
                 unstake_request_time: s.unstakeRequestTime.to::<u64>(),
                 deposit_block: s.depositBlock.to::<u64>(),
+                // aggregate3 runs every sub-call at one block, the head read beside them.
+                read_block: head,
             }),
             _ => None,
         };

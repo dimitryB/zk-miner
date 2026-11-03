@@ -4181,6 +4181,55 @@ impl Drop for CardRelease {
     }
 }
 
+/// The block each held job's lock is known at (`ClaimReceipt::block`: its claim's receipt, or the
+/// read that found it already ours), for telling a reservation the on-chain collateral figure counts
+/// from one it does not yet. Pruned to the jobs held each brain pass.
+static LOCK_BLOCKS: std::sync::Mutex<Option<HashMap<B256, u64>>> = std::sync::Mutex::new(None);
+
+fn note_lock_block(job_id: B256, block: u64) {
+    LOCK_BLOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(job_id, block);
+}
+
+fn lock_blocks() -> HashMap<B256, u64> {
+    LOCK_BLOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
+/// Keep only the lock blocks of jobs still held.
+fn prune_lock_blocks(held: &HashMap<B256, u128>) {
+    if let Some(m) = LOCK_BLOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        m.retain(|j, _| held.contains_key(j));
+    }
+}
+
+/// Whether a stake read at `read_block` already counts a lock known at `lock_block`: only when both
+/// are known and the lock is no later. Anything else is treated as not yet counted.
+fn lock_counted_on_chain(read_block: Option<u64>, lock_block: Option<u64>) -> bool {
+    matches!((read_block, lock_block), (Some(read), Some(lock)) if lock <= read)
+}
+
+/// The reservations of held jobs whose locks a stake read at `read_block` does not count yet.
+fn uncounted_reservations(
+    held: &HashMap<B256, u128>,
+    lock_blocks: &HashMap<B256, u64>,
+    read_block: Option<u64>,
+) -> u128 {
+    held.iter()
+        .filter(|(jid, _)| !lock_counted_on_chain(read_block, lock_blocks.get(*jid).copied()))
+        .fold(0u128, |sum, (_, reserved)| sum.saturating_add(*reserved))
+}
+
 /// What each card has proved jobs at, learned from the jobs themselves: cycles over duration for
 /// each `(device id, backend)`, smoothed. Without a benchmark suite the planner had only the
 /// synthetic placeholder's 1.0 M cycles/s for every card, against 1.0-3.0 M measured on this
@@ -5062,6 +5111,7 @@ async fn miner_brain(
         // recovery pass's own reap, and the planner's model then never matched again.
         proved.retain(|j| in_flight.contains_key(j));
         inflight_work.retain(|j, _| in_flight.contains_key(j));
+        prune_lock_blocks(&in_flight);
         {
             // Advance the backlog model by real elapsed time, not by tick count: the brain
             // loop awaits `recover_claimed_jobs` inline and can stall for minutes, and a
@@ -6021,32 +6071,34 @@ async fn miner_brain(
             }
         }
 
-        // Available collateral for NEW claims this tick = on-chain available MINUS our
-        // in-flight reservations. This is deliberately FAIL-SAFE (it can under-count but
-        // never over-commit), for a subtle reason:
+        // Available collateral for NEW claims this tick = on-chain available MINUS the reservations
+        // of our claims that figure cannot include yet.
         //
-        // getAvailableCollateral already nets out EVERY on-chain lock — including a
-        // fresh claim once the 15s stake refresh reflects it, AND collateral stranded in
-        // past-deadline jobs that never sit in `in_flight`. Subtracting Σ(in_flight) on
-        // top double-counts a fresh claim's collateral during the ~15s window before the
-        // refresh catches up (and, because the collateral gate reserves at max_price, over-counts
-        // that window by the reservation surplus). That over-conservatism idles GPUs when
-        // collateral is genuinely tight — a THROUGHPUT cost, not a
-        // safety one.
+        // getAvailableCollateral nets out EVERY lock mined by the block it was read at: our claims
+        // that locked by then, and collateral stranded in past-deadline jobs that never sit in
+        // `in_flight`. Subtracting every in-flight reservation on top of it (the old form)
+        // double-counted each claim for as long as it was held, not only until the next refresh: on
+        // 743111, where a job locks at least 100 HEMI, a 1,000 HEMI stake held about five jobs, not
+        // ten. So a reservation is subtracted only while its lock is NOT counted on-chain: its claim
+        // is still pending, mined after the block the stake was read at, or of a block we do not know
+        // (`lock_counted_on_chain`). Each claim's lock block is the one its lifecycle proved the lock
+        // at (`note_lock_block`), and the stake's is the refresh multicall's head (`read_block`), so
+        // the two compare on one chain. Both unknown or out of order resolve to subtracting: the
+        // failure mode left is a claim the chain reverts (gas), never collateral we do not have.
         //
-        // An earlier attempt used `total − max(on_chain_locked, Σ in_flight)` to remove
-        // the double-count. But the two views cover DIFFERENT job sets: a stranded lock is
-        // in on_chain_locked but not in in_flight, so when the (max_price-inflated)
-        // reservations dominate, max() silently DROPS the stranded lock → over-counts
-        // available → over-commits → the on-chain tail sub-claim reverts (wasted gas). A
-        // correct tight formula needs per-job "is this reservation reflected on-chain yet"
-        // tracking (a stake-refresh generation stamped on each in_flight entry); until
-        // then we keep the conservative form, because idle GPUs beat on-chain reverts.
+        // (`total − max(on_chain_locked, Σ in_flight)`, tried earlier, was wrong for another reason:
+        // a stranded lock is in `on_chain_locked` but not in `in_flight`, so max() dropped it.)
+        let stake_read_block = stake_info.as_ref().and_then(|si| si.read_block);
+        let lock_blocks = lock_blocks();
         let mut available_collateral = stake_info
             .as_ref()
             .map(|si| si.available_collateral)
             .unwrap_or(0)
-            .saturating_sub(in_flight.values().copied().sum::<u128>())
+            .saturating_sub(uncounted_reservations(
+                &in_flight,
+                &lock_blocks,
+                stake_read_block,
+            ))
             // Watch-only locks nothing, so take off what its would-be claims would have locked.
             .saturating_sub(watch_locked_collateral());
 
@@ -8920,6 +8972,7 @@ async fn process_job_lifecycle(
             }
         }
     };
+    note_lock_block(job_id, lock_block);
 
     // 3. Read the view post-claim, PINNED at or after `lock_block` (a lagging replica would show the
     //    pre-claim state: lockDeadline 0, prover 0), to learn the authoritative effective deadline.
@@ -15129,6 +15182,45 @@ mod r2_sizing_tests {
             "7 at admission, 1 planned, 1 claimed without the planner, 1 not recommended, \
              1 planner skipped (model incomplete), 1 horizon full, 1 deadline infeasible, \
              1 no free card"
+        );
+    }
+
+    /// A reservation is subtracted from the on-chain available figure only while that figure cannot
+    /// count its lock: claim pending, locked after the read, or either block unknown.
+    #[test]
+    fn a_lock_already_counted_on_chain_is_not_subtracted_again() {
+        assert!(lock_counted_on_chain(Some(100), Some(100)));
+        assert!(lock_counted_on_chain(Some(100), Some(99)));
+        assert!(!lock_counted_on_chain(Some(100), Some(101)));
+        assert!(!lock_counted_on_chain(None, Some(1)));
+        assert!(!lock_counted_on_chain(Some(100), None));
+
+        const HEMI: u128 = 1_000_000_000_000_000_000;
+        let (a, b, c, d) = (
+            B256::repeat_byte(0xa1),
+            B256::repeat_byte(0xa2),
+            B256::repeat_byte(0xa3),
+            B256::repeat_byte(0xa4),
+        );
+        // a locked before the read, b after it, c's claim still pending, d recovered (0 reserved).
+        let held: HashMap<B256, u128> = [(a, 100 * HEMI), (b, 100 * HEMI), (c, 100 * HEMI), (d, 0)]
+            .into_iter()
+            .collect();
+        let locks: HashMap<B256, u64> = [(a, 90), (b, 110), (d, 50)].into_iter().collect();
+        assert_eq!(uncounted_reservations(&held, &locks, Some(100)), 200 * HEMI);
+        // A stake read of unknown block counts nothing as on-chain: every reservation subtracted,
+        // the old form exactly.
+        assert_eq!(uncounted_reservations(&held, &locks, None), 300 * HEMI);
+        // On a 1,000 HEMI stake with five held jobs locked by the read, the old form left 0 HEMI
+        // (500 counted on-chain, 500 again here); this leaves the 500 that are free.
+        let five: HashMap<B256, u128> = (0..5u8)
+            .map(|i| (B256::repeat_byte(i), 100 * HEMI))
+            .collect();
+        let locked: HashMap<B256, u64> = five.keys().map(|j| (*j, 10)).collect();
+        let on_chain_available = 500 * HEMI;
+        assert_eq!(
+            on_chain_available - uncounted_reservations(&five, &locked, Some(20)),
+            500 * HEMI
         );
     }
 
