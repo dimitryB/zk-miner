@@ -63,6 +63,8 @@
 //!   (for a host whose capacity or memory gates refuse every claim).
 //! - `ZKMINER_LOCALNET_MINE=1`, `ZKMINER_LOCALNET_MINE_TIMEOUT_SECS` (default 1800): the mining
 //!   test. It honours `CUDA_VISIBLE_DEVICES` (see `mines_the_claimable_jobs`).
+//! - `ZKMINER_LOCALNET_FIB_N` (default 10): the fibonacci jobs' input. A larger one makes each proof
+//!   last long enough for several cards to prove at once.
 #![cfg(unix)]
 
 use alloy::primitives::aliases::{U40, U96};
@@ -95,8 +97,17 @@ use zkminer_contracts::bindings::{
 const FORK_BLOCK: u64 = 7_116_900;
 const DEFAULT_FORK_URL: &str = "https://testnet.rpc.hemi.network/rpc";
 const HEMI: u128 = 1_000_000_000_000_000_000;
-/// The fibonacci guest's jobs prove fibonacci(FIB_N).
+/// The fibonacci guest's jobs prove fibonacci(FIB_N), unless `ZKMINER_LOCALNET_FIB_N` says otherwise
+/// (`fib_n`).
 const FIB_N: u32 = 10;
+
+/// The fibonacci jobs' input: `ZKMINER_LOCALNET_FIB_N`, or `FIB_N`.
+fn fib_n() -> u32 {
+    std::env::var("ZKMINER_LOCALNET_FIB_N")
+        .ok()
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(FIB_N)
+}
 /// The contract suite's RISC Zero Groth16 receipt (zkmarket c8333aa,
 /// `test/fixtures/RiscZeroTestReceipt.sol`): risc0 v3.0 Groth16, accepted by the deployed
 /// `RiscZeroGroth16Verifier` (SELECTOR 0x73c457ba) for this image id and journal.
@@ -352,8 +363,8 @@ impl Program {
             id,
             proof_system: risc_zero_groth16_v1_id(),
             elf,
-            input: FIB_N.to_le_bytes().to_vec(),
-            journal: fib(FIB_N).to_le_bytes().to_vec(),
+            input: fib_n().to_le_bytes().to_vec(),
+            journal: fib(fib_n()).to_le_bytes().to_vec(),
         }
     }
 
@@ -379,8 +390,8 @@ impl Program {
             id,
             proof_system: sp1_groth16_v1_id(),
             elf,
-            input: FIB_N.to_le_bytes().to_vec(),
-            journal: fib(FIB_N).to_le_bytes().to_vec(),
+            input: fib_n().to_le_bytes().to_vec(),
+            journal: fib(fib_n()).to_le_bytes().to_vec(),
         }
     }
 
@@ -515,11 +526,13 @@ fn start_anvil(dir: &Path) -> Anvil {
         .args(["--block-time", "1"])
         // Every setup transaction is sent from an address anvil signs for.
         .arg("--auto-impersonate")
+        // Generous, so a burst of fork reads rides out the upstream RPC's rate limit (HTTP 429, 300
+        // requests a window on the Hemi testnet RPC) instead of failing the transaction behind it.
         .args([
             "--retries",
-            "10",
+            "60",
             "--fork-retry-backoff",
-            "1000",
+            "2000",
             "--timeout",
             "60000",
         ])
@@ -672,8 +685,8 @@ struct World {
     program: Program,
     /// More programs, each submitted with every case as `program` is (`World::with_programs`).
     extra: Vec<Program>,
-    /// How many jobs of each case and program.
-    copies: usize,
+    /// How many jobs of each case each program gets: `program`'s first, then each of `extra`'s.
+    copies: Vec<usize>,
     /// The cases this run submits.
     cases: Vec<Case>,
     /// The jobs submitted so far.
@@ -687,7 +700,7 @@ struct World {
 
 impl World {
     async fn new(dir: &Path, program: Program, cases: &[Case], clock: Clock) -> Self {
-        Self::with_programs(dir, vec![program], cases, clock, 1).await
+        Self::with_programs(dir, vec![program], cases, clock, vec![1]).await
     }
 
     /// The program of a job.
@@ -698,13 +711,14 @@ impl World {
         }
     }
 
-    /// A world whose every program gets `copies` jobs of each case.
+    /// A world whose programs get `copies[i]` jobs of each case, program `i` in order (the last
+    /// count repeats for any program past the end).
     async fn with_programs(
         dir: &Path,
         programs: Vec<Program>,
         cases: &[Case],
         clock: Clock,
-        copies: usize,
+        copies: Vec<usize>,
     ) -> Self {
         let mut programs = programs.into_iter();
         let program = programs.next().expect("a world has a program");
@@ -765,6 +779,10 @@ impl World {
         let (elf_url, elf_hits) = serve_file(program.elf.clone());
         let extra_urls: Vec<String> = extra.iter().map(|p| serve_file(p.elf.clone()).0).collect();
         let n_programs = 1 + extra.len();
+        let last = *copies.last().expect("a job count per program");
+        let copies: Vec<usize> = (0..n_programs)
+            .map(|i| copies.get(i).copied().unwrap_or(last))
+            .collect();
 
         let submitter = Address::from_word(keccak256(b"zkminer localnet submitter"));
         let prover = PrivateKeySigner::random();
@@ -788,7 +806,7 @@ impl World {
             .expect("read the registry's registrationFee()")
             * U256::from(registrations);
         let deposits = U256::from(
-            cases.iter().map(|c| c.deposit()).sum::<u128>() * (n_programs * copies) as u128,
+            cases.iter().map(|c| c.deposit()).sum::<u128>() * copies.iter().sum::<usize>() as u128,
         );
 
         let token = ITestnetToken::new(DEPLOYMENT.token, &provider);
@@ -899,7 +917,7 @@ impl World {
         before.sort_by_key(|&c| c != Case::Full);
         // The first program's first Full job first (see above), then the rest in order.
         for program in 0..n_programs {
-            for copy in 0..copies {
+            for copy in 0..world.copies[program] {
                 for &case in &before {
                     world.submit_job(case, program, copy).await;
                 }
@@ -1042,21 +1060,43 @@ impl World {
 
     /// Submit a job of `case` for the world's `program`-th program, the `copy`-th of its kind.
     async fn submit_job(&mut self, case: Case, program: usize, copy: usize) {
+        if let Err(e) = self.try_submit_job(case, program, copy).await {
+            panic!("submit the {case:?} job: {e}");
+        }
+    }
+
+    /// As `submit_job`, returning a failure instead of panicking on it, for a caller that can wait
+    /// and try again: the fork's upstream RPC rate-limits anvil (HTTP 429) under a burst of submits,
+    /// each of which reads storage slots anvil has not fetched yet.
+    async fn try_submit_job(
+        &mut self,
+        case: Case,
+        program: usize,
+        copy: usize,
+    ) -> Result<(), String> {
         let core = IHemiProveCore::new(DEPLOYMENT.router, &self.provider);
         let p = match program {
             0 => &self.program,
             i => &self.extra[i - 1],
         };
-        let receipt = mined!(
-            core.submitJob(
+        let pending = core
+            .submitJob(
                 descriptor(case, p, self.prover.address(), copy),
                 case.auction(),
                 no_cycles(),
                 no_bidding(),
             )
-            .from(self.submitter),
-            format!("submit the {case:?} job")
-        );
+            .from(self.submitter)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let receipt = tokio::time::timeout(SETUP_TX_TIMEOUT, pending.get_receipt())
+            .await
+            .map_err(|_| format!("not mined within {SETUP_TX_TIMEOUT:?}"))?
+            .map_err(|e| format!("no receipt: {e}"))?;
+        if !receipt.status() {
+            return Err(format!("reverted ({})", receipt.transaction_hash));
+        }
         let id = receipt
             .inner
             .logs()
@@ -1073,6 +1113,24 @@ impl World {
             id,
             block,
         });
+        Ok(())
+    }
+
+    /// Mint the submitter `amount` more tHEMI for job deposits, and let the router take any amount.
+    async fn fund_deposits(&self, amount: U256) {
+        let owner = owner_of(&self.provider, DEPLOYMENT.token).await;
+        mined!(
+            ITestnetToken::new(DEPLOYMENT.token, &self.provider)
+                .mint(self.submitter, amount)
+                .from(owner),
+            "mint tHEMI for more job deposits"
+        );
+        mined!(
+            IERC20::new(DEPLOYMENT.token, &self.provider)
+                .approve(DEPLOYMENT.router, U256::MAX)
+                .from(self.submitter),
+            "approve the router for any deposit"
+        );
     }
 
     /// Where the miner's backfill starts: the block of the Case::Full job's submit, the first job
@@ -1090,6 +1148,11 @@ impl World {
         if !wait_for_line(miner, "Job monitor started", Duration::from_secs(120)).await {
             miner.fail("the miner's job monitor did not start within 120 s");
         }
+        self.submit_held_back().await;
+    }
+
+    /// Submit the jobs held back from setup (the cases not `before_start`), every copy of each.
+    async fn submit_held_back(&mut self) {
         let after: Vec<Case> = self
             .cases
             .iter()
@@ -1097,7 +1160,7 @@ impl World {
             .filter(|c| !c.before_start())
             .collect();
         for program in 0..=self.extra.len() {
-            for copy in 0..self.copies {
+            for copy in 0..self.copies[program] {
                 for &case in &after {
                     self.submit_job(case, program, copy).await;
                 }
@@ -1512,6 +1575,47 @@ impl Miner {
         args: &[&str],
         env: &[(&str, String)],
     ) -> Self {
+        let mut cmd = Self::command(dir, config, global, "run", args, env);
+        die_with_parent(&mut cmd);
+        let mut child = cmd.spawn().expect("start zkminer");
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let echo = env_flag("ZKMINER_LOCALNET_ECHO");
+        let log = Arc::new(Mutex::new(
+            std::fs::File::create(dir.join("zkminer.log")).expect("create zkminer.log"),
+        ));
+        for stream in [
+            Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
+            Box::new(child.stderr.take().unwrap()),
+        ] {
+            let (lines, log) = (lines.clone(), log.clone());
+            std::thread::spawn(move || {
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    let line = strip_ansi(&line);
+                    if echo {
+                        eprintln!("zkminer| {line}");
+                    }
+                    let _ = writeln!(log.lock().unwrap(), "{line}");
+                    lines.lock().unwrap().push(line);
+                }
+            });
+        }
+        Miner {
+            child,
+            lines,
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    /// `zkminer [global] --config <config> <sub> [args]` from a link in `dir`, as `start` describes:
+    /// `dir` is its HOME, the environment is cleaned and `env` set on top, and its output is piped.
+    fn command(
+        dir: &Path,
+        config: &Path,
+        global: &[&str],
+        sub: &str,
+        args: &[&str],
+        env: &[(&str, String)],
+    ) -> Command {
         let exe = dir.join("zkminer");
         let _ = std::fs::remove_file(&exe);
         if std::fs::hard_link(env!("CARGO_BIN_EXE_zkminer"), &exe).is_err() {
@@ -1521,7 +1625,7 @@ impl Miner {
         cmd.args(global)
             .arg("--config")
             .arg(config)
-            .arg("run")
+            .arg(sub)
             .args(args);
         for (k, _) in std::env::vars_os() {
             let name = k.to_string_lossy();
@@ -1557,34 +1661,7 @@ impl Miner {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        die_with_parent(&mut cmd);
-        let mut child = cmd.spawn().expect("start zkminer");
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let echo = env_flag("ZKMINER_LOCALNET_ECHO");
-        let log = Arc::new(Mutex::new(
-            std::fs::File::create(dir.join("zkminer.log")).expect("create zkminer.log"),
-        ));
-        for stream in [
-            Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
-            Box::new(child.stderr.take().unwrap()),
-        ] {
-            let (lines, log) = (lines.clone(), log.clone());
-            std::thread::spawn(move || {
-                for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                    let line = strip_ansi(&line);
-                    if echo {
-                        eprintln!("zkminer| {line}");
-                    }
-                    let _ = writeln!(log.lock().unwrap(), "{line}");
-                    lines.lock().unwrap().push(line);
-                }
-            });
-        }
-        Miner {
-            child,
-            lines,
-            dir: dir.to_path_buf(),
-        }
+        cmd
     }
 
     fn lines(&self) -> Vec<String> {
@@ -2195,9 +2272,17 @@ async fn mines_the_claimable_jobs() {
 ///
 /// Needs `ZKMINER_LOCALNET_MINE_ALL=1`, `ZKMINER_LOCALNET_WORKERS` (the risc0 workers, `:`-separated,
 /// the first exporting the risc0 guest) and `ZKMINER_LOCALNET_SP1_WORKER` (with its servers beside it).
-/// Optional: `ZKMINER_LOCALNET_COPIES` (default 3), `ZKMINER_LOCALNET_RISC0_PO2` (`gpu1=19,...`), and
-/// `SP1_GROTH16_CIRCUIT_PATH`, `XDG_CACHE_HOME`, `ZKMINER_MIN_AVAILABLE_VRAM_MB` and
+/// Optional: `ZKMINER_LOCALNET_COPIES` (default 3) and `ZKMINER_LOCALNET_SP1_COPIES` (default the
+/// same): how many jobs of each case the risc0 and the SP1 program get. `ZKMINER_LOCALNET_RISC0_PO2`
+/// (`gpu1=19,...`). `SP1_GROTH16_CIRCUIT_PATH`, `XDG_CACHE_HOME`, `ZKMINER_MIN_AVAILABLE_VRAM_MB` and
 /// `ZKMINER_GPU_NAME_FILTER`, passed to the miner.
+///
+/// For a busy run (see `occupancy`): `ZKMINER_LOCALNET_QUEUE_HORIZON_SECS` turns on the miner's
+/// look-ahead (`prover.queue_horizon_secs`), which claims each card's next job while its current one
+/// proves, and which acts only on a measured benchmark suite: `ZKMINER_LOCALNET_BENCHMARKS` names one
+/// to give the miner, made by `zkminer benchmark --calibrate` in this run if the file does not exist.
+/// `ZKMINER_LOCALNET_MIN_OCCUPANCY` (a percentage) fails the run if a card proved for less of the
+/// time work was waiting.
 #[tokio::test]
 #[ignore = "needs every GPU worker and SP1 server"]
 async fn mines_on_every_gpu() {
@@ -2213,50 +2298,13 @@ async fn mines_on_every_gpu() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(3_600),
     );
-    let workers: Vec<PathBuf> = std::env::var("ZKMINER_LOCALNET_WORKERS")
-        .expect("ZKMINER_LOCALNET_WORKERS: the risc0 workers, `:`-separated")
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .collect();
-    let sp1_worker = PathBuf::from(
-        std::env::var("ZKMINER_LOCALNET_SP1_WORKER").expect("ZKMINER_LOCALNET_SP1_WORKER"),
-    );
-    for w in workers.iter().chain(std::iter::once(&sp1_worker)) {
-        assert!(w.is_file(), "no worker at {}", w.display());
-    }
-    let copies = std::env::var("ZKMINER_LOCALNET_COPIES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
-    let po2: Vec<(String, u8)> = std::env::var("ZKMINER_LOCALNET_RISC0_PO2")
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|kv| {
-            let (k, v) = kv.split_once('=')?;
-            Some((k.trim().to_string(), v.trim().parse().ok()?))
-        })
-        .collect();
-    let dir = RunDir::new("mine-all");
-    let risc0 = Program::fibonacci(&workers[0], &dir.0);
-    let sp1 = Program::sp1_fibonacci(&sp1_worker, &dir.0);
-    let cases = [Case::Full, Case::Fields, Case::NoneForUs];
-    let mut world =
-        World::with_programs(&dir.0, vec![risc0, sp1], &cases, Clock::Wall, copies).await;
-    let mut all = workers.clone();
-    all.push(sp1_worker);
-    let config = world.write_config_for(&dir.0, &all, &po2);
-    let env: Vec<(&'static str, String)> = [
-        "SP1_GROTH16_CIRCUIT_PATH",
-        "XDG_CACHE_HOME",
-        "ZKMINER_MIN_AVAILABLE_VRAM_MB",
-        // To steer jobs onto particular NVIDIA cards: one SP1 proof at a time fits this host's RAM
-        // (each is charged ~24 GiB), so it lands on the same card every time unless others are hidden.
-        "ZKMINER_GPU_NAME_FILTER",
-    ]
-    .into_iter()
-    .filter_map(|k| std::env::var(k).ok().map(|v| (k, v)))
-    .collect();
+    let EveryGpu {
+        dir,
+        mut world,
+        config,
+        env,
+        ..
+    } = every_gpu("mine-all").await;
 
     let nonce_before = world.prover_nonce().await;
     let mut miner = start_mining(&world, &dir, &config, env, false);
@@ -2283,6 +2331,36 @@ async fn mines_on_every_gpu() {
         }
     }
     eprintln!("localnet: proofs by slot: {by_slot:?}");
+    match occupancy(&proof_spans(&lines)) {
+        Some(o) => {
+            eprintln!(
+                "localnet: occupancy over the {:.0} s that work was waiting (first proof start to \
+                 last proof start): {}; all {} cards proving at once for {:.0}% of it",
+                o.window,
+                o.cards
+                    .iter()
+                    .map(|(card, share)| format!("{card} {:.0}%", share * 100.0))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                o.cards.len(),
+                o.all_busy * 100.0,
+            );
+            if let Some(min) = std::env::var("ZKMINER_LOCALNET_MIN_OCCUPANCY")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+            {
+                for (card, share) in &o.cards {
+                    if share * 100.0 < min {
+                        failures.push(format!(
+                            "{card} proved for {:.0}% of the time work was waiting, under {min}%",
+                            share * 100.0
+                        ));
+                    }
+                }
+            }
+        }
+        None => eprintln!("localnet: occupancy: too few proofs to measure"),
+    }
     for slot in std::env::var("ZKMINER_LOCALNET_EXPECT_SLOTS")
         .unwrap_or_default()
         .split(',')
@@ -2295,6 +2373,419 @@ async fn mines_on_every_gpu() {
     }
     report(&world, &dir, &miner, &failures).await;
     dir.finish();
+}
+
+/// A localnet for a miner someone runs BY HAND, to watch it work in its TUI: the every-GPU world
+/// (`every_gpu`, with all its variables), a launcher for the miner, and a job queue kept topped up
+/// until `<run dir>/stop` exists or `ZKMINER_LOCALNET_TUI_SECS` (default 7200) pass. The test does
+/// not start a miner; run `<run dir>/run-tui.sh` in a terminal of its own.
+///
+/// Needs `ZKMINER_LOCALNET_TUI=1`. The queue: a round of `ZKMINER_LOCALNET_TUI_ROUND` copies of each
+/// case (`risc0,sp1`, default `4,1`) is submitted whenever fewer than `ZKMINER_LOCALNET_TUI_QUEUE`
+/// (default 16) jobs are unfulfilled. At the end it reports what was fulfilled and, from the miner's
+/// log (`<run dir>/.zkminer/logs`), each card's occupancy.
+#[tokio::test]
+#[ignore = "serves a localnet to a miner run by hand"]
+async fn serves_a_tui_miner() {
+    if !env_flag("ZKMINER_LOCALNET_TUI") {
+        eprintln!("localnet: SKIPPED the TUI localnet; set ZKMINER_LOCALNET_TUI=1 to serve one");
+        return;
+    }
+    let EveryGpu {
+        dir,
+        mut world,
+        config,
+        mut env,
+        copies,
+    } = every_gpu("tui").await;
+    // No monitor to wait for: the miner's backfill finds these as it does the jobs set up before it.
+    world.submit_held_back().await;
+    env.push((
+        "ZKMINER_PRIVATE_KEY",
+        format!("{}", world.prover.to_bytes()),
+    ));
+    let launcher = write_launcher(&dir.0, &config, &env);
+    let stop = dir.0.join("stop");
+    let secs = std::env::var("ZKMINER_LOCALNET_TUI_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7_200);
+    let queue: usize = std::env::var("ZKMINER_LOCALNET_TUI_QUEUE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    let round: Vec<usize> = std::env::var("ZKMINER_LOCALNET_TUI_ROUND")
+        .unwrap_or_else(|_| "4,1".into())
+        .split(',')
+        .map(|n| {
+            n.trim()
+                .parse()
+                .expect("ZKMINER_LOCALNET_TUI_ROUND is `risc0,sp1` copies")
+        })
+        .collect();
+    assert_eq!(
+        round.len(),
+        2,
+        "ZKMINER_LOCALNET_TUI_ROUND is `risc0,sp1` copies"
+    );
+    eprintln!(
+        "localnet: READY. {} jobs are open on the fork at {}.\n\
+         localnet: run the miner in a terminal of its own:  bash {}\n\
+         localnet: the queue is kept at {queue}+ open jobs for {secs} s; stop early with:  touch {}",
+        world.jobs.len(),
+        world.rpc_url,
+        launcher.display(),
+        stop.display()
+    );
+    let cases = world.cases.clone();
+    let per_round =
+        U256::from(cases.iter().map(|c| c.deposit()).sum::<u128>() * (round[0] + round[1]) as u128);
+    // Every round's deposits up front: one mint, rather than more fork reads in each round.
+    world.fund_deposits(per_round * U256::from(500u64)).await;
+    let mut next = copies;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(secs) && !stop.exists() {
+        let fulfilled: std::collections::HashSet<B256> = world
+            .jobs_with::<IHemiProveFulfill::JobFulfilled>()
+            .await
+            .into_iter()
+            .collect();
+        let open = world
+            .jobs
+            .iter()
+            .filter(|j| j.case.claimable() && !fulfilled.contains(&j.id))
+            .count();
+        if open < queue {
+            // One job at a time, a second apart, and a refused one tried again after a pause: a
+            // burst of submits trips the fork's upstream rate limit (see `try_submit_job`).
+            for program in 0..2 {
+                for _ in 0..round[program] {
+                    for &case in &cases {
+                        while let Err(e) = world.try_submit_job(case, program, next[program]).await
+                        {
+                            eprintln!("localnet: submit failed, trying again in 30 s: {e}");
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    next[program] += 1;
+                }
+            }
+            eprintln!(
+                "localnet: {open} open, {} fulfilled; submitted another round ({} jobs in all)",
+                fulfilled.len(),
+                world.jobs.len()
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    let fulfilled = world
+        .jobs_with::<IHemiProveFulfill::JobFulfilled>()
+        .await
+        .len();
+    eprintln!(
+        "localnet: done: {fulfilled} of {} jobs fulfilled",
+        world.jobs.len()
+    );
+    let mut lines = Vec::new();
+    for log in std::fs::read_dir(dir.0.join(".zkminer").join("logs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if let Ok(text) = std::fs::read_to_string(log.path()) {
+            lines.extend(text.lines().map(strip_ansi));
+        }
+    }
+    if let Some(o) = occupancy(&proof_spans(&lines)) {
+        eprintln!(
+            "localnet: occupancy over the {:.0} s that work was waiting: {}; all {} cards at once \
+             {:.0}% of it",
+            o.window,
+            o.cards
+                .iter()
+                .map(|(card, share)| format!("{card} {:.0}%", share * 100.0))
+                .collect::<Vec<_>>()
+                .join(", "),
+            o.cards.len(),
+            o.all_busy * 100.0,
+        );
+    }
+    dir.finish();
+}
+
+/// `<dir>/run-tui.sh`: the miner `Miner::start` would run, as a script someone runs in a terminal of
+/// their own, so it gets the TUI. The same cleaned environment and HOME, the same config.
+fn write_launcher(dir: &Path, config: &Path, env: &[(&str, String)]) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let cmd = Miner::command(dir, config, &[], "run", &[], env);
+    let quote = |s: &std::ffi::OsStr| format!("'{}'", s.to_string_lossy().replace('\'', r"'\''"));
+    let mut script = format!(
+        "#!/bin/bash\n\
+         # zkminer with its TUI against the localnet run in this directory, written by the localnet\n\
+         # test. Its HOME is this directory (config, journal, logs in .zkminer/), and the key below\n\
+         # is the run's throwaway prover on the anvil fork. Quit the TUI to stop it.\n\
+         set -e\n\
+         cd {}\n\
+         for v in $(compgen -e | grep -E '^(ZKMINER_|MOCK_|BONSAI_)'); do unset \"$v\"; done\n",
+        quote(dir.as_os_str())
+    );
+    for (k, v) in cmd.get_envs() {
+        let k = k.to_string_lossy();
+        match v {
+            Some(v) => script += &format!("export {k}={}\n", quote(v)),
+            None => script += &format!("unset {k}\n"),
+        }
+    }
+    script += &format!("exec {}", quote(cmd.get_program()));
+    for arg in cmd.get_args() {
+        script += &format!(" {}", quote(arg));
+    }
+    script.push('\n');
+    let path = dir.join("run-tui.sh");
+    std::fs::write(&path, script).expect("write the TUI launcher");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+        .expect("make the TUI launcher executable");
+    path
+}
+
+/// What the every-GPU tests share: the run directory, the world with every program's held-back jobs
+/// still to submit, the miner's config naming every worker, the environment passed to the miner,
+/// and how many jobs of each case the risc0 and the SP1 program got. See `mines_on_every_gpu` for
+/// the variables it reads.
+struct EveryGpu {
+    dir: RunDir,
+    world: World,
+    config: PathBuf,
+    env: Vec<(&'static str, String)>,
+    copies: [usize; 2],
+}
+
+async fn every_gpu(name: &str) -> EveryGpu {
+    let workers: Vec<PathBuf> = std::env::var("ZKMINER_LOCALNET_WORKERS")
+        .expect("ZKMINER_LOCALNET_WORKERS: the risc0 workers, `:`-separated")
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let sp1_worker = PathBuf::from(
+        std::env::var("ZKMINER_LOCALNET_SP1_WORKER").expect("ZKMINER_LOCALNET_SP1_WORKER"),
+    );
+    for w in workers.iter().chain(std::iter::once(&sp1_worker)) {
+        assert!(w.is_file(), "no worker at {}", w.display());
+    }
+    let copies = std::env::var("ZKMINER_LOCALNET_COPIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let sp1_copies = std::env::var("ZKMINER_LOCALNET_SP1_COPIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(copies);
+    let po2: Vec<(String, u8)> = std::env::var("ZKMINER_LOCALNET_RISC0_PO2")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().parse().ok()?))
+        })
+        .collect();
+    let dir = RunDir::new(name);
+    let risc0 = Program::fibonacci(&workers[0], &dir.0);
+    let sp1 = Program::sp1_fibonacci(&sp1_worker, &dir.0);
+    let cases = [Case::Full, Case::Fields, Case::NoneForUs];
+    let world = World::with_programs(
+        &dir.0,
+        vec![risc0, sp1],
+        &cases,
+        Clock::Wall,
+        vec![copies, sp1_copies],
+    )
+    .await;
+    let mut all = workers.clone();
+    all.push(sp1_worker);
+    let config = world.write_config_for(&dir.0, &all, &po2);
+    if let Some(horizon) = std::env::var("ZKMINER_LOCALNET_QUEUE_HORIZON_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        let mut c = ZkMinerConfig::load(Some(&config)).expect("read the miner config back");
+        c.prover.queue_horizon_secs = horizon;
+        c.save(Some(&config)).expect("write the miner config");
+    }
+    let env: Vec<(&'static str, String)> = [
+        // Named, not merely inherited, so the TUI launcher carries it too: CUDA numbers cards by
+        // speed without it, which is not `nvidia-smi`'s order.
+        "CUDA_DEVICE_ORDER",
+        "SP1_GROTH16_CIRCUIT_PATH",
+        "XDG_CACHE_HOME",
+        "ZKMINER_MIN_AVAILABLE_VRAM_MB",
+        // To steer jobs onto particular NVIDIA cards: one SP1 proof at a time fits this host's
+        // `/dev/shm` (each may stage 24 GiB), so it lands on the same card unless others are hidden.
+        "ZKMINER_GPU_NAME_FILTER",
+    ]
+    .into_iter()
+    .filter_map(|k| std::env::var(k).ok().map(|v| (k, v)))
+    .collect();
+    if let Ok(cache) = std::env::var("ZKMINER_LOCALNET_BENCHMARKS") {
+        seed_benchmarks(&dir.0, &config, &env, Path::new(&cache));
+    }
+    EveryGpu {
+        dir,
+        world,
+        config,
+        env,
+        copies: [copies, sp1_copies],
+    }
+}
+
+/// Give the miner whose HOME is `dir` a measured benchmark suite: `cache` when that file exists,
+/// otherwise one `zkminer benchmark --calibrate` makes here first (a plain benchmark saves nothing),
+/// saved to `cache` for later runs. The suite is
+/// fingerprinted on this host's CPU, RAM and GPUs, not on paths, so one serves every run on the host
+/// until a card or driver changes (and the miner discards it then).
+fn seed_benchmarks(dir: &Path, config: &Path, env: &[(&str, String)], cache: &Path) {
+    let suite = dir.join(".zkminer").join("benchmarks.json");
+    std::fs::create_dir_all(suite.parent().unwrap()).expect("create the miner's ~/.zkminer");
+    if cache.is_file() {
+        std::fs::copy(cache, &suite).expect("copy the benchmark suite");
+        eprintln!("localnet: benchmark suite from {}", cache.display());
+        return;
+    }
+    eprintln!(
+        "localnet: no benchmark suite at {}; running zkminer benchmark --calibrate (every worker, \
+         every card)",
+        cache.display()
+    );
+    let mut cmd = Miner::command(dir, config, &[], "benchmark", &["--calibrate"], env);
+    die_with_parent(&mut cmd);
+    let out = cmd.output().expect("run zkminer benchmark");
+    let log = dir.join("benchmark.log");
+    let _ = std::fs::write(&log, [&out.stdout[..], &out.stderr[..]].concat());
+    assert!(
+        out.status.success() && suite.is_file(),
+        "zkminer benchmark failed or saved no suite; see {}",
+        log.display()
+    );
+    std::fs::copy(&suite, cache).expect("save the benchmark suite for later runs");
+}
+
+/// One proof the miner logged as `<time> INFO Proof complete on <slot> [<card>]: <n> cycles in <t>s`:
+/// its slot, its card (`cuda:0`), and when it ran, in seconds, timed back from the line by `t`.
+struct ProofSpan {
+    card: String,
+    start: f64,
+    end: f64,
+}
+
+fn proof_spans(lines: &[String]) -> Vec<ProofSpan> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let (stamp, rest) = line.split_once(' ')?;
+            let (slot, rest) = rest.split_once("Proof complete on ")?.1.split_once(' ')?;
+            let secs: f64 = rest
+                .rsplit_once(" in ")?
+                .1
+                .trim()
+                .strip_suffix('s')?
+                .parse()
+                .ok()?;
+            let end = chrono::DateTime::parse_from_rfc3339(stamp)
+                .ok()?
+                .timestamp_micros() as f64
+                / 1e6;
+            Some(ProofSpan {
+                card: slot.split_once(':')?.1.to_string(),
+                start: end - secs,
+                end,
+            })
+        })
+        .collect()
+}
+
+/// How busy each card was while work was waiting.
+struct Occupancy {
+    /// The window measured, in seconds.
+    window: f64,
+    /// Each card and the share of the window it spent proving (any backend).
+    cards: Vec<(String, f64)>,
+    /// The share of the window every card spent proving at once.
+    all_busy: f64,
+}
+
+/// Occupancy over the window from the first proof's start to the LAST proof's start. Until then a
+/// job was waiting to start, so a card standing idle was the miner's doing (a claim or fulfil it did
+/// not overlap, a worker respawn, a wait); after it the queue is empty and cards go idle by design.
+/// Proof time is what the worker reports, so a respawn, a warm-up or a wait for memory counts as idle.
+fn occupancy(spans: &[ProofSpan]) -> Option<Occupancy> {
+    let from = spans.iter().map(|s| s.start).fold(f64::INFINITY, f64::min);
+    let to = spans
+        .iter()
+        .map(|s| s.start)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if spans.len() < 2 || to <= from {
+        return None;
+    }
+    let mut names: Vec<&str> = spans.iter().map(|s| s.card.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    // Each card's proving time inside the window, its spans merged so two backends' overlap (which
+    // the per-card guard forbids) could not count twice.
+    let busy_on = |card: &str| -> Vec<(f64, f64)> {
+        let mut runs: Vec<(f64, f64)> = spans
+            .iter()
+            .filter(|s| s.card == card)
+            .map(|s| (s.start.max(from), s.end.min(to)))
+            .filter(|(a, b)| b > a)
+            .collect();
+        runs.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let mut merged: Vec<(f64, f64)> = Vec::new();
+        for (a, b) in runs {
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        merged
+    };
+    let per_card: Vec<(String, Vec<(f64, f64)>)> = names
+        .iter()
+        .map(|card| (card.to_string(), busy_on(card)))
+        .collect();
+    let window = to - from;
+    let cards = per_card
+        .iter()
+        .map(|(card, runs)| {
+            (
+                card.clone(),
+                runs.iter().map(|(a, b)| b - a).sum::<f64>() / window,
+            )
+        })
+        .collect();
+    // Every card at once: walk the pieces between consecutive span edges.
+    let mut edges: Vec<f64> = per_card
+        .iter()
+        .flat_map(|(_, runs)| runs.iter().flat_map(|&(a, b)| [a, b]))
+        .chain([from, to])
+        .collect();
+    edges.sort_by(f64::total_cmp);
+    let all_busy = edges
+        .windows(2)
+        .filter(|w| {
+            let mid = (w[0] + w[1]) / 2.0;
+            per_card
+                .iter()
+                .all(|(_, runs)| runs.iter().any(|&(a, b)| a <= mid && mid < b))
+        })
+        .map(|w| w[1] - w[0])
+        .sum::<f64>()
+        / window;
+    Some(Occupancy {
+        window,
+        cards,
+        all_busy,
+    })
 }
 
 /// `zkminer run` with the prover's key.
@@ -2536,4 +3027,31 @@ async fn finish_or_report(world: World, dir: RunDir, miner: Miner, failures: Vec
     drop(miner);
     drop(world);
     dir.finish();
+}
+
+/// The occupancy arithmetic on a hand-made log: two cards, the queue empty once the last proof starts.
+#[test]
+fn occupancy_is_measured_while_work_waits() {
+    let line = |at: &str, slot: &str, secs: &str| {
+        format!(
+            "2026-11-02T17:00:{at}Z  INFO Proof complete on {slot} [Some Card]: 100 cycles in {secs}s"
+        )
+    };
+    // cuda:0 proves over 0-10 s and 12-20 s, rocm:0 over 0-20 s; the last proof starts at 12 s.
+    let lines = vec![
+        line("10.000000", "risc0:cuda:0", "10.0"),
+        line("20.000000", "sp1:rocm:0", "20.0"),
+        line("20.000000", "risc0:cuda:0", "8.0"),
+        "2026-11-02T17:00:21.000000Z  INFO Job 0x1234 proved on risc0:cuda:0".to_string(),
+    ];
+    let spans = proof_spans(&lines);
+    assert_eq!(spans.len(), 3);
+    let o = occupancy(&spans).expect("enough proofs to measure");
+    assert!((o.window - 12.0).abs() < 1e-6, "window {}", o.window);
+    let share = |card: &str| o.cards.iter().find(|(c, _)| c == card).unwrap().1;
+    assert!((share("cuda:0") - 10.0 / 12.0).abs() < 1e-6);
+    assert!((share("rocm:0") - 1.0).abs() < 1e-6);
+    assert!((o.all_busy - 10.0 / 12.0).abs() < 1e-6);
+    // One proof is no window at all.
+    assert!(occupancy(&spans[..1]).is_none());
 }
