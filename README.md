@@ -94,14 +94,29 @@ no error.**
 ~/.zkminer/provers/
 ├── zkminer-prove-risc0-cuda
 ├── zkminer-prove-risc0-rocm
+├── zkminer-rocm/               (AMD's HIP runtime, which the AMD provers load)
 ├── zkminer-prove-risc0-intel
-├── zkminer-intel/lib/          (the Intel worker's libraries, see Build)
+├── zkminer-intel/              (the Intel provers' libraries and Intel's compute runtime)
 ├── zkminer-prove-sp1
 ├── sp1-gpu-server
+├── sp1-gpu-server-hip
+├── sp1-gpu-server-hip-lib  -> zkminer-rocm/lib
+├── sp1-gpu-server-sycl
+├── sp1-gpu-server-sycl-lib -> zkminer-intel/lib
 ├── libcudart.so.12
 ├── libcudart.so.12.LICENSE.txt
 └── zkminer-prove-openvm
 ```
+
+**From a release**, put the single files there and unpack the AMD or Intel tarball into the same
+directory (`tar --zstd -xf zkminer-provers-amd-linux-x86_64.tar.zst -C ~/.zkminer/provers`). Each
+prover carries the GPU runtime it loads, so a host needs only its GPU's driver: NVIDIA's driver for
+RTX cards, and for AMD (Radeon RX 7000 and 9000) and Intel (Arc A and B) cards just the kernel
+driver every distribution ships (amdgpu; i915 for Arc A, xe for Arc B): no CUDA toolkit, ROCm or
+oneAPI install, and a ROCm the distribution has is not used. A miner run outside a desktop session
+(a systemd unit, SSH) needs its user in the `render` group for AMD and Intel cards
+(`sudo usermod -aG render $USER`). The release workflow checks all of this on real GPUs before it
+publishes (`.github/workflows/release.yml`).
 
 **SP1** needs three more things, all handled for you:
 
@@ -121,8 +136,10 @@ no error.**
   short is detected and redone. Final Groth16 proofs on one host take turns through lock files in
   `~/.zkminer/locks/` (hemilabs/sp1 v6.8.1 and later).
 
-**Intel**: copy `zkminer-intel/` together with `zkminer-prove-risc0-intel`. Some of its kernels are
-compiled for the card on first use, which took about 8 minutes on an Arc B580; the driver caches them
+**Intel**: copy `zkminer-intel/` together with `zkminer-prove-risc0-intel`. A release's kernels are
+compiled in advance for the Arc B580/B570, the B-series Pro cards and the A770/A750/A580; on any other
+Intel card, and in a build without them, some are compiled on first use, which took about 8 minutes
+on an Arc B580. The driver caches them
 under `~/.cache/` (`libsycl_cache`, `neo_compiler_cache`) for every later process. The miner warms
 each Intel card up with one small verified proof before its first benchmark or proof, outside their
 time limits. Discovery reads an Intel card's memory from the xe driver.
@@ -393,4 +410,7 @@ MIT — see [LICENSE](LICENSE).
 Releases also ship `libcudart.so.12`, NVIDIA's CUDA runtime, unmodified. It is NVIDIA's software,
 distributed under the NVIDIA CUDA Toolkit End User License Agreement, which lists it as
 distributable with an application, and not under this license. Its notice and that agreement ship
-beside it as `libcudart.so.12.LICENSE.txt`.
+beside it as `libcudart.so.12.LICENSE.txt`. The AMD tarball ships AMD's ROCm HIP runtime, and the
+Intel tarball oneAPI's SYCL runtime and Intel's compute runtime, Level Zero loader and graphics
+compiler, each unmodified (Intel's built from source) and under its own license, in
+`zkminer-rocm/LICENSES/` and `zkminer-intel/LICENSES/`.

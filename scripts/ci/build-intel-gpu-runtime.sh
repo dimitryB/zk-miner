@@ -26,6 +26,10 @@ prefix=${1:?usage: $0 <prefix>}
 src=${SRC_DIR:-/tmp/intel-gpu-src}
 jobs=${JOBS:-$(nproc)}
 mkdir -p "$src" "$prefix"
+# opencl-clang applies its clang and SPIR-V translator patches with `git am`, which needs an
+# identity, and ignores its failure: without one, every patch is skipped and the build goes on.
+export GIT_AUTHOR_NAME=zkminer-build GIT_AUTHOR_EMAIL=build@zkminer.invalid
+export GIT_COMMITTER_NAME=zkminer-build GIT_COMMITTER_EMAIL=build@zkminer.invalid
 
 # <dir> <repository> <commit> [<tag or branch to fetch shallowly>]
 fetch() {
@@ -78,12 +82,25 @@ fetch SPIRV-Headers KhronosGroup/SPIRV-Headers 9268f3057354a2cb65991ba5f38b16d81
 fetch llvm-project llvm/llvm-project 7cbf1a2591520c2491aa35339f227775f4d3adf6 llvmorg-16.0.6
 fetch llvm-project/llvm/projects/opencl-clang intel/opencl-clang 7161d7c6d97da80f12739cebad9bf508555bbfd9
 fetch llvm-project/llvm/projects/llvm-spirv KhronosGroup/SPIRV-LLVM-Translator c13fcf6c5072483d50993e9175087bead3b7bf8a
-# Opaque pointers, as Intel's v2.28.4 packages are built (its release notes: a local build defaults
-# to typed pointers).
-cmake_build igc build-igc \
+# LLVM from the sources above (Source mode), never a prebuilt LLVM the image might have; opaque
+# pointers, as Intel's v2.28.4 packages are built (its release notes: a local build defaults to typed
+# pointers). The layout above is the one IGC's Ubuntu build guide gives.
+cmake -S igc -B build-igc -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+  -DCMAKE_INSTALL_LIBDIR=lib \
+  -DIGC_OPTION__LLVM_MODE=Source \
   -DIGC_OPTION__LLVM_PREFERRED_VERSION=16.0.6 \
-  -DIGC_OPTION__API_ENABLE_OPAQUE_POINTERS=ON \
-  -DIGC_BUILD__VC_ENABLED=ON
+  -DIGC_OPTION__API_ENABLE_OPAQUE_POINTERS=ON 2>&1 | tee igc-configure.log
+# Every patch opencl-clang tried must have applied ("Not present - Applying: ..."); an empty log
+# after "Not present - " is a `git am` that failed, which it does not stop for.
+applied=$(grep -c '\[OPENCL-CLANG\] Not present - Applying' igc-configure.log || true)
+skipped=$(grep -cE '\[OPENCL-CLANG\] Not present - *$' igc-configure.log || true)
+echo "opencl-clang patches applied: $applied, failed: $skipped"
+if [ "$skipped" != 0 ] || [ "$applied" = 0 ]; then
+  echo "opencl-clang's patches did not all apply" >&2
+  exit 1
+fi
+cmake --build build-igc -j "$jobs"
+cmake --install build-igc
 license igc igc/LICENSE.md
 license llvm llvm-project/llvm/LICENSE.TXT
 license opencl-clang llvm-project/llvm/projects/opencl-clang/LICENSE
@@ -93,11 +110,11 @@ license spirv-tools SPIRV-Tools/LICENSE
 
 echo "== compute runtime 26.05.37020.3"
 fetch neo intel/compute-runtime a5e0dd79db5ff7b3ed6c5cd3d11064ab7cbb9aa5 26.05.37020.3
+# IGC_DIR and GMM_DIR name the installs above; left unset, the build would take ../igc and
+# ../gmmlib, the source trees here, and build them again in-tree. It has its own Level Zero headers.
 PKG_CONFIG_PATH="$prefix/lib/pkgconfig" cmake_build neo build-neo \
   -DNEO_SKIP_UNIT_TESTS=1 -DSKIP_UNIT_TESTS=1 \
-  -DCMAKE_PREFIX_PATH="$prefix" \
-  -DIGC_DIR="$prefix" -DGMM_DIR="$prefix" \
-  -DLevelZero_INCLUDE_DIR="$prefix/include"
+  -DIGC_DIR="$prefix" -DGMM_DIR="$prefix"
 license compute-runtime neo/LICENSE.md
 
 echo "== RUNPATH \$ORIGIN"

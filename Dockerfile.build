@@ -520,8 +520,8 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 # script, so the build cache keeps it until the script changes.
 FROM ubuntu:${UBUNTU_VERSION}@sha256:3ba65aa20f86a0fad9df2b2c259c613df006b2e6d0bfcc8a146afb8c525a9751 AS intel-gpu-runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake ninja-build git ca-certificates python3 python3-mako \
-        bison flex pkg-config zlib1g-dev patchelf file \
+        build-essential cmake ninja-build git ca-certificates python3 python3-mako python3-yaml \
+        bison flex pkg-config zlib1g-dev libzstd-dev patchelf file \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/ci/build-intel-gpu-runtime.sh /usr/local/bin/
 RUN build-intel-gpu-runtime.sh /opt/zkminer-intel-gpu && rm -rf /tmp/intel-gpu-src
@@ -674,6 +674,11 @@ COPY --from=rocm-runtime /zkminer-rocm /zkminer-rocm
 
 FROM scratch AS dist-sp1-server-hip
 COPY --from=build-sp1-server-hip /sp1-gpu-server-hip /sp1-gpu-server-hip
+
+# Intel's compute stack alone, as built for the release: its own CI job, so that the stage is built
+# once and its layers are in the build cache for the two jobs below.
+FROM scratch AS dist-intel-gpu-runtime
+COPY --from=intel-gpu-runtime /opt/zkminer-intel-gpu /zkminer-intel-gpu
 
 # zkminer-prove-risc0-intel and zkminer-intel/ (lib/, LICENSES/)
 FROM scratch AS dist-intel
