@@ -259,8 +259,9 @@ ARG NVCC_THREADS
 # of this image is risc0-circuit-rv32im-sys's 3 MB steps.cu, a single nvcc call that took ~24 minutes
 # for one target and one PTX on the 4-core runner; serially, eight targets would take it past two hours.
 # Not four at a time: beside cargo's four jobs that peaked at 16.8 GB of compiler memory, more than the
-# runner's 16 GB. Two at a time built under a 14 GiB cap with no swap, peaking at 10.6 GB (2026-10-10).
-# NVCC_THREADS raises it on a larger runner.
+# runner's 16 GB. Two at a time built under a 14 GiB cap with no swap, peaking at 10.6 GB (2026-10-10),
+# but the kernels of the current risc0 pin ran the 16 GB runner out of memory at two (2026-11-03), so
+# CI passes NVCC_THREADS=1 there, and 4 on a larger runner.
 ENV NVCC_APPEND_FLAGS="--threads ${NVCC_THREADS} \
     -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 \
     -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \

@@ -206,8 +206,11 @@ jobs:
           TARGET: ${{ matrix.target }}
           ALSO: ${{ matrix.cache_from }}
           CHECKPOINTS: ${{ matrix.checkpoints }}
-          # nvcc compiles four GPU targets at once on a large runner, two on a standard one.
-          NVCC_THREADS: ${{ (matrix.large && vars.ZKMINER_LARGE_RUNNER) && '4' || '2' }}
+          # nvcc compiles four GPU targets at once on a large runner, one on a standard one:
+          # at two, the risc0 kernels of the current pin ran a 16 GB runner out of memory after
+          # 2.4 hours (risc0-circuit-rv32im-sys, 2026-11-03). Cargo's jobs cannot go below four
+          # instead (risc0's build scripts deadlock on its jobserver at 1 to 3).
+          NVCC_THREADS: ${{ (matrix.large && vars.ZKMINER_LARGE_RUNNER) && '4' || '1' }}
         run: |
           set -euo pipefail
           from=(--cache-from "type=registry,ref=$CACHE:$TARGET")
