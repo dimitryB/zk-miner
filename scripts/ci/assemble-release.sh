@@ -6,8 +6,8 @@
 # <artifacts dir> holds one directory per build-docker.yml target (dist-cli/, dist-rocm/, ...), as
 # actions/download-artifact leaves them. The release gets:
 # - the CLI and the NVIDIA and OpenVM provers as single files, as before;
-# - zkminer-provers-amd-linux-x86_64.tar.zst: the risc0 ROCm worker, the SP1 HIP server and the HIP
-#   runtime both load (zkminer-rocm/), with sp1-gpu-server-hip-lib linked to it;
+# - zkminer-provers-amd-linux-x86_64.tar.zst: the risc0 ROCm worker with ROCm 7.1's HIP runtime
+#   (zkminer-rocm/), and the SP1 HIP server with ROCm 10.1's (sp1-gpu-server-hip-lib/);
 # - zkminer-provers-intel-linux-x86_64.tar.zst: the risc0 Intel worker, the SP1 SYCL server, and
 #   zkminer-intel/ (the risc0 kernels, libsp1_gpu_sycl.so, oneAPI's SYCL runtime, Intel's compute
 #   stack), with sp1-gpu-server-sycl-lib linked to it;
@@ -50,11 +50,11 @@ echo "== AMD"
 amd=$work/amd
 mkdir -p "$amd"
 need "$in/dist-rocm/zkminer-prove-risc0-rocm"
+need "$in/dist-rocm/zkminer-rocm/lib/libamdhip64.so.7"
 need "$in/dist-sp1-server-hip/sp1-gpu-server-hip"
-need "$in/dist-rocm-runtime/zkminer-rocm/lib/libamdhip64.so.7"
-cp "$in/dist-rocm/zkminer-prove-risc0-rocm" "$in/dist-sp1-server-hip/sp1-gpu-server-hip" "$amd/"
-cp -r "$in/dist-rocm-runtime/zkminer-rocm" "$amd/"
-ln -s zkminer-rocm/lib "$amd/sp1-gpu-server-hip-lib"
+need "$in/dist-sp1-server-hip/sp1-gpu-server-hip-lib/libamdhip64.so.7"
+cp -r "$in/dist-rocm/." "$in/dist-sp1-server-hip/." "$amd/"
+rm -f "$amd"/*.sha256
 modes "$amd"
 
 echo "== Intel"

@@ -62,8 +62,8 @@ pub(crate) fn install_bundled_server() {
 /// there is one: the HIP build's ROCm runtime, or the SYCL build's `libsp1_gpu_sycl.so`, oneAPI
 /// runtime and Intel driver stack. `main` puts it first on the library path the server inherits.
 ///
-/// The release ships it beside this worker as `<name>-lib/`, a link to `zkminer-rocm/lib` or
-/// `zkminer-intel/lib`, which the risc0 workers load from too; it is used in place. Without one, or
+/// The release ships it beside this worker as `<name>-lib/` (for SYCL, a link to
+/// `zkminer-intel/lib`, which the risc0 Intel worker loads from too); it is used in place. Without one, or
 /// with installing turned off (a server managed by hand), it is `<name>-lib/` beside the installed
 /// server.
 pub(crate) fn server_lib_dir() -> Option<PathBuf> {
@@ -161,12 +161,12 @@ mod tests {
         let root = TestDir::new();
         let worker = root.path().join("provers");
         let sp1_bin = root.path().join(".sp1/bin");
-        let server = sp1_bin.join("sp1-gpu-server-hip");
+        let server = sp1_bin.join("sp1-gpu-server-sycl");
         std::fs::create_dir_all(&worker).unwrap();
         std::fs::create_dir_all(&sp1_bin).unwrap();
         let find = |installing| {
             lib_dir_for(
-                "sp1-gpu-server-hip",
+                "sp1-gpu-server-sycl",
                 Some(&worker),
                 Some(&server),
                 installing,
@@ -174,14 +174,15 @@ mod tests {
         };
 
         assert_eq!(find(true), None, "no directory anywhere");
-        std::fs::create_dir(sp1_bin.join("sp1-gpu-server-hip-lib")).unwrap();
-        assert_eq!(find(true), Some(sp1_bin.join("sp1-gpu-server-hip-lib")));
-        // The release's: a link to the runtime the risc0 worker uses.
-        std::fs::create_dir(worker.join("zkminer-rocm")).unwrap();
-        std::os::unix::fs::symlink("zkminer-rocm", worker.join("sp1-gpu-server-hip-lib")).unwrap();
-        assert_eq!(find(true), Some(worker.join("sp1-gpu-server-hip-lib")));
+        std::fs::create_dir(sp1_bin.join("sp1-gpu-server-sycl-lib")).unwrap();
+        assert_eq!(find(true), Some(sp1_bin.join("sp1-gpu-server-sycl-lib")));
+        // The release's SYCL one: a link to the libraries the risc0 Intel worker uses.
+        std::fs::create_dir_all(worker.join("zkminer-intel/lib")).unwrap();
+        std::os::unix::fs::symlink("zkminer-intel/lib", worker.join("sp1-gpu-server-sycl-lib"))
+            .unwrap();
+        assert_eq!(find(true), Some(worker.join("sp1-gpu-server-sycl-lib")));
         // A server managed by hand keeps its own libraries.
-        assert_eq!(find(false), Some(sp1_bin.join("sp1-gpu-server-hip-lib")));
+        assert_eq!(find(false), Some(sp1_bin.join("sp1-gpu-server-sycl-lib")));
     }
 
     #[test]

@@ -94,13 +94,13 @@ no error.**
 ~/.zkminer/provers/
 ├── zkminer-prove-risc0-cuda
 ├── zkminer-prove-risc0-rocm
-├── zkminer-rocm/               (AMD's HIP runtime, which the AMD provers load)
+├── zkminer-rocm/               (ROCm 7.1's HIP runtime, which the risc0 AMD prover loads)
 ├── zkminer-prove-risc0-intel
 ├── zkminer-intel/              (the Intel provers' libraries and Intel's compute runtime)
 ├── zkminer-prove-sp1
 ├── sp1-gpu-server
 ├── sp1-gpu-server-hip
-├── sp1-gpu-server-hip-lib  -> zkminer-rocm/lib
+├── sp1-gpu-server-hip-lib/    (ROCm 10.1's HIP runtime, which SP1's AMD server loads)
 ├── sp1-gpu-server-sycl
 ├── sp1-gpu-server-sycl-lib -> zkminer-intel/lib
 ├── libcudart.so.12
@@ -413,4 +413,4 @@ distributable with an application, and not under this license. Its notice and th
 beside it as `libcudart.so.12.LICENSE.txt`. The AMD tarball ships AMD's ROCm HIP runtime, and the
 Intel tarball oneAPI's SYCL runtime and Intel's compute runtime, Level Zero loader and graphics
 compiler, each unmodified (Intel's built from source) and under its own license, in
-`zkminer-rocm/LICENSES/` and `zkminer-intel/LICENSES/`.
+`zkminer-rocm/LICENSES/`, `sp1-gpu-server-hip-lib/LICENSES/` and `zkminer-intel/LICENSES/`.

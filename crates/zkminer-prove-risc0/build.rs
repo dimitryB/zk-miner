@@ -11,9 +11,9 @@ fn main() {
             "cargo:rustc-link-arg-bin=zkminer-prove-risc0-intel=-Wl,--disable-new-dtags,-rpath,$ORIGIN/zkminer-intel/lib:$ORIGIN"
         );
     }
-    // The ROCm worker's HIP runtime: the release ships it in `zkminer-rocm/lib/` next to the binary
-    // (Dockerfile.build, stage rocm-runtime), so a host needs only the amdgpu kernel driver, and a
-    // distribution's own ROCm (Ubuntu's 7.1 gives invalid SP1 proofs) is never picked up instead.
+    // The ROCm worker's HIP runtime: the release ships the one it is compiled against (ROCm 7.1) in
+    // `zkminer-rocm/lib/` next to the binary (Dockerfile.build, build-rocm), so a host needs only the
+    // amdgpu kernel driver, and a distribution's own ROCm is never picked up instead.
     // DT_RPATH, which ld.so searches before LD_LIBRARY_PATH and the system directories; the runtime's
     // own libraries find each other through their $ORIGIN-relative RUNPATHs. Without that directory
     // (a development build) the system's HIP runtime is used, as before.

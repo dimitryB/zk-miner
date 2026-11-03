@@ -5,7 +5,7 @@
 #
 # All binaries link against glibc 2.35 (Ubuntu 22.04) for broad compatibility. What a host needs
 # beyond that is its GPU's driver and nothing else: the NVIDIA workers link the CUDA runtime
-# statically or ship it (libcudart.so.12); the AMD workers ship AMD's HIP runtime (dist-rocm-runtime);
+# statically or ship it (libcudart.so.12); the AMD workers ship AMD's HIP runtime they were built with;
 # the Intel workers ship oneAPI's SYCL runtime and Intel's compute stack, built here from source
 # (dist-intel). .github/workflows/release.yml checks that on real GPUs, in stock distribution images.
 
@@ -404,12 +404,13 @@ NOTICE
 EOF
 
 # ===========================================================================
-# Stage: rocm-toolchain — Ubuntu 22.04 + Rust + AMD's ROCm 10.1 + the RISC Zero toolchain
+# Stage: rocm-toolchain — Ubuntu 22.04 + Rust + AMD's ROCm 10.1, for SP1's HIP server
 # ===========================================================================
 # ROCm from AMD's own Ubuntu 22.04 repository rather than a ROCm image: the image is the same Ubuntu
-# 22.04 as every other binary here, and only what the builds use is installed: the HIP runtime and
+# 22.04 as every other binary here, and only what the build uses is installed: the HIP runtime and
 # compiler (amdrocm-runtime-dev pulls in amdrocm-llvm-dev), and hipcub/rocprim/rocthrust
-# (amdrocm-ccl-dev). The repository key is checked against its hash.
+# (amdrocm-ccl-dev). The repository key is checked against its hash. (The risc0 prover is built with
+# ROCm 7.1: see rocm71-toolchain.)
 FROM rust-base AS rocm-toolchain
 ARG ROCM_VERSION
 ARG ROCM_PKG_VERSION
@@ -434,11 +435,47 @@ RUN install -d /etc/apt/keyrings \
 
 ENV ROCM_PATH=/opt/rocm/core-${ROCM_VERSION} \
     HIP_PATH=/opt/rocm/core-${ROCM_VERSION} \
-    PATH="${PATH}:/opt/rocm/core-${ROCM_VERSION}/bin:/root/.risc0/bin"
+    PATH="${PATH}:/opt/rocm/core-${ROCM_VERSION}/bin"
+
+# ===========================================================================
+# Stage: rocm71-toolchain — AMD's ROCm 7.1 image + Rust + the RISC Zero toolchain
+# ===========================================================================
+# The risc0 ROCm prover's kernels are compiled with ROCm 7.1, the compiler they were validated with
+# on an RX 7900 XTX, not 10.1: ROCm 10.1's compiler gives the witness kernel par_stepExecW2 every
+# implicit kernel argument, the hostcall buffer among them (it can no longer prove the kernel uses
+# none), and a kernel with a hostcall buffer cannot launch on a card without PCIe atomics
+# ("hostcall not supported", "AQL dispatch failed"), even with asserts compiled out and printf
+# buffered. ROCm 7.1's leaves it out. The prover ships with ROCm 7.1's runtime (build-rocm), and
+# SP1's HIP server, which needs 7.2 or later, with ROCm 10.1's (build-sp1-server-hip): each runs on
+# the runtime of the toolchain it was compiled and validated with.
+# rocm/dev-ubuntu-22.04:7.1 — ROCm 7.1.0, pinned 2026-11-03
+FROM rocm/dev-ubuntu-22.04:7.1@sha256:f55ecea640588a014b9a0fcaba596ed9f79656bffea23644e73f9928280103a5 AS rocm71-toolchain
+ARG RUST_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates cmake pkg-config libssl-dev \
+        protobuf-compiler libclang-dev file \
+        hipcub-dev rocthrust-dev rocprim-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && /opt/rocm/bin/hipcc --version | head -n 3
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}:/root/.risc0/bin" \
+    ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+    && rustup show
+
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
 
 # rzup: see cuda-base (GITHUB_TOKEN).
 RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
     curl -fsSL https://risczero.com/install | bash && rzup install -f
+
+WORKDIR /build
 
 # ===========================================================================
 # Stages: cook-rocm, build-rocm — RISC Zero ROCm prover
@@ -448,12 +485,11 @@ RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
 # which is the build validated on an RX 7900 XTX, and which needs no PCIe atomics: an assert or a
 # printf otherwise makes a kernel use hostcall, which cannot launch on a card without them (some
 # platforms, VMs, eGPU enclosures). The binary's RPATH finds the HIP runtime shipped beside it
-# (crates/zkminer-prove-risc0/build.rs, dist-rocm-runtime).
-FROM rocm-toolchain AS cook-rocm
+# (crates/zkminer-prove-risc0/build.rs, staged below).
+FROM rocm71-toolchain AS cook-rocm
 ARG CARGO_CHEF_VERSION
-ARG ROCM_VERSION
 ARG AMD_GPU_TARGETS
-ENV HIPCC=/opt/rocm/core-${ROCM_VERSION}/bin/hipcc \
+ENV HIPCC=/opt/rocm/bin/hipcc \
     NVCC=off \
     RISC0_HIP_ARCH=${AMD_GPU_TARGETS} \
     HIPCC_COMPILE_FLAGS_APPEND="-DNDEBUG -mprintf-kind=buffered"
@@ -467,26 +503,20 @@ RUN cargo chef cook --release --recipe-path recipe.json \
 FROM cook-rocm AS build-rocm
 COPY . .
 
+# With the HIP runtime it was compiled against, ROCm 7.1's, in zkminer-rocm/ (lib/, LICENSES/), which
+# the binary's RPATH names: scripts/ci/stage-rocm-runtime.sh.
 RUN cargo build --release -p zkminer-prove-risc0 --features rocm --bin zkminer-prove-risc0-rocm \
-    && cp target/release/zkminer-prove-risc0-rocm /zkminer-prove-risc0-rocm \
-    && readelf -d /zkminer-prove-risc0-rocm | grep -q 'RPATH.*\$ORIGIN/zkminer-rocm/lib'
-
-# ===========================================================================
-# Stage: rocm-runtime — the HIP runtime the AMD workers ship with
-# ===========================================================================
-# zkminer-rocm/lib: libamdhip64.so.7 and everything it loads from the ROCm install, in ROCm's own
-# layout, and zkminer-rocm/LICENSES (scripts/ci/stage-rocm-runtime.sh). The risc0 worker finds it
-# through its RPATH, the SP1 HIP server through `sp1-gpu-server-hip-lib`, a link to it.
-FROM rocm-toolchain AS rocm-runtime
-ARG ROCM_VERSION
-COPY scripts/ci/stage-rocm-runtime.sh /usr/local/bin/
-RUN stage-rocm-runtime.sh /opt/rocm/core-${ROCM_VERSION} /zkminer-rocm
+    && mkdir -p /stage \
+    && cp target/release/zkminer-prove-risc0-rocm /stage/ \
+    && readelf -d /stage/zkminer-prove-risc0-rocm | grep -q 'RPATH.*\$ORIGIN/zkminer-rocm/lib' \
+    && scripts/ci/stage-rocm-runtime.sh /opt/rocm /stage/zkminer-rocm
 
 # ===========================================================================
 # Stage: build-sp1-server-hip — hemilabs/sp1's sp1-gpu-server, HIP build
 # ===========================================================================
-# The same commit as build-sp1-server (Cargo.lock's), built for AMD GPUs (#19). Shipped as
-# sp1-gpu-server-hip; the dispatcher has the SP1 worker run it for an AMD card. Device printf buffered,
+# The same commit as build-sp1-server (Cargo.lock's), built for AMD GPUs (#19) with ROCm 10.1 (it needs
+# 7.2 or later). Shipped as sp1-gpu-server-hip; the dispatcher has the SP1 worker run it for an AMD
+# card. Device printf buffered,
 # as for build-rocm (Release builds already compile asserts out). CMake is told the ROCm root, which
 # it does not find from the compiler path in ROCm 10's layout.
 FROM rocm-toolchain AS build-sp1-server-hip
@@ -515,8 +545,16 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     && echo "building sp1-gpu-server (HIP: ${HIP_ARCHS}) at hemilabs/sp1 $REV" \
     && CARGO_TARGET_DIR=/build/target-sp1-server \
        cargo install --locked --root /sp1-server --git https://github.com/hemilabs/sp1 --rev "$REV" sp1-gpu-server \
-    && cp /sp1-server/bin/sp1-gpu-server /sp1-gpu-server-hip \
-    && readelf -d /sp1-gpu-server-hip | grep -q 'NEEDED.*\[libamdhip64\.so\.7\]'
+    && mkdir -p /stage \
+    && cp /sp1-server/bin/sp1-gpu-server /stage/sp1-gpu-server-hip \
+    && readelf -d /stage/sp1-gpu-server-hip | grep -q 'NEEDED.*\[libamdhip64\.so\.7\]'
+
+# With the HIP runtime it was compiled against, ROCm 10.1's, as sp1-gpu-server-hip-lib/ (the
+# libraries, and their licenses in LICENSES/), which the SP1 worker puts on the server's library path.
+COPY scripts/ci/stage-rocm-runtime.sh /usr/local/bin/
+RUN stage-rocm-runtime.sh /opt/rocm/core-${ROCM_VERSION} /tmp/hip-runtime \
+    && mv /tmp/hip-runtime/lib /stage/sp1-gpu-server-hip-lib \
+    && mv /tmp/hip-runtime/LICENSES /stage/sp1-gpu-server-hip-lib/LICENSES
 
 # ===========================================================================
 # Stages: intel-igc, intel-gpu-runtime — Intel's GPU compute stack, built from source for glibc 2.35
@@ -681,14 +719,13 @@ FROM scratch AS dist-sp1-server
 COPY --from=build-sp1-server /sp1-gpu-server /sp1-gpu-server
 COPY --from=build-sp1-server /cudart/ /
 
+# zkminer-prove-risc0-rocm and zkminer-rocm/ (ROCm 7.1's HIP runtime)
 FROM scratch AS dist-rocm
-COPY --from=build-rocm /zkminer-prove-risc0-rocm /zkminer-prove-risc0-rocm
+COPY --from=build-rocm /stage/ /
 
-FROM scratch AS dist-rocm-runtime
-COPY --from=rocm-runtime /zkminer-rocm /zkminer-rocm
-
+# sp1-gpu-server-hip and sp1-gpu-server-hip-lib/ (ROCm 10.1's HIP runtime)
 FROM scratch AS dist-sp1-server-hip
-COPY --from=build-sp1-server-hip /sp1-gpu-server-hip /sp1-gpu-server-hip
+COPY --from=build-sp1-server-hip /stage/ /
 
 # Intel's compute stack alone, as built for the release: its own CI job, so that the stage is built
 # once and its layers are in the build cache for the two jobs below.

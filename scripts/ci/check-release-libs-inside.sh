@@ -35,7 +35,7 @@ while IFS= read -r -d '' lib; do
   # A library loaded by a worker gets the worker's RPATH, which names its own directory.
   check "$lib" "$(dirname "$lib")"
   n=$((n + 1))
-done < <(find "$p/zkminer-rocm/lib" "$p/zkminer-intel/lib" -type f -name '*.so*' -print0)
+done < <(find "$p/zkminer-rocm/lib" "$p/sp1-gpu-server-hip-lib" "$p/zkminer-intel/lib" -type f -name '*.so*' -print0)
 echo "checked 9 binaries and $n libraries"
 [ $fail -eq 0 ] && echo "ok: everything loads with only the GPU driver to come from the host"
 exit $fail

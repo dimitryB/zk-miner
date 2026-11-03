@@ -78,18 +78,19 @@ jobs:
             timeout: 350
             # Shipped with it: the CUDA runtime it links, and that file's license.
             extras: libcudart.so.12 libcudart.so.12.LICENSE.txt
-          # AMD: RX 7000 and 9000 (AMD_GPU_TARGETS in Dockerfile.build), on ROCm 10.1.
+          # AMD: RX 7000 and 9000 (AMD_GPU_TARGETS in Dockerfile.build), each with the
+          # HIP runtime it was compiled against: ROCm 7.1 for risc0, 10.1 for SP1.
           - target: dist-rocm
             binary: zkminer-prove-risc0-rocm
+            extras: zkminer-rocm/lib/libamdhip64.so.7
             large: true
             timeout: 350
             checkpoints: cook-rocm
           - target: dist-sp1-server-hip
             binary: sp1-gpu-server-hip
+            extras: sp1-gpu-server-hip-lib/libamdhip64.so.7
             large: true
             timeout: 350
-          - target: dist-rocm-runtime
-            binary: zkminer-rocm/lib/libamdhip64.so.7
           # Intel: Arc A and B series. Both build on Intel's compute stack, built from
           # source (LLVM, IGC, the compute runtime: the intel-gpu-runtime stage). Its
           # own job builds it once and its layers go to the cache, where the two
