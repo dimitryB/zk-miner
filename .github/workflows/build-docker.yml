@@ -71,6 +71,7 @@ jobs:
             binary: zkminer-prove-risc0-cuda
             large: true
             timeout: 350
+            checkpoints: cook-cuda
           - target: dist-sp1-server
             binary: sp1-gpu-server
             large: true
@@ -82,6 +83,7 @@ jobs:
             binary: zkminer-prove-risc0-rocm
             large: true
             timeout: 350
+            checkpoints: cook-rocm
           - target: dist-sp1-server-hip
             binary: sp1-gpu-server-hip
             large: true
@@ -97,17 +99,20 @@ jobs:
             binary: zkminer-intel-gpu/lib/libze_intel_gpu.so.1
             large: true
             timeout: 355
+            checkpoints: intel-igc
           - target: dist-intel
             binary: zkminer-prove-risc0-intel
             extras: zkminer-intel/lib/libze_intel_gpu.so.1
             large: true
             timeout: 355
+            checkpoints: intel-igc intel-gpu-runtime cook-intel
             cache_from: dist-intel-gpu-runtime dist-sp1-server-sycl
           - target: dist-sp1-server-sycl
             binary: sp1-gpu-server-sycl
             extras: zkminer-intel/lib/libsp1_gpu_sycl.so
             large: true
             timeout: 355
+            checkpoints: intel-igc intel-gpu-runtime
             cache_from: dist-intel-gpu-runtime dist-intel
           # Not shipped: what release.yml's GPU validation runs.
           - target: dist-localnet-test
@@ -174,6 +179,12 @@ jobs:
             echo "write=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Checkpoints first: the stages a target's build is slow to reach (a risc0
+      # prover's compiled dependencies, Intel's compute stack), each built and
+      # its cache saved on its own, as `<target>-<stage>`. BuildKit saves the
+      # cache only when a build succeeds, so without them a failure late in a
+      # five-hour build would save none of it, and the next run would start over.
+      #
       # EXTRACT the binary instead of discarding it.
       #
       # Every `dist-*` stage is a `FROM scratch` container holding exactly what
@@ -193,21 +204,37 @@ jobs:
           WRITE: ${{ steps.cache.outputs.write }}
           TARGET: ${{ matrix.target }}
           ALSO: ${{ matrix.cache_from }}
+          CHECKPOINTS: ${{ matrix.checkpoints }}
           # nvcc compiles four GPU targets at once on a large runner, two on a standard one.
           NVCC_THREADS: ${{ (matrix.large && vars.ZKMINER_LARGE_RUNNER) && '4' || '2' }}
         run: |
           set -euo pipefail
-          cache=(--cache-from "type=registry,ref=$CACHE:$TARGET")
-          for also in $ALSO; do cache+=(--cache-from "type=registry,ref=$CACHE:$also"); done
-          [ "$WRITE" = true ] && cache+=(--cache-to "type=registry,ref=$CACHE:$TARGET,mode=max,ignore-error=true")
-          docker buildx build \
-            -f Dockerfile.build \
-            --target "$TARGET" \
-            --build-arg NVCC_THREADS="$NVCC_THREADS" \
-            --secret id=github_token,env=GITHUB_TOKEN \
-            "${cache[@]}" \
-            --output type=local,dest=dist \
-            .
+          from=(--cache-from "type=registry,ref=$CACHE:$TARGET")
+          for also in $ALSO; do from+=(--cache-from "type=registry,ref=$CACHE:$also"); done
+          for stage in $CHECKPOINTS; do
+            from+=(--cache-from "type=registry,ref=$CACHE:$TARGET-$stage")
+            for also in $ALSO; do from+=(--cache-from "type=registry,ref=$CACHE:$also-$stage"); done
+          done
+          build() { # <stage> [args...]
+            local stage=$1
+            shift
+            docker buildx build -f Dockerfile.build --target "$stage" \
+              --build-arg NVCC_THREADS="$NVCC_THREADS" \
+              --secret id=github_token,env=GITHUB_TOKEN \
+              "${from[@]}" "$@" .
+          }
+          for stage in $CHECKPOINTS; do
+            echo "::group::checkpoint $stage"
+            if [ "$WRITE" = true ]; then
+              build "$stage" --cache-to "type=registry,ref=$CACHE:$TARGET-$stage,mode=max,ignore-error=true"
+            else
+              build "$stage"
+            fi
+            echo "::endgroup::"
+          done
+          to=()
+          [ "$WRITE" = true ] && to=(--cache-to "type=registry,ref=$CACHE:$TARGET,mode=max,ignore-error=true")
+          build "$TARGET" "${to[@]}" --output type=local,dest=dist
 
       - name: "Verify and checksum"
         if: steps.gate.outputs.run == 'true'

@@ -238,9 +238,13 @@ RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN rzup install -f
 WORKDIR /build
 
 # ===========================================================================
-# Stage: build-cuda — RISC Zero CUDA prover (multi-arch portable)
+# Stages: cook-cuda, build-cuda — RISC Zero CUDA prover (multi-arch portable)
 # ===========================================================================
-FROM cuda-base AS build-cuda
+# cook-cuda compiles the dependencies, the GPU kernels among them; build-cuda the prover on top. The
+# first is a stage of its own so that CI can save it to the build cache before building on
+# (build-docker.yml, `checkpoints`): the kernels take hours on a standard runner, and a build that
+# fails later would otherwise save none of it. The same goes for cook-rocm and cook-intel.
+FROM cuda-base AS cook-cuda
 ARG CARGO_CHEF_VERSION
 ARG NVCC_THREADS
 
@@ -268,6 +272,7 @@ COPY --from=planner /recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json \
         -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda
 
+FROM cook-cuda AS build-cuda
 COPY . .
 
 RUN cargo build --release -p zkminer-prove-risc0 --features cuda --bin zkminer-prove-risc0-cuda \
@@ -436,7 +441,7 @@ RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
     curl -fsSL https://risczero.com/install | bash && rzup install -f
 
 # ===========================================================================
-# Stage: build-rocm — RISC Zero ROCm prover
+# Stages: cook-rocm, build-rocm — RISC Zero ROCm prover
 # ===========================================================================
 # RISC0_HIP_ARCH names the GPUs compiled for; every risc0 HIP build script honours it. The release
 # build has device asserts compiled out and device printf buffered (-DNDEBUG -mprintf-kind=buffered),
@@ -444,7 +449,7 @@ RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
 # printf otherwise makes a kernel use hostcall, which cannot launch on a card without them (some
 # platforms, VMs, eGPU enclosures). The binary's RPATH finds the HIP runtime shipped beside it
 # (crates/zkminer-prove-risc0/build.rs, dist-rocm-runtime).
-FROM rocm-toolchain AS build-rocm
+FROM rocm-toolchain AS cook-rocm
 ARG CARGO_CHEF_VERSION
 ARG ROCM_VERSION
 ARG AMD_GPU_TARGETS
@@ -458,6 +463,8 @@ COPY --from=planner /recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json \
         -p zkminer-prove-risc0 --features rocm --bin zkminer-prove-risc0-rocm
 
+# See cook-cuda.
+FROM cook-rocm AS build-rocm
 COPY . .
 
 RUN cargo build --release -p zkminer-prove-risc0 --features rocm --bin zkminer-prove-risc0-rocm \
@@ -512,17 +519,23 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     && readelf -d /sp1-gpu-server-hip | grep -q 'NEEDED.*\[libamdhip64\.so\.7\]'
 
 # ===========================================================================
-# Stage: intel-gpu-runtime — Intel's GPU compute stack, built from source for glibc 2.35
+# Stages: intel-igc, intel-gpu-runtime — Intel's GPU compute stack, built from source for glibc 2.35
 # ===========================================================================
-# The Level Zero loader, the compute runtime (with ocloc), IGC and gmmlib, at the versions the Intel
-# workers were validated with (scripts/ci/build-intel-gpu-runtime.sh). Intel's packages of them need
-# glibc 2.38. The build compiles LLVM 16 for IGC (an hour or more); this layer depends only on the
-# script, so the build cache keeps it until the script changes.
-FROM ubuntu:${UBUNTU_VERSION}@sha256:3ba65aa20f86a0fad9df2b2c259c613df006b2e6d0bfcc8a146afb8c525a9751 AS intel-gpu-runtime
+# IGC and gmmlib, then the compute runtime (with ocloc) and the Level Zero loader, at the versions the
+# Intel workers were validated with (scripts/ci/build-intel-igc.sh, build-intel-gpu-runtime.sh).
+# Intel's packages of them need glibc 2.38. IGC builds LLVM 16 (over an hour on a standard runner),
+# so it is a stage of its own, which depends only on its script and the shared one: the build cache
+# keeps it while the rest changes, and CI saves it before building on (build-docker.yml,
+# `checkpoints`).
+FROM ubuntu:${UBUNTU_VERSION}@sha256:3ba65aa20f86a0fad9df2b2c259c613df006b2e6d0bfcc8a146afb8c525a9751 AS intel-igc
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build git ca-certificates python3 python3-mako python3-yaml \
         bison flex pkg-config zlib1g-dev libzstd-dev patchelf file \
     && rm -rf /var/lib/apt/lists/*
+COPY scripts/ci/intel-gpu-build-lib.sh scripts/ci/build-intel-igc.sh /usr/local/bin/
+RUN build-intel-igc.sh /opt/zkminer-intel-gpu && rm -rf /tmp/intel-gpu-src
+
+FROM intel-igc AS intel-gpu-runtime
 COPY scripts/ci/build-intel-gpu-runtime.sh /usr/local/bin/
 RUN build-intel-gpu-runtime.sh /opt/zkminer-intel-gpu && rm -rf /tmp/intel-gpu-src
 
@@ -564,12 +577,12 @@ RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
     curl -fsSL https://risczero.com/install | bash && rzup install -f
 
 # ===========================================================================
-# Stage: build-intel — RISC Zero Intel prover, and the libraries it ships with
+# Stages: cook-intel, build-intel — RISC Zero Intel prover, and the libraries it ships with
 # ===========================================================================
 # The risc0 -sys crates build their SYCL kernels as shared libraries; stage-intel-worker-libs.sh
 # copies them, oneAPI's SYCL runtime and (INTEL_GPU_RUNTIME) Intel's compute stack into
 # zkminer-intel/lib, which the binary's RPATH names, and their licenses into zkminer-intel/LICENSES.
-FROM intel-toolchain AS build-intel
+FROM intel-toolchain AS cook-intel
 ARG CARGO_CHEF_VERSION
 ARG RISC0_INTEL_SYCL_TARGETS
 ENV NVCC=off HIPCC=off RISC0_INTEL_SYCL_TARGETS=${RISC0_INTEL_SYCL_TARGETS}
@@ -579,6 +592,8 @@ COPY --from=planner /recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json \
         -p zkminer-prove-risc0 --features intel --bin zkminer-prove-risc0-intel
 
+# See cook-cuda.
+FROM cook-intel AS build-intel
 COPY . .
 
 RUN cargo build --release -p zkminer-prove-risc0 --features intel --bin zkminer-prove-risc0-intel \
