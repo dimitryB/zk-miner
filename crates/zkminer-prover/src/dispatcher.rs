@@ -1653,7 +1653,8 @@ const SP1_QUEUE_DIR_ENV: &str = "SP1_GROTH16_QUEUE_DIR";
 /// `/tmp/<name>-<device>.sock`); see `discovery::sp1_server_name`.
 const SP1_GPU_SERVER_NAME_ENV: &str = "SP1_GPU_SERVER_NAME";
 
-/// How long SP1's warm-up may take: the circuit artifacts are ~8 GB to download.
+/// How long a backend's warm-up may take: SP1's circuit artifacts are ~8 GB to download, risc0's
+/// Groth16 component 2.3 GB.
 pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// `~/.zkminer/locks`: on disk, owned by the miner, and the same for every worker it starts.
@@ -2876,13 +2877,17 @@ impl WorkerPool {
         !self.keys_for_prefix(backend).is_empty()
     }
 
-    /// Whether `backend` is ready for its first proof. SP1 must have warmed up (see `warm_up`): its
-    /// first proof would otherwise download ~8 GB of circuit artifacts inside its watchdog, and the
-    /// SDK's installer leaves a torn install that fails every later proof if that is cut short.
-    /// Other backends need nothing.
+    /// Whether `backend` is ready for its first proof. SP1 and risc0 must have warmed up (see
+    /// `warm_up`): SP1's first proof would otherwise download ~8 GB of circuit artifacts inside its
+    /// watchdog, and the SDK's installer leaves a torn install that fails every later proof if that
+    /// is cut short; risc0's needs its `risc0-groth16` component (5 GB), which a host with only its
+    /// GPU driver does not have until the worker's warm-up installs it, and without which every proof
+    /// fails. OpenVM needs nothing.
     pub fn backend_warmed(&self, backend: &str) -> bool {
-        backend != zkminer_prover_protocol::BACKEND_SP1
-            || self
+        !matches!(
+            backend,
+            zkminer_prover_protocol::BACKEND_SP1 | zkminer_prover_protocol::BACKEND_RISC0
+        ) || self
                 .warmed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -8215,14 +8220,16 @@ mod tests {
         }
     }
 
-    /// SP1 waits for its one-time setup before its first proof; nothing else has one.
+    /// SP1 and risc0 wait for their one-time setup before their first proof; OpenVM has none.
     #[test]
-    fn only_sp1_waits_for_its_warm_up() {
+    fn sp1_and_risc0_wait_for_their_warm_up() {
         let pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
-        assert!(!pool.backend_warmed("sp1"));
-        assert!(pool.backend_warmed("risc0") && pool.backend_warmed("openvm"));
+        assert!(!pool.backend_warmed("sp1") && !pool.backend_warmed("risc0"));
+        assert!(pool.backend_warmed("openvm"));
         pool.warmed.lock().unwrap().insert("sp1".to_string());
-        assert!(pool.backend_warmed("sp1"));
+        assert!(pool.backend_warmed("sp1") && !pool.backend_warmed("risc0"));
+        pool.warmed.lock().unwrap().insert("risc0".to_string());
+        assert!(pool.backend_warmed("risc0"));
         assert!(!pool.has_slots("sp1"));
     }
 

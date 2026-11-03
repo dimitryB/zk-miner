@@ -6,6 +6,8 @@
 use std::io::{self, BufReader, BufWriter};
 use std::time::Instant;
 
+mod groth16_component;
+
 use anyhow::{Context, Result};
 use risc0_zkvm::Prover as _;
 use zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV;
@@ -1512,14 +1514,17 @@ fn benchmark_program(
 /// why calibration is opt-in (`zkminer benchmark --calibrate`), never a default run.
 const CALIBRATION_ITERS: u32 = 6_000_000;
 
-/// The one-time setup before a first proof (`WorkerCommand::Warmup`). Nothing on CUDA or ROCm, whose
-/// kernels are compiled in. On Intel, SYCL compiles the kernels shipped as SPIR-V (the zkp and Groth16
-/// ones) for the device on first use, which took ~8 minutes on an Arc B580, longer than a benchmark's
-/// whole budget; the driver caches the result on disk (`~/.cache/libsycl_cache`,
-/// `~/.cache/neo_compiler_cache`), so one small proof through the full Groth16 pipeline compiles
-/// everything once for every later process. It is verified, so a broken card fails here, not on a job.
+/// The one-time setup before a first proof (`WorkerCommand::Warmup`), which the miner runs before it
+/// claims any risc0 job. Every backend: the `risc0-groth16` component every proof's Groth16 wrap
+/// needs, installed if it is missing (`groth16_component`). On Intel, also the kernels: SYCL compiles
+/// those shipped as SPIR-V (the zkp and Groth16 ones) for the device on first use, which took ~8
+/// minutes on an Arc B580, longer than a benchmark's whole budget; the driver caches the result on
+/// disk (`~/.cache/libsycl_cache`, `~/.cache/neo_compiler_cache`), so one small proof through the
+/// full Groth16 pipeline compiles everything once for every later process. It is verified, so a
+/// broken card fails here, not on a job.
 #[cfg(feature = "intel")]
 fn warm_up() -> Result<String> {
+    let component = groth16_component::ensure_installed()?;
     let start = Instant::now();
     let env = risc0_zkvm::ExecutorEnv::builder()
         .write_slice(&1000u32.to_le_bytes())
@@ -1533,14 +1538,15 @@ fn warm_up() -> Result<String> {
         .verify(FIBONACCI_ID)
         .context("the warm-up proof does not verify")?;
     Ok(format!(
-        "compiled and cached the Intel GPU kernels with a verified Groth16 proof in {:.0} s",
+        "{component}; compiled and cached the Intel GPU kernels with a verified Groth16 proof in \
+         {:.0} s",
         start.elapsed().as_secs_f64()
     ))
 }
 
 #[cfg(not(feature = "intel"))]
 fn warm_up() -> Result<String> {
-    Ok("nothing to warm up".to_string())
+    groth16_component::ensure_installed()
 }
 
 /// Run a po2 calibration: prove fibonacci at the specified segment po2 and measure throughput.

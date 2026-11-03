@@ -4701,41 +4701,47 @@ fn risc0_job_device(backend: &str, cards: &[Risc0Card], device: &str) -> bool {
     backend != zkminer_prover_protocol::BACKEND_RISC0 || cards.iter().any(|c| c.device == device)
 }
 
-/// Warms SP1 up in the background until it succeeds (see `WorkerPool::warm_up`): installs its
-/// Groth16 circuit artifacts and, where its server supports it, builds the stripped circuit, before
-/// its first proof rather than inside it. A failure (a network error, the host short of memory just
-/// then) is retried, more patiently each time.
+/// Warms SP1 and risc0 up in the background, each until it succeeds (see `WorkerPool::warm_up`), so
+/// that their one-time setup happens before their first proof rather than inside it: SP1 installs
+/// its Groth16 circuit artifacts and, where its server supports it, builds the stripped circuit;
+/// risc0 installs its `risc0-groth16` component where it is missing (a host with only its GPU driver
+/// has no rzup to install it with). A failure (a network error, the host short of memory just then)
+/// is retried, more patiently each time.
 fn spawn_sp1_warmup() {
-    use zkminer_prover_protocol::BACKEND_SP1;
+    use zkminer_prover_protocol::{BACKEND_RISC0, BACKEND_SP1};
     let Some(pool) = zkminer_prover::engine::worker_pool() else {
         return;
     };
-    if !pool.has_slots(BACKEND_SP1) || pool.backend_warmed(BACKEND_SP1) {
-        return;
-    }
-    let spawned = std::thread::Builder::new()
-        .name("sp1-warmup".into())
-        .spawn(move || {
-            let mut delay = Duration::from_secs(60);
-            loop {
-                match pool.warm_up(BACKEND_SP1, zkminer_prover::dispatcher::WARMUP_TIMEOUT) {
-                    Ok(summary) => {
-                        tracing::info!("SP1 is ready: {summary}");
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                        "SP1's one-time setup failed, so SP1 jobs are not claimed yet; retrying in \
-                         {delay:?}: {e:#}"
-                    );
-                        std::thread::sleep(delay);
-                        delay = (delay * 2).min(Duration::from_secs(15 * 60));
+    for (backend, name) in [(BACKEND_SP1, "SP1"), (BACKEND_RISC0, "risc0")] {
+        if !pool.has_slots(backend) || pool.backend_warmed(backend) {
+            continue;
+        }
+        let spawned = std::thread::Builder::new()
+            .name(format!("{backend}-warmup"))
+            .spawn(move || {
+                let mut delay = Duration::from_secs(60);
+                loop {
+                    match pool.warm_up(backend, zkminer_prover::dispatcher::WARMUP_TIMEOUT) {
+                        Ok(summary) => {
+                            tracing::info!("{name} is ready: {summary}");
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "{name}'s one-time setup failed, so {name} jobs are not claimed \
+                                 yet; retrying in {delay:?}: {e:#}"
+                            );
+                            std::thread::sleep(delay);
+                            delay = (delay * 2).min(Duration::from_secs(15 * 60));
+                        }
                     }
                 }
-            }
-        });
-    if let Err(e) = spawned {
-        tracing::error!("could not start SP1's warm-up ({e}); SP1 jobs will not be claimed");
+            });
+        if let Err(e) = spawned {
+            tracing::error!(
+                "could not start {name}'s warm-up ({e}); {name} jobs will not be claimed"
+            );
+        }
     }
 }
 

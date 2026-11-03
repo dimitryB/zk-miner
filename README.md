@@ -24,18 +24,20 @@ Backends: **RISC Zero** (CUDA, ROCm and Intel), **SP1**, **OpenVM**.
 
 ### RISC Zero toolchain (easy to miss)
 
-Two `rzup` components are needed, and they fail at different stages:
+Building needs `rzup`'s Rust toolchain for the guest ELFs (without it, cargo build fails):
 
 ```bash
 curl -sSL https://risczero.com/install | bash
 export PATH="$HOME/.risc0/bin:$PATH"
-rzup install rust            # builds the guest ELFs — without it, cargo build fails
-rzup install risc0-groth16   # the Groth16 wrap — without it, every PROOF fails
+rzup install rust
 ```
 
-`risc0-groth16` is the nastier of the two: everything compiles and benchmarks fine
-without it, and only real proofs fail — reported by the host as the unhelpful
-`Worker risc0 process died (EOF)`.
+Running needs RISC Zero's `risc0-groth16` component (the Groth16 proving key, 5 GB), but not
+`rzup`: the risc0 worker installs it in its one-time setup, before the miner claims any risc0 job,
+when `~/.risc0/extensions/v0.1.0-risc0-groth16` (or `RISC0_GROTH16_DIR`) does not hold it. It
+downloads the 2.3 GB archive rzup itself uses from RISC Zero's artifact store and checks its
+SHA-256 (`crates/zkminer-prove-risc0/src/groth16_component.rs`). `rzup install risc0-groth16`
+installs the same files.
 
 ## Build
 
