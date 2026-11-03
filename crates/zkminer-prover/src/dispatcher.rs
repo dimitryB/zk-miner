@@ -2123,6 +2123,41 @@ impl WorkerPool {
                 }
             }
 
+            // The same for an AMD card: a HIP binary carries code objects for a list of targets
+            // (RX 7000 and 9000 in a release), with no JIT to fall back on, and a card outside it
+            // fails every launch with "invalid device function". The card's target comes from the
+            // kernel's KFD topology; the binary is the risc0 worker, or the HIP server the SP1 worker
+            // runs. Unknown is again not "cannot".
+            if gpu_tag == "rocm" && std::env::var("ZKMINER_ALLOW_BROKEN_GPU").is_err() {
+                if let (Some(gfx), Some(binary)) = (
+                    pci_bus_id
+                        .as_deref()
+                        .and_then(crate::discovery::amd_gfx_target),
+                    crate::discovery::hip_code_binary(&backend, &path),
+                ) {
+                    match crate::gpu_code::EmbeddedHipCode::read(&binary) {
+                        Ok(Some(code)) if !code.runs_on(&gfx) => {
+                            tracing::warn!(
+                                "not starting worker {key}{device_desc}: {} carries GPU code for \
+                                 {} only, and this card is {gfx}, which can run none of it — every \
+                                 proof would fail with \"invalid device function\". The slot is not \
+                                 advertised; {backend} jobs will be routed to a card it can run on. \
+                                 A build that includes {gfx} lifts this.",
+                                binary.display(),
+                                code.describe(),
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::debug!(
+                            "could not read the GPU code in {} ({e}); not checking it against \
+                             {key}",
+                            binary.display()
+                        ),
+                    }
+                }
+            }
+
             if let (Some(floor), Some(have)) = (
                 crate::discovery::min_vram_bytes_for_backend(&backend),
                 gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref()),

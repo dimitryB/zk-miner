@@ -694,28 +694,24 @@ fn detect_amd_gpus() -> Vec<DetectedGpu> {
     gpus
 }
 
-/// Each AMD GPU's HIP device index, by PCI bus id, from the kernel's KFD topology
-/// (`<topology>/nodes/<n>/properties`), which a host with only the amdgpu driver has: HIP numbers
-/// the GPUs in the order of their KFD nodes, counting every GPU node (an APU's too), and skipping
-/// the CPU nodes, which have no SIMDs. A node's `location_id` is its PCI address,
-/// `bus << 8 | device << 3 | function`, in PCI domain `domain`.
+/// The GPU nodes of the kernel's KFD topology (`<topology>/nodes/<n>/properties`), which a host
+/// with only the amdgpu driver has, in node order: each one's PCI bus id and target (`gfx1100`).
+/// CPU nodes, which have no SIMDs, are left out. A node's `location_id` is its PCI address,
+/// `bus << 8 | device << 3 | function`, in PCI domain `domain`; its `gfx_target_version` is
+/// `major * 10000 + minor * 100 + stepping`, the target named `gfx<major><minor:x><stepping:x>`.
 ///
-/// Empty when the topology cannot be read whole: a GPU node missing from the count would shift
-/// every later index, and pin a worker onto the wrong card.
-fn kfd_hip_indices(topology: &Path) -> HashMap<String, u32> {
-    let mut nodes: Vec<(u32, PathBuf)> = match std::fs::read_dir(topology.join("nodes")) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .filter_map(|e| Some((e.file_name().to_str()?.parse().ok()?, e.path())))
-            .collect(),
-        Err(_) => return HashMap::new(),
-    };
+/// `None` when the topology cannot be read whole: a GPU node missing from the list would shift
+/// every later HIP index, and pin a worker onto the wrong card.
+fn kfd_gpu_nodes(topology: &Path) -> Option<Vec<(String, Option<String>)>> {
+    let mut nodes: Vec<(u32, PathBuf)> = std::fs::read_dir(topology.join("nodes"))
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| Some((e.file_name().to_str()?.parse().ok()?, e.path())))
+        .collect();
     nodes.sort();
-    let mut indices = HashMap::new();
+    let mut gpus = Vec::new();
     for (_, dir) in nodes {
-        let Ok(properties) = std::fs::read_to_string(dir.join("properties")) else {
-            return HashMap::new();
-        };
+        let properties = std::fs::read_to_string(dir.join("properties")).ok()?;
         let value = |key: &str| {
             properties.lines().find_map(|line| {
                 let (k, v) = line.split_once(' ')?;
@@ -725,19 +721,56 @@ fn kfd_hip_indices(topology: &Path) -> HashMap<String, u32> {
         if value("simd_count").unwrap_or(0) == 0 {
             continue;
         }
-        let (Some(location), Some(domain)) = (value("location_id"), value("domain")) else {
-            return HashMap::new();
-        };
+        let (location, domain) = (value("location_id")?, value("domain")?);
         let bus = format!(
             "{domain:04x}:{:02x}:{:02x}.{:x}",
             (location >> 8) & 0xff,
             (location >> 3) & 0x1f,
             location & 0x7
         );
-        let index = indices.len() as u32;
-        indices.insert(normalize_pci_bus_id(&bus), index);
+        let gfx = value("gfx_target_version")
+            .filter(|v| *v > 0)
+            .map(|v| format!("gfx{}{:x}{:x}", v / 10_000, (v / 100) % 100, v % 100));
+        gpus.push((normalize_pci_bus_id(&bus), gfx));
     }
-    indices
+    Some(gpus)
+}
+
+/// Each AMD GPU's HIP device index, by PCI bus id: HIP numbers the GPUs in the order of their KFD
+/// nodes, counting every GPU node (an APU's too). Empty when the topology cannot be read whole.
+fn kfd_hip_indices(topology: &Path) -> HashMap<String, u32> {
+    kfd_gpu_nodes(topology)
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(index, (bus, _))| (bus, index as u32))
+        .collect()
+}
+
+/// The target of the AMD GPU at `pci_bus_id` (`gfx1100` for an RX 7900 XTX), from the KFD topology,
+/// for checking a HIP binary carries code for it (`gpu_code::EmbeddedHipCode`).
+pub fn amd_gfx_target(pci_bus_id: &str) -> Option<String> {
+    let bus = normalize_pci_bus_id(pci_bus_id);
+    kfd_gpu_nodes(Path::new("/sys/class/kfd/kfd/topology"))?
+        .into_iter()
+        .find(|(b, _)| *b == bus)?
+        .1
+}
+
+/// The binary holding a backend's HIP device code, for `gpu_code::EmbeddedHipCode` to read: the
+/// risc0 worker itself, or the SP1 HIP server the SP1 worker will run.
+pub fn hip_code_binary(backend: &str, worker: &Path) -> Option<PathBuf> {
+    if backend != "sp1" {
+        return Some(worker.to_path_buf());
+    }
+    let install = std::env::var(zkminer_prover_protocol::types::SP1_SERVER_INSTALL_ENV)
+        .map_or(true, |v| v.trim() != "0");
+    sp1_named_server_for(
+        sp1_server_name("rocm")?,
+        worker,
+        install,
+        dirs::home_dir().as_deref(),
+    )
 }
 
 /// Parse the numeric suffix of a DRM node name like "card10" -> 10.
@@ -1459,6 +1492,31 @@ mod tests {
     }
 
     #[test]
+    fn gfx_targets_are_named_from_their_version() {
+        let root = std::env::temp_dir().join(format!("zkminer-kfd-gfx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (n, version) in [(1, 110001), (2, 120001), (3, 90010), (4, 90402)] {
+            let dir = root.join(format!("nodes/{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("properties"),
+                format!(
+                    "simd_count 64\nlocation_id {}\ndomain 0\ngfx_target_version {version}\n",
+                    n << 8
+                ),
+            )
+            .unwrap();
+        }
+        let gfx: Vec<String> = kfd_gpu_nodes(&root)
+            .unwrap()
+            .into_iter()
+            .filter_map(|g| g.1)
+            .collect();
+        assert_eq!(gfx, ["gfx1101", "gfx1201", "gfx90a", "gfx942"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn hip_indices_follow_the_kfd_topology_without_rocm() {
         let root = std::env::temp_dir().join(format!("zkminer-kfd-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1479,6 +1537,12 @@ mod tests {
             "simd_count 192\nlocation_id 2168\ndomain 0\ngfx_target_version 110000\n",
         );
 
+        let gpus = kfd_gpu_nodes(&root).unwrap();
+        assert_eq!(
+            gpus[1],
+            ("0000:08:0f.0".to_string(), Some("gfx1100".to_string()))
+        );
+        assert_eq!(gpus[0].1, None, "a node without its target version");
         let indices = kfd_hip_indices(&root);
         // 1280 = 0x500: 05:00.0; 2168 = 0x878: 08:0f.0; 49152 = 0xc000: c0:00.0.
         assert_eq!(indices.get("0000:05:00.0"), Some(&0), "the APU counts");
