@@ -367,21 +367,27 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
     // Private to this user: anyone who can open the lock file can hold it (flock needs no write
     // access), and a held lock keeps a restarted miner from recovering its locks.
     {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
             .create(&dir)
             .with_context(|| format!("create {}", dir.display()))?;
     }
     let path = dir.join("miner.lock");
     let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?
     };
