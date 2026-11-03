@@ -113,6 +113,10 @@ const NO_RISC0_CARD_WAIT: Duration = Duration::from_secs(60);
 /// stranding failure mode).
 const MAX_CLAIM_BATCH: usize = 10;
 
+/// The least time between brain passes when one is started early by a freed card (`CARD_FREED`)
+/// rather than by the tick.
+const MIN_EARLY_PASS_SPACING: Duration = Duration::from_secs(1);
+
 
 /// Committed-cycle count above which a job is treated as "large" and proactively
 /// pinned to a high-VRAM GPU (only takes effect when the job commits a cycle
@@ -4121,6 +4125,7 @@ fn synthetic_conservative_benchmark(
         ],
         device_benchmarks,
         zkops: throughput_cps,
+        cpu_info: SYNTHETIC_SUITE_CPU.to_string(),
         ..Default::default()
     }
 }
@@ -4145,6 +4150,110 @@ impl Drop for SlotGuard {
     fn drop(&mut self) {
         let _ = self.1.send(self.0);
     }
+}
+
+/// Jobs whose card is free again, reported by their lifecycle tasks (`CardRelease`) and drained by
+/// the brain, which stops counting them against card capacity: a job being fulfilled holds
+/// collateral, not a GPU. `CARD_FREED` wakes the brain for it, so the card's next job is admitted
+/// now instead of on the next 5 s tick.
+static CARDS_FREED: std::sync::Mutex<Vec<B256>> = std::sync::Mutex::new(Vec::new());
+static CARD_FREED: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// Held by a job's lifecycle from its start until its proving is over: dropped there explicitly, or
+/// on any earlier return (a failed claim, a refused job, failed proving), all of which leave the job
+/// with no further need for a card. Reported once.
+struct CardRelease(Option<B256>);
+impl CardRelease {
+    fn release(&mut self) {
+        if let Some(jid) = self.0.take() {
+            CARDS_FREED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(jid);
+            CARD_FREED.notify_one();
+        }
+    }
+}
+impl Drop for CardRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// What each card has proved jobs at, learned from the jobs themselves: cycles over duration for
+/// each `(device id, backend)`, smoothed. Without a benchmark suite the planner had only the
+/// synthetic placeholder's 1.0 M cycles/s for every card, against 1.0-3.0 M measured on this
+/// host's four, so it modelled every card as busy up to 3x longer than it was.
+static OBSERVED_THROUGHPUT: std::sync::Mutex<Option<HashMap<(String, String), f64>>> =
+    std::sync::Mutex::new(None);
+
+/// Weight of the newest proof in `OBSERVED_THROUGHPUT`'s moving average.
+const OBSERVED_THROUGHPUT_WEIGHT: f64 = 0.3;
+
+/// Record a finished proof's rate for its card (`slot` as `backend:tag:index`).
+fn note_observed_throughput(slot: &str, cycles: u64, duration: Duration) {
+    let Some((key, rate)) = observed_rate(slot, cycles, duration) else {
+        return;
+    };
+    let mut seen = OBSERVED_THROUGHPUT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = seen
+        .get_or_insert_with(HashMap::new)
+        .entry(key)
+        .or_insert(rate);
+    *entry += OBSERVED_THROUGHPUT_WEIGHT * (rate - *entry);
+}
+
+/// `((device id, backend), cycles per second)` for one proof, or `None` for a slot that is not a
+/// card or a proof with nothing to measure.
+fn observed_rate(slot: &str, cycles: u64, duration: Duration) -> Option<((String, String), f64)> {
+    let mut parts = slot.splitn(3, ':');
+    let (backend, tag, index) = (parts.next()?, parts.next()?, parts.next()?);
+    if !matches!(tag, "cuda" | "rocm" | "intel") || cycles == 0 || duration.is_zero() {
+        return None;
+    }
+    let device = zkminer_prover::dispatcher::WorkerPool::gpu_device_id(tag, index);
+    Some((
+        (device, backend.to_string()),
+        cycles as f64 / duration.as_secs_f64(),
+    ))
+}
+
+/// The learned rates, for the planner.
+fn observed_throughputs() -> HashMap<(String, String), f64> {
+    OBSERVED_THROUGHPUT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
+/// Planner rows `(device, backend, cycles/s)` with every `observed` rate in place of what the rows
+/// said for that device and backend, and added where they had nothing (SP1, which the synthetic
+/// suite has no rows for).
+fn with_observed(
+    mut rows: Vec<(String, String, f64)>,
+    observed: &HashMap<(String, String), f64>,
+) -> Vec<(String, String, f64)> {
+    rows.retain(|(device, backend, _)| !observed.contains_key(&(device.clone(), backend.clone())));
+    let mut learned: Vec<(String, String, f64)> = observed
+        .iter()
+        .filter(|(_, rate)| rate.is_finite() && **rate > 0.0)
+        .map(|((device, backend), rate)| (device.clone(), backend.clone(), *rate))
+        .collect();
+    learned.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    rows.extend(learned);
+    rows
+}
+
+/// `cpu_info` of the synthetic placeholder suite (`synthetic_conservative_benchmark`), which is how
+/// a suite read back from the shared state is told apart from a measured one.
+const SYNTHETIC_SUITE_CPU: &str = "(unbenchmarked placeholder)";
+
+fn is_synthetic_suite(suite: &zkminer_prover::benchmark::BenchmarkSuite) -> bool {
+    suite.cpu_info == SYNTHETIC_SUITE_CPU
 }
 
 /// `f64::min`-fold helper: an empty fold yields INFINITY, which downstream would read as
@@ -4523,6 +4632,12 @@ async fn miner_brain(
     // recovered lock) counts as risc0, the safe direction.
     let mut other_backend_in_flight: std::collections::HashSet<B256> =
         std::collections::HashSet::new();
+    // The jobs in `in_flight` that are SP1, held to what the host can stage (`sp1_concurrent_capacity`).
+    let mut sp1_in_flight: std::collections::HashSet<B256> = std::collections::HashSet::new();
+    // The jobs in `in_flight` whose card is free again (`CardRelease`): proved, or never going to
+    // prove. They still hold collateral until fulfilled or released, but not a GPU, so card capacity
+    // (`max_concurrent`, the claim ceiling, the planner's model) counts `in_flight` less these.
+    let mut proved: std::collections::HashSet<B256> = std::collections::HashSet::new();
 
     // The recovery room checks judge locks against chain time: read a header first, so the startup
     // pass does not fall back to the bare wall clock.
@@ -4775,9 +4890,22 @@ async fn miner_brain(
     let mut measure_pool_down: std::collections::HashMap<&'static str, bool> =
         std::collections::HashMap::new();
 
+    // When the last pass began: a pass a freed card triggers waits out the rest of
+    // `MIN_EARLY_PASS_SPACING` after it, so a burst of finishing jobs cannot spin the brain.
+    let mut last_pass = std::time::Instant::now();
     loop {
-        interval.tick().await;
-        tick_count = tick_count.wrapping_add(1);
+        // Every `interval` tick, or as soon as a job hands back its card. `tick_count` counts the
+        // ticks only: the periodic work keyed on it keeps its 5 s cadence.
+        let ticked = tokio::select! {
+            _ = interval.tick() => true,
+            _ = CARD_FREED.notified() => false,
+        };
+        if ticked {
+            tick_count = tick_count.wrapping_add(1);
+        } else if let Some(rest) = MIN_EARLY_PASS_SPACING.checked_sub(last_pass.elapsed()) {
+            tokio::time::sleep(rest).await;
+        }
+        last_pass = std::time::Instant::now();
         // PAGE lines logged since the last tick (only collected in TUI mode, where the log file is
         // all the operator would otherwise see of them), each shown again at most every 10 minutes.
         for msg in take_pages() {
@@ -4821,7 +4949,14 @@ async fn miner_brain(
         // Reap finished job tasks before re-evaluating the concurrency budget.
         while let Ok(jid) = done_rx.try_recv() {
             in_flight.remove(&jid);
+            proved.remove(&jid);
             queue_model.settle(&jid.0);
+        }
+        // And jobs done with their card: no longer a card's work, in the budget or in the model.
+        for jid in std::mem::take(&mut *CARDS_FREED.lock().unwrap_or_else(|e| e.into_inner())) {
+            if in_flight.contains_key(&jid) && proved.insert(jid) {
+                queue_model.settle(&jid.0);
+            }
         }
         {
             // Advance the backlog model by real elapsed time, not by tick count: the brain
@@ -5393,14 +5528,20 @@ async fn miner_brain(
             }
         }
 
-        let measured = benchmarks.is_some();
+        // A measured suite, or rates learned from this miner's own proofs. NOT the synthetic
+        // placeholder, which the brain publishes to the shared state for the Settings screen and so
+        // reads back here on every later tick; it counted as measured, and the planner ran on its
+        // invented 1.0 M cycles/s for every card.
+        let observed = observed_throughputs();
+        let measured = benchmarks.as_ref().is_some_and(|b| !is_synthetic_suite(b));
         let planner_active = !queue_horizon.is_zero()
-            && measured
-            && benchmarks.as_ref().is_some_and(|b| {
-                b.device_benchmarks
-                    .iter()
-                    .any(|d| d.device_id.starts_with("gpu"))
-            });
+            && ((measured
+                && benchmarks.as_ref().is_some_and(|b| {
+                    b.device_benchmarks
+                        .iter()
+                        .any(|d| d.device_id.starts_with("gpu"))
+                }))
+                || !observed.is_empty());
         let claim_ceiling = if !planner_active {
             max_concurrent
         } else {
@@ -5408,7 +5549,7 @@ async fn miner_brain(
             // mis-estimate cannot run away and lock unbounded collateral.
             max_concurrent.saturating_mul(3)
         };
-        if in_flight.len() >= claim_ceiling {
+        if in_flight.len() - proved.len() >= claim_ceiling {
             continue;
         }
 
@@ -5740,6 +5881,10 @@ async fn miner_brain(
                 v.push((d.device_id.clone(), d.prover_backend.clone(), throughput));
             }
             fill_risc0_rows(&mut v, &risc0_cards);
+            // No measured suite: what the cards have actually proved at, where they have.
+            if !measured {
+                v = with_observed(v, &observed);
+            }
             v
         };
 
@@ -5787,6 +5932,7 @@ async fn miner_brain(
             s.open_jobs.retain(|j| !undecodable_now.contains(&j.info.job_id));
         }
         other_backend_in_flight.retain(|j| in_flight.contains_key(j));
+        sp1_in_flight.retain(|j| in_flight.contains_key(j));
         let mut candidates: Vec<_> = open_jobs
             .iter()
             .filter(|j| !in_flight.contains_key(&j.info.job_id))
@@ -6204,10 +6350,23 @@ async fn miner_brain(
                             // SEQUENTIALLY, so the memory a set of claims can demand at once is
                             // `min(outstanding + 1, max_concurrent)` peaks. See
                             // `backend_fits_for_claim`.
+                            // An SP1 job the host could not stage beside those already waiting for
+                            // a card would wait for memory holding collateral and a slot; one queued
+                            // behind the running ones is enough to hide the next claim's latency.
+                            if backend == zkminer_prover_protocol::BACKEND_SP1 {
+                                let waiting = sp1_in_flight
+                                    .iter()
+                                    .filter(|j| !proved.contains(*j))
+                                    .count();
+                                let room = pool.sp1_concurrent_capacity().unwrap_or(usize::MAX);
+                                if waiting > room.max(1) {
+                                    continue;
+                                }
+                            }
                             if !pool.backend_fits_for_claim(
                                 want,
                                 backend,
-                                in_flight.len(),
+                                in_flight.len() - proved.len(),
                                 max_concurrent,
                             ) {
                                 // Rate-limited to once per backend per tick. On the market this
@@ -6869,7 +7028,7 @@ async fn miner_brain(
             // model then UNDER-reports that device and the planner would place a later job as
             // though the card were idle — void at depth 1, not just depth 2. Refuse to plan
             // against a model we know is incomplete rather than plan against a fiction.
-            let model_complete = queue_model.outstanding() == in_flight.len();
+            let model_complete = queue_model.outstanding() == in_flight.len() - proved.len();
             let admission = if planner_active
                 && measurable
                 && model_complete
@@ -6967,8 +7126,11 @@ async fn miner_brain(
             // card).
             let risc0_job = backend_opt == Some(zkminer_prover_protocol::BACKEND_RISC0);
             let bypass_room = risc0_bypass_room(
-                in_flight.len(),
-                other_backend_in_flight.len(),
+                in_flight.len() - proved.len(),
+                other_backend_in_flight
+                    .iter()
+                    .filter(|j| !proved.contains(*j))
+                    .count(),
                 max_concurrent,
                 risc0_job,
                 risc0_cards.len(),
@@ -7004,6 +7166,9 @@ async fn miner_brain(
                 in_flight.insert(jid, required_collateral);
                 if !risc0_job {
                     other_backend_in_flight.insert(jid);
+                }
+                if backend_opt == Some(zkminer_prover_protocol::BACKEND_SP1) {
+                    sp1_in_flight.insert(jid);
                 }
                 // Commit the admission to the backlog model, paired with the
                 // `in_flight` insert so the two can never disagree about what is outstanding.
@@ -7041,7 +7206,8 @@ async fn miner_brain(
                 // Bound to free proving slots (never lock more than we can prove before
                 // their deadlines) and to the contract's MAX_BATCH_SIZE. in_flight now
                 // includes this tick's collected jobs, so its length is the capacity gate.
-                if in_flight.len() >= claim_ceiling || batch.len() >= MAX_CLAIM_BATCH {
+                if in_flight.len() - proved.len() >= claim_ceiling || batch.len() >= MAX_CLAIM_BATCH
+                {
                     break;
                 }
             }
@@ -7122,11 +7288,12 @@ async fn miner_brain(
                 let jid = job.info.job_id;
                 // Already reserved in in_flight during collection.
                 tracing::info!(
-                    "CLAIM {} (price {}, in_flight {}/{})",
+                    "CLAIM {} (price {}, in_flight {}/{}, {} held in all)",
                     short_id(jid),
                     job.current_price,
+                    in_flight.len() - proved.len(),
+                    max_concurrent,
                     in_flight.len(),
-                    max_concurrent
                 );
                 spawn_lifecycle_task(
                     jid,
@@ -8076,6 +8243,9 @@ async fn process_job_lifecycle(
     // skip the re-fetch at step 6. Always `None` for fresh jobs.
     prefetched_descriptor: Option<zkminer_contracts::bindings::JobDescriptor>,
 ) -> Result<()> {
+    // This job's claim on a card, handed back once proving is over (below), or on any return before
+    // that: either way the card's next job may be admitted while this one is fulfilled or released.
+    let mut card = CardRelease(Some(job.info.job_id));
     use zkminer_tui::state::{LogLevel, MinerJobStatus};
 
     let job_id = job.info.job_id;
@@ -9308,7 +9478,13 @@ async fn process_job_lifecycle(
                                 memory_waits,
                                 MAX_HOST_MEMORY_WAITS,
                             );
-                            tokio::time::sleep(Duration::from_secs(HOST_MEMORY_BACKOFF_SECS)).await;
+                            // Until memory is given back, or the backoff at most: a release is a
+                            // wake-up, not a promise, and one before this wait began is missed.
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(HOST_MEMORY_BACKOFF_SECS),
+                                zkminer_prover::memory::MEMORY_RELEASED.notified(),
+                            )
+                            .await;
                             continue;
                         }
                         // Still not the slot's fault, so do not exclude it or call it unhealthy —
@@ -9462,8 +9638,10 @@ async fn process_job_lifecycle(
         }
     };
 
+    card.release();
     if let Some(slot) = &proved_on {
         tracing::info!("Job {} proved on {}", short_id(job_id), slot);
+        note_observed_throughput(slot, proof.cycles, proof.duration);
     }
     {
         let mut s = state.write().await;
@@ -14636,6 +14814,94 @@ mod r2_sizing_tests {
         assert_eq!(get_journal_len(&cache, "risc0", prog, ih), Some(100));
         insert_journal_len(&cache, "risc0", prog, ih, 300);
         assert_eq!(get_journal_len(&cache, "risc0", prog, ih), Some(300));
+    }
+
+    /// A proof's rate is filed under the planner's id for its card, for its backend.
+    #[test]
+    fn a_proof_teaches_the_planner_its_cards_rate() {
+        let secs = Duration::from_secs;
+        assert_eq!(
+            observed_rate("risc0:cuda:1", 42_000_000, secs(14)),
+            Some((("gpu1".to_string(), "risc0".to_string()), 3_000_000.0))
+        );
+        assert_eq!(
+            observed_rate("sp1:rocm:0", 20_000_000, secs(40)).map(|(k, _)| k),
+            Some(("gpu-rocm0".to_string(), "sp1".to_string()))
+        );
+        assert_eq!(
+            observed_rate("risc0:intel:0", 1, secs(1)).map(|(k, _)| k.0),
+            Some("gpu-intel0".to_string())
+        );
+        assert_eq!(observed_rate("risc0:cpu", 1_000, secs(1)), None);
+        assert_eq!(observed_rate("risc0:cuda:0", 1_000, Duration::ZERO), None);
+        assert_eq!(observed_rate("risc0:cuda:0", 0, secs(1)), None);
+
+        // Smoothed: the first proof sets it, a later one moves it part of the way.
+        note_observed_throughput("openvm:cuda:7", 10_000_000, secs(10));
+        let key = ("gpu7".to_string(), "openvm".to_string());
+        assert_eq!(observed_throughputs()[&key], 1_000_000.0);
+        note_observed_throughput("openvm:cuda:7", 20_000_000, secs(10));
+        let expected = 1_000_000.0 + OBSERVED_THROUGHPUT_WEIGHT * 1_000_000.0;
+        assert!((observed_throughputs()[&key] - expected).abs() < 1e-6);
+    }
+
+    /// Learned rates replace what the rows said for that card and backend, keep the rest, and add a
+    /// backend the rows lacked.
+    #[test]
+    fn learned_rates_replace_the_placeholder_rows() {
+        let rows = vec![
+            ("gpu0".to_string(), "risc0".to_string(), 1e6),
+            ("gpu1".to_string(), "risc0".to_string(), 1e6),
+        ];
+        let observed: HashMap<(String, String), f64> = [
+            (("gpu0".to_string(), "risc0".to_string()), 3e6),
+            (("gpu0".to_string(), "sp1".to_string()), 1.5e6),
+            (("gpu1".to_string(), "sp1".to_string()), f64::NAN),
+        ]
+        .into_iter()
+        .collect();
+        let mut got = with_observed(rows, &observed);
+        got.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        assert_eq!(
+            got,
+            vec![
+                ("gpu0".to_string(), "risc0".to_string(), 3e6),
+                ("gpu0".to_string(), "sp1".to_string(), 1.5e6),
+                ("gpu1".to_string(), "risc0".to_string(), 1e6),
+            ]
+        );
+    }
+
+    /// The placeholder suite is recognisable once it has been read back from the shared state, and a
+    /// suite from a benchmark run is not mistaken for it.
+    #[test]
+    fn the_synthetic_suite_is_never_taken_for_a_measured_one() {
+        let cards = vec![("gpu0".to_string(), "0000:06:10.0".to_string())];
+        assert!(is_synthetic_suite(&synthetic_conservative_benchmark(
+            &cards
+        )));
+        let mut measured = zkminer_prover::benchmark::BenchmarkSuite::default();
+        measured.cpu_info = "AMD Ryzen Threadripper 3970X 32-Core Processor".to_string();
+        assert!(!is_synthetic_suite(&measured));
+    }
+
+    /// A job hands its card back exactly once, whether released explicitly or by dropping.
+    #[test]
+    fn a_card_is_handed_back_once() {
+        let jid = B256::repeat_byte(0xc4);
+        {
+            let mut card = CardRelease(Some(jid));
+            card.release();
+        }
+        let freed = CARDS_FREED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(freed.iter().filter(|j| **j == jid).count(), 1);
+        CARDS_FREED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|j| *j != jid);
     }
 
     #[test]

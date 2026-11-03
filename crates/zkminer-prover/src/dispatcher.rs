@@ -1102,6 +1102,28 @@ fn read_card_occupancy(
     ))
 }
 
+/// How many charges of `each` bytes fit in `room` (all of it when a charge is 0).
+fn staging_capacity(room: u64, each: u64) -> usize {
+    room.checked_div(each)
+        .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// Would `need` (plus `reserve`) overflow `capacity` with what is already `held` there, after
+/// `preemptable` of it is given back? The committed term of `memory::can_admit`, net of what a
+/// committed proof may preempt; see `WorkerPool::host_side_refusal`.
+fn beyond_committed_room(
+    held: u64,
+    preemptable: u64,
+    need: u64,
+    reserve: u64,
+    capacity: u64,
+) -> bool {
+    held.saturating_sub(preemptable)
+        .saturating_add(need)
+        .saturating_add(reserve)
+        > capacity
+}
+
 /// Read an AMD or Intel card (slot tag `rocm` or `intel`) the way `read_card_occupancy` reads an
 /// NVIDIA one. `None` when the card cannot be read: no opinion, as there.
 ///
@@ -4894,6 +4916,112 @@ impl WorkerPool {
         self.shm_ledger.try_reserve(want, 0, capacity, capacity, 0)
     }
 
+    /// How many SP1 proofs this host can stage at once: the smaller of what `/dev/shm` holds of the
+    /// images `reserve_sp1_shm` charges (x86-64) and what host RAM holds of SP1's expected peak,
+    /// counting the reserve. `None` when neither can be read. Claim admission keeps the SP1 jobs
+    /// waiting for a card to this many (plus one queued), so claimed jobs do not sit in the
+    /// memory-wait loop holding collateral and a concurrency slot: on a 92 GB host with a 46 GiB
+    /// `/dev/shm` it is 1, and SP1 jobs claimed beyond it waited a median 41 s.
+    pub fn sp1_concurrent_capacity(&self) -> Option<usize> {
+        let total = crate::memory::mem_total_bytes();
+        let shm = if cfg!(target_arch = "x86_64") {
+            crate::memory::dev_shm_capacity_bytes().map(|shm| {
+                staging_capacity(
+                    shm.saturating_sub(crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES),
+                    crate::memory::sp1_measure_cap_bytes(total.unwrap_or(u64::MAX)),
+                )
+            })
+        } else {
+            None
+        };
+        let host = total.map(|t| {
+            staging_capacity(
+                t.saturating_sub(crate::memory::DEFAULT_HOST_RESERVE_BYTES),
+                self.expected_host_peak(zkminer_prover_protocol::BACKEND_SP1),
+            )
+        });
+        match (shm, host) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The host memory `key`'s next proof is charged: its backend's expected peak at the proof's
+    /// segment size (`expected_host_peak_at_po2`), and for SP1 at least the execute spike on top of
+    /// the warm server.
+    ///
+    /// RH2: `run_proof` re-runs the deterministic execute on top of the resident `sp1-gpu-server`
+    /// before proving, so an SP1 proof's true transient peak is `max(steady prove estimate,
+    /// server_resident + execute_peak)`. Charging that max — credited by the SAME current resident
+    /// `reserve_host_memory` reads back — makes the committed term reflect the execute window when the
+    /// server is WARM, refusing a concurrent other-backend proof that would OOM during it, while a
+    /// COLD server (resident ≈ 0) collapses it to the steady estimate, so a first proof is not
+    /// over-declined. Only SP1 stages an execute beside a warm server; a 0 peak (unknown, or the
+    /// portable executor) leaves the estimate as it is.
+    fn host_want(&self, key: &str, po2: Option<u8>, execute_peak_bytes: u64) -> u64 {
+        let backend = key.split(':').next().unwrap_or(key);
+        let want = self.expected_host_peak_at_po2(backend, po2);
+        if backend == zkminer_prover_protocol::BACKEND_SP1 && execute_peak_bytes > 0 {
+            let server_resident = self.current_host_bytes_for_slot(key).unwrap_or(0);
+            return want.max(execute_peak_bytes.saturating_add(server_resident));
+        }
+        want
+    }
+
+    /// The host-side refusal `prove_on_slot` is certain to meet for `key`, checked without reserving
+    /// anything; `None` whenever its admission might still succeed.
+    ///
+    /// Certain means: what is already reserved, less what a committed proof may preempt (pre-claim
+    /// measurements' charges), plus this proof, exceeds the whole host (`can_admit`'s committed term)
+    /// or, for SP1, the `/dev/shm` the staging ledger allows (`reserve_sp1_shm`). Recycling an idle
+    /// worker changes neither figure, so nothing `make_host_room` or the VRAM budget could do would
+    /// help: only another proof finishing will. The live term (`MemAvailable`) is left out on
+    /// purpose, since recycling can fix it.
+    fn host_side_refusal(
+        &self,
+        key: &str,
+        want: u64,
+        committed: bool,
+    ) -> Option<zkminer_prover_protocol::types::HostMemoryShortage> {
+        let measures = self.inflight_measures_snapshot();
+        let preemptable = |bytes: fn(&InflightMeasure) -> u64| {
+            if !committed {
+                return 0;
+            }
+            measures
+                .iter()
+                .fold(0u64, |sum, (_, m)| sum.saturating_add(bytes(m)))
+        };
+        let refusal = |needed, reserved, available| {
+            Some(zkminer_prover_protocol::types::HostMemoryShortage {
+                attempted: false,
+                slot_key: key.to_string(),
+                needed,
+                reserved,
+                available,
+            })
+        };
+        let total = crate::memory::mem_total_bytes();
+        let backend = key.split(':').next().unwrap_or(key);
+        if backend == zkminer_prover_protocol::BACKEND_SP1 && cfg!(target_arch = "x86_64") {
+            if let Some(shm) = crate::memory::dev_shm_capacity_bytes() {
+                let need = crate::memory::sp1_measure_cap_bytes(total.unwrap_or(u64::MAX));
+                let capacity = shm.saturating_sub(crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES);
+                let held = self.shm_ledger.reserved_bytes();
+                if beyond_committed_room(held, preemptable(|m| m.shm_bytes), need, 0, capacity) {
+                    return refusal(need, held, shm);
+                }
+            }
+        }
+        let held = self.reserved_host_memory();
+        let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
+        if beyond_committed_room(held, preemptable(|m| m.host_bytes), want, reserve, total?) {
+            let available = crate::memory::mem_available_bytes().unwrap_or(0);
+            return refusal(want, held, available);
+        }
+        None
+    }
+
     /// Snapshot the in-flight measurements (key + its recorded holdings), for a preemptor to CHOOSE
     /// its victims without holding `inflight_measures` across the reclaim WAITS. The snapshot is only
     /// a selection; the kill itself (`preempt_one_measure`) re-acquires the lock and re-reads the
@@ -6547,6 +6675,21 @@ impl WorkerPool {
         let gpu_lock = self.gpu_lock_for(key);
         let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, abort_at, timeout)?;
 
+        // Host memory and `/dev/shm` are reserved further down, after the slot mutex (see there), but
+        // the VRAM budget just below may recycle a warm same-card sibling to make room. If the proofs
+        // already in flight leave this one no host-side room that anything below could make, it would
+        // be refused there anyway, after the sibling was destroyed for nothing, and again on every
+        // retry. Seen on localnet: an SP1 proof waiting for `/dev/shm` behind another card's SP1 proof
+        // recycled the idle risc0 worker on its own card seven times in four minutes. So it is refused
+        // here first, with the same typed shortage.
+        if let Some(shortage) = self.host_side_refusal(
+            key,
+            self.host_want(key, po2, execute_peak_bytes),
+            abort_at.is_some(),
+        ) {
+            return Err(anyhow::Error::new(shortage));
+        }
+
         // Is enough of this card's VRAM free for this backend? See `check_vram_budget`, which also
         // explains why this must come after the guard and before the slot mutex.
         let _vram_budget = self.check_vram_budget(key, abort_at)?;
@@ -6672,22 +6815,8 @@ impl WorkerPool {
         //
         // Held for the rest of the proof; released on drop, including on every error path.
         let backend_of_slot = key.split(':').next().unwrap_or(key);
-        // Scaled to THIS proof's segment size — see `expected_host_peak_at_po2`.
-        let mut want = self.expected_host_peak_at_po2(backend_of_slot, po2);
-        // RH2: fold in the SP1 EXECUTE spike. `run_proof` re-runs the deterministic execute on top of
-        // the resident `sp1-gpu-server` before proving, so this proof's true transient peak is
-        // `max(steady prove estimate, server_resident + execute_peak)`. Charge that max — credited by
-        // the SAME current resident `reserve_host_memory` reads back — so that when the server is WARM
-        // the committed term reflects the execute window and refuses a concurrent other-backend proof
-        // that would OOM during it, while when the server is COLD (resident ≈ 0) the term collapses to
-        // the steady estimate, so a first/cold proof is NOT over-declined (the cold-start regression a
-        // flat server-floor would cause). Only SP1 stages an execute beside a warm server; 0 peak
-        // (unknown / portable executor) leaves `want` unchanged.
-        if backend_of_slot == zkminer_prover_protocol::BACKEND_SP1 && execute_peak_bytes > 0 {
-            let server_resident = self.current_host_bytes_for_slot(key).unwrap_or(0);
-            want = want.max(execute_peak_bytes.saturating_add(server_resident));
-        }
-        let want = want;
+        // Read again now, after any recycle above, which changes what the SP1 server holds.
+        let want = self.host_want(key, po2, execute_peak_bytes);
         // RH1 / Mode B: reserve the `/dev/shm` this SP1 proof's execute phase will stage, held for the
         // whole proof so a concurrent measure or a prove on another card cannot sum images past the
         // shared tmpfs and SIGBUS (which, hitting a claimed prove, is a slash). On shortage, refuse as
@@ -9401,6 +9530,79 @@ mod tests {
                  `std::sync::Mutex` would deadlock on if this thread already held it."
             );
         }
+    }
+
+    /// A proof the host side is certain to refuse must be refused BEFORE the VRAM budget, which may
+    /// recycle a warm same-card sibling to make room for it.
+    #[test]
+    fn a_proof_the_host_will_refuse_recycles_nothing_first() {
+        let src = include_str!("dispatcher.rs");
+        let body = src
+            .split_once("    fn prove_on_slot(")
+            .expect("prove_on_slot no longer exists; move this assertion with it")
+            .1;
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        let refusal = body
+            .find("self.host_side_refusal(")
+            .expect("prove_on_slot no longer checks the host side before making VRAM room");
+        let budget = body
+            .find("self.check_vram_budget(")
+            .expect("prove_on_slot no longer checks the VRAM budget");
+        let guard = body
+            .find("Self::acquire_gpu_guard(")
+            .expect("prove_on_slot no longer takes the per-card guard");
+        assert!(
+            guard < refusal && refusal < budget,
+            "host_side_refusal must come after the per-card guard and before check_vram_budget: \
+             otherwise an SP1 proof waiting for another card's `/dev/shm` staging recycles the idle \
+             risc0 worker on its own card on every retry, for nothing"
+        );
+    }
+
+    /// This host: a 46 GiB `/dev/shm` (less the poll margin) holds one 24 GiB SP1 image, and 92 GiB
+    /// of RAM three of SP1's 24 GiB unmeasured peak.
+    #[test]
+    fn sp1_staging_capacity_counts_whole_images() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let shm = 46 * GIB - crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES;
+        assert_eq!(staging_capacity(shm, 24 * GIB), 1);
+        assert_eq!(
+            staging_capacity(
+                92 * GIB - crate::memory::DEFAULT_HOST_RESERVE_BYTES,
+                24 * GIB
+            ),
+            3
+        );
+        assert_eq!(staging_capacity(10 * GIB, 24 * GIB), 0);
+        assert_eq!(staging_capacity(10 * GIB, 0), usize::MAX);
+    }
+
+    /// The committed term, with this host's figures from the localnet run that showed the bug.
+    #[test]
+    fn the_committed_room_is_net_of_what_a_claim_may_preempt() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // `/dev/shm` of 46 GiB (half of 92) less the 2 GiB poll margin, one SP1 staging of 24 GiB
+        // in flight: a second one cannot fit, whatever is recycled.
+        let shm = 46 * GIB - crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES;
+        assert!(beyond_committed_room(24 * GIB, 0, 24 * GIB, 0, shm));
+        // ... unless the 24 GiB in flight is a pre-claim measurement a claimed proof may preempt.
+        assert!(!beyond_committed_room(24 * GIB, 24 * GIB, 24 * GIB, 0, shm));
+        // Nothing in flight: one staging fits.
+        assert!(!beyond_committed_room(0, 0, 24 * GIB, 0, shm));
+        // Host RAM of 92 GiB with the 3 GiB reserve: an SP1 proof (24) beside two risc0 ones fits.
+        let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
+        assert!(!beyond_committed_room(
+            48 * GIB,
+            0,
+            24 * GIB,
+            reserve,
+            92 * GIB
+        ));
+        // Exactly full is not beyond it; one byte more is.
+        assert!(!beyond_committed_room(10, 0, 5, 5, 20));
+        assert!(beyond_committed_room(10, 0, 6, 5, 20));
+        // Giving back more than is held cannot go negative and admit for free.
+        assert!(beyond_committed_room(1, 5, 30, 0, 20));
     }
 
     #[test]

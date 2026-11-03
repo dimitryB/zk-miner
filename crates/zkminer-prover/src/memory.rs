@@ -1002,8 +1002,16 @@ impl Drop for MemoryReservation<'_> {
             std::sync::atomic::Ordering::Acquire,
             |v| Some(v.saturating_sub(self.bytes)),
         );
+        MEMORY_RELEASED.notify_waiters();
     }
 }
+
+/// Signalled whenever any reservation (host RAM or `/dev/shm`) is given back, so a proof waiting for
+/// memory can retry the moment some frees instead of on its next poll. A wake-up only: the waiter
+/// still has to win the reservation, and waits with a timeout, since a release between its refusal
+/// and its wait is not remembered.
+pub static MEMORY_RELEASED: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
 
 impl MemoryLedger {
     pub fn reserved_bytes(&self) -> u64 {
