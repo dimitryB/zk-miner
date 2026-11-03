@@ -793,14 +793,41 @@ fn read_amd_gpu_name(device_dir: &Path) -> String {
             return name;
         }
     }
+    let read = |file: &str| {
+        std::fs::read_to_string(device_dir.join(file))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    let (device_id, revision) = (read("device"), read("revision"));
+    // The marketing name from libdrm's table, which Mesa installs (libdrm-common): a host with only
+    // the GPU driver has no rocm-smi to ask.
+    if let Some(name) = [
+        "/usr/share/libdrm/amdgpu.ids",
+        "/usr/local/share/libdrm/amdgpu.ids",
+    ]
+    .iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .find_map(|ids| amdgpu_ids_name(&ids, &device_id, &revision))
+    {
+        return name;
+    }
     // Fallback: device ID
-    if let Ok(device_id) = std::fs::read_to_string(device_dir.join("device")) {
-        let device_id = device_id.trim().to_string();
-        if !device_id.is_empty() {
-            return format!("AMD GPU ({})", device_id);
-        }
+    if !device_id.is_empty() {
+        return format!("AMD GPU ({})", device_id);
     }
     "AMD GPU".to_string()
+}
+
+/// The product name libdrm's `amdgpu.ids` gives a device id and revision (sysfs's `0x744c` and
+/// `0xc8`), from its `744C,\tC8,\tAMD Radeon RX 7900 XTX` lines.
+fn amdgpu_ids_name(ids: &str, device_id: &str, revision: &str) -> Option<String> {
+    let hex = |s: &str| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    let (device, revision) = (hex(device_id)?, hex(revision)?);
+    ids.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ',');
+        let (d, r, name) = (fields.next()?, fields.next()?, fields.next()?);
+        (hex(d)? == device && hex(r)? == revision).then(|| name.trim().to_string())
+    })
 }
 
 /// rocm-smi enumeration info, keyed by lowercase PCI bus id.
@@ -1415,6 +1442,21 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amd_names_come_from_libdrm_without_rocm() {
+        let ids = "# comment\n1.0.0\n744C,\tC8,\tAMD Radeon RX 7900 XTX\n744C,\tCC,\tAMD Radeon RX 7900 XT\n7550,\tC0,\tAMD Radeon RX 9070 XT\n";
+        assert_eq!(
+            amdgpu_ids_name(ids, "0x744c", "0xc8").as_deref(),
+            Some("AMD Radeon RX 7900 XTX")
+        );
+        assert_eq!(
+            amdgpu_ids_name(ids, "0x7550", "0xc0").as_deref(),
+            Some("AMD Radeon RX 9070 XT")
+        );
+        assert_eq!(amdgpu_ids_name(ids, "0x744c", "0xff"), None);
+        assert_eq!(amdgpu_ids_name(ids, "", "0xc8"), None);
+    }
 
     #[test]
     fn hip_indices_follow_the_kfd_topology_without_rocm() {
