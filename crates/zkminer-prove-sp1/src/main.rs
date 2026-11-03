@@ -273,6 +273,12 @@ fn main() {
                 _ => lib.display().to_string(),
             };
             std::env::set_var("LD_LIBRARY_PATH", path);
+            // The SYCL build's Level Zero driver, shipped there: the only one its loader opens, not
+            // also a distribution's (see zkminer-prove-risc0's `use_shipped_level_zero_driver`).
+            let driver = lib.join("libze_intel_gpu.so.1");
+            if driver.is_file() && std::env::var_os("ZE_ENABLE_ALT_DRIVERS").is_none() {
+                std::env::set_var("ZE_ENABLE_ALT_DRIVERS", driver);
+            }
         }
     }
 

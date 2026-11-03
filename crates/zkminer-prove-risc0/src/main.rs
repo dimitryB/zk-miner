@@ -38,7 +38,31 @@ fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::i
     Ok(new)
 }
 
+/// The release's Intel worker ships Intel's Level Zero driver beside it (`zkminer-intel/lib`, from
+/// `Dockerfile.build`'s intel-gpu-runtime). The Level Zero loader (shipped there too) would also open
+/// any other driver it finds on the host by its usual names, such as a distribution's
+/// `libze_intel_gpu_legacy1.so.1`, which adds its devices to the ones `ZE_AFFINITY_MASK` indexes;
+/// `ZE_ENABLE_ALT_DRIVERS` makes the shipped driver the only one. An operator's own setting wins.
+#[cfg(feature = "intel")]
+fn use_shipped_level_zero_driver() {
+    if std::env::var_os("ZE_ENABLE_ALT_DRIVERS").is_some() {
+        return;
+    }
+    let Some(driver) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("zkminer-intel/lib/libze_intel_gpu.so.1")))
+        .filter(|driver| driver.is_file())
+    else {
+        return;
+    };
+    // Before anything starts a thread or initialises Level Zero.
+    std::env::set_var("ZE_ENABLE_ALT_DRIVERS", driver);
+}
+
 fn main() {
+    #[cfg(feature = "intel")]
+    use_shipped_level_zero_driver();
+
     // Direct benchmark mode runs the operator's own guests and prints a human table to the REAL
     // stdout, so it must come before the fd-1 redirect below. It speaks no IPC.
     if std::env::args().any(|a| a == "--benchmark") {
