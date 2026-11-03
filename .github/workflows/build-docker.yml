@@ -26,23 +26,30 @@ permissions:
 
 jobs:
   build:
-    # Docker actions require a Linux environment
-    runs-on: ubuntu-latest
-    # One job per shippable artifact.
+    # One job per shippable artifact, each on its own runner, all at once: the
+    # build takes as long as its slowest target, not the sum of them.
+    # release.yml collects the artifacts and assembles the release from them.
     #
     # `docker build -f Dockerfile.build .` with no --target builds only the LAST
-    # stage in the file and its dependencies. The last stage is dist-rocm, so a
-    # bare build compiled `zkminer-prove-risc0 --features rocm` and nothing else:
-    # the main zkminer CLI, the CUDA and SP1 provers, OpenVM and the Windows
-    # binary were all skipped while the check still reported success. Because
-    # zkminer-prove-risc0 depends only on zkminer-prover-protocol, a compile
-    # error in zkminer-cli, -chain, -tui, -strategy or -prover passed CI green.
+    # stage in the file and its dependencies, so each job names its target: a
+    # bare build once compiled one prover and nothing else while the check
+    # still reported success.
     name: ${{ matrix.target }}
-    # sp1-gpu-server compiles SP1's CUDA kernels on top of the whole prover.
+    # The jobs that compile GPU kernels for every target run on a larger runner
+    # when the repository variable ZKMINER_LARGE_RUNNER names one (a GitHub
+    # larger runner's label, e.g. a 16-core, 64 GB Ubuntu runner set up in the
+    # organisation's settings). Without it they run on the standard runner, as
+    # before, where the CUDA and Intel kernels take most of the six hours a job
+    # may run and only the build cache below keeps later builds short.
+    runs-on: ${{ (matrix.large && vars.ZKMINER_LARGE_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: ${{ matrix.timeout || 120 }}
+    permissions:
+      contents: read
+      # The build cache is an image in this repository's GitHub Container Registry.
+      packages: write
     strategy:
       # Build every target even after one fails — otherwise the first failure
-      # hides the state of the other five.
+      # hides the state of the others.
       fail-fast: false
       matrix:
         include:
@@ -52,19 +59,48 @@ jobs:
             binary: zkminer.exe
           - target: dist-openvm
             binary: zkminer-prove-openvm
-          - target: dist-cuda
-            binary: zkminer-prove-risc0-cuda
-            # Native code for seven GPU families, not two: see NVCC_APPEND_FLAGS in Dockerfile.build.
-            timeout: 240
           - target: dist-sp1
             binary: zkminer-prove-sp1
+          # NVIDIA. Native code for seven GPU families, not two: see NVCC_APPEND_FLAGS in Dockerfile.build.
+          - target: dist-cuda
+            binary: zkminer-prove-risc0-cuda
+            large: true
+            timeout: 350
           - target: dist-sp1-server
             binary: sp1-gpu-server
-            timeout: 300
+            large: true
+            timeout: 350
             # Shipped with it: the CUDA runtime it links, and that file's license.
             extras: libcudart.so.12 libcudart.so.12.LICENSE.txt
+          # AMD: RX 7000 and 9000 (AMD_GPU_TARGETS in Dockerfile.build), on ROCm 10.1.
           - target: dist-rocm
             binary: zkminer-prove-risc0-rocm
+            large: true
+            timeout: 350
+          - target: dist-sp1-server-hip
+            binary: sp1-gpu-server-hip
+            large: true
+            timeout: 350
+          - target: dist-rocm-runtime
+            binary: zkminer-rocm/lib/libamdhip64.so.7
+          # Intel: Arc A and B series. Both build Intel's compute stack from source
+          # first (the intel-gpu-runtime stage), which the cache then keeps.
+          - target: dist-intel
+            binary: zkminer-prove-risc0-intel
+            extras: zkminer-intel/lib/libze_intel_gpu.so.1
+            large: true
+            timeout: 355
+            cache_from: dist-sp1-server-sycl
+          - target: dist-sp1-server-sycl
+            binary: sp1-gpu-server-sycl
+            extras: zkminer-intel/lib/libsp1_gpu_sycl.so
+            large: true
+            timeout: 355
+            cache_from: dist-intel
+          # Not shipped: what release.yml's GPU validation runs.
+          - target: dist-localnet-test
+            binary: localnet
+            extras: anvil
 
     steps:
       - name: "Checkout repository"
@@ -73,55 +109,96 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      # The hosted runner's image carries toolchains none of these builds use;
+      # the ROCm, oneAPI and LLVM builds need the room.
+      - name: "Free disk space"
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          df -h /
+
       # `--output` is a BuildKit feature; the classic builder ignores it.
       - name: "Set up Buildx"
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
+      # The build cache: every layer of the target's build (mode=max), in
+      # ghcr.io/<owner>/zk-miner-build-cache:<target>, read by every build and
+      # written by those that can (not a pull request from a fork, whose token
+      # cannot write packages). The layers that matter are the toolchains and,
+      # through cargo-chef (the planner stage), each risc0 worker's compiled
+      # dependencies: the GPU kernels, rebuilt only when Cargo.lock changes.
+      - name: "Log in to the build cache"
+        id: cache
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          echo "ref=ghcr.io/${OWNER,,}/zk-miner-build-cache" >> "$GITHUB_OUTPUT"
+          if [ "$FORK" = true ]; then
+            echo "write=false" >> "$GITHUB_OUTPUT"
+            echo "a pull request from a fork: reading the cache only"
+          else
+            echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+            echo "write=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # EXTRACT the binary instead of discarding it.
       #
-      # Every `dist-*` stage is a `FROM scratch` container holding exactly one
-      # binary, and exists only to be exported — the Dockerfile's own usage line
+      # Every `dist-*` stage is a `FROM scratch` container holding exactly what
+      # ships, and exists only to be exported — the Dockerfile's own usage line
       # says so. Building without `--output` proved the code compiled and then
-      # threw all six binaries away, so no build produced anything anyone could
+      # threw the binaries away, so no build produced anything anyone could
       # download or test.
       #
       # The token is for rzup, in the risc0 stages: GitHub's unauthenticated API
       # limits requests per IP, which runners share, and failed builds there.
       # Passed as a secret, it never goes into a layer or the build cache.
-      - name: "Build and extract ${{ matrix.binary }}"
+      - name: "Build and extract ${{ matrix.target }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CACHE: ${{ steps.cache.outputs.ref }}
+          WRITE: ${{ steps.cache.outputs.write }}
+          TARGET: ${{ matrix.target }}
+          ALSO: ${{ matrix.cache_from }}
+          # nvcc compiles four GPU targets at once on a large runner, two on a standard one.
+          NVCC_THREADS: ${{ (matrix.large && vars.ZKMINER_LARGE_RUNNER) && '4' || '2' }}
         run: |
+          set -euo pipefail
+          cache=(--cache-from "type=registry,ref=$CACHE:$TARGET")
+          [ -n "$ALSO" ] && cache+=(--cache-from "type=registry,ref=$CACHE:$ALSO")
+          [ "$WRITE" = true ] && cache+=(--cache-to "type=registry,ref=$CACHE:$TARGET,mode=max,ignore-error=true")
           docker buildx build \
             -f Dockerfile.build \
-            --target ${{ matrix.target }} \
+            --target "$TARGET" \
+            --build-arg NVCC_THREADS="$NVCC_THREADS" \
             --secret id=github_token,env=GITHUB_TOKEN \
+            "${cache[@]}" \
             --output type=local,dest=dist \
             .
 
       - name: "Verify and checksum"
+        env:
+          BINARY: ${{ matrix.binary }}
+          EXTRAS: ${{ matrix.extras }}
         run: |
           set -euo pipefail
           cd dist
-          test -s "${{ matrix.binary }}" || {
-            echo "::error::${{ matrix.binary }} is missing or empty after extraction"
-            ls -la
-            exit 1
-          }
-          for f in ${{ matrix.extras }}; do
+          for f in "$BINARY" $EXTRAS; do
             test -s "$f" || {
               echo "::error::$f is missing or empty after extraction"
-              ls -la
+              find . -maxdepth 3 | head -50
               exit 1
             }
           done
-          chmod +x "${{ matrix.binary }}" || true
-          sha256sum "${{ matrix.binary }}" | tee "${{ matrix.binary }}.sha256"
-          ls -la
+          chmod +x "$BINARY" || true
+          sha256sum "$BINARY" | tee "$(basename "$BINARY").sha256"
+          du -sh . && find . -type f | wc -l
 
       # Downloadable from the run's Artifacts section by anyone who can see the
       # repo, on EVERY build — push, PR and manual dispatch alike.
-      - name: "Upload ${{ matrix.binary }}"
+      - name: "Upload ${{ matrix.target }}"
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.target }}
