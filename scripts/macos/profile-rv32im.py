@@ -21,7 +21,7 @@ def gpu_stage(row):
     if row["segment"] < 0:
         return "recursion"
     kernel = row["kernel"]
-    if kernel == "eval_check":
+    if kernel in {"eval_check", "ef_prep", "ef_eval_split", "ef_combine"}:
         return "constraint_evaluation"
     if kernel.startswith("multi_ntt") or kernel in {"multi_bit_reverse", "zk_shift", "batch_expand"}:
         return "polynomial_transforms"

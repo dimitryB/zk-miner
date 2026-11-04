@@ -1,5 +1,29 @@
 # macOS proving handoff
 
+## Reopened WP1 evalfast port — 2026-11-04
+
+Engine `d194533fa5138a8d9a352c977ae622d59cca4d41` regenerates the
+in-tree evalfast pipeline through `remat_lu.py` and emits the main/LogUp
+phase split as MSL. Select it with `RISC0_RV32IM_EVALFAST=1`; leaving that
+variable unset retains the tail-split/256 fallback. The synthetic po2-20 CPU
+oracle passed at 1.694 s repeat GPU time, and po2-14/18/20 real-witness proofs
+passed CPU differentials and external verification. Single verified 10M
+arithmetic and hashing diagnostics saved 32.10 s and 36.07 s in complete time
+against the prior tail-split/256 run. The 20-request lifecycle passed with
+21 verified proofs, 63 tamper rejections, cancellation, a calibrated helper
+watchdog, recovery and shutdown. Nine workload-limit controls passed. Pressure
+stayed normal; idle footprint decreased 12.39% from the first proof and varied
+0.25% after settling.
+The default tail-split/256 fallback also passed a fresh po2-14 real-witness
+CPU differential and complete proof. The initial 10-second watchdog control
+failed because it sampled a partial sidecar; its diagnostic run is preserved.
+The MSL generator currently stops after `remat_lu.py`; the later CUDA
+`mksm2.py` and `mksub.py` passes remain to port.
+
+The LogUp-removal timing diagnosis below was negative, while the wide-arithmetic
+evalfast port met the timing target. Keep the two results separate when
+reviewing the mechanism.
+
 ## Phase 2 WP1 reopened — 2026-11-04
 
 The owner reset WP1's iteration budget and specified a port of the in-tree

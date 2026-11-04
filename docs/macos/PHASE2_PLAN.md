@@ -21,6 +21,26 @@ proof. This is a percent-scale result, so it does not confirm the proposed
 multiples-scale live-state diagnosis. See
 `evidence/phase2-wp1-logup-probe.{json,csv}`.
 
+Engine `d194533fa5138a8d9a352c977ae622d59cca4d41` now regenerates the
+evalfast pass output through `remat_lu.py` during the Metal build and translates
+its main/LogUp phase split to three MSL kernels. Set
+`RISC0_RV32IM_EVALFAST=1` to select it; the existing tail-split/256 evaluator
+remains the default fallback. The isolated po2-20 CPU differential passed with
+1.694 s repeat GPU time at 256 threads and 1.741 s at 512 threads. Complete
+po2-14, po2-18 and po2-20 proofs passed real-witness CPU differentials and the
+external verifier. In 10M diagnostics, the three-kernel constraint stage took 16.899 s
+for arithmetic and 16.948 s for hashing, saving 30.914 s and 34.111 s against
+the prior tail-split/256 diagnostics. The same phase split without `EF_WIDE`
+took 4.766 s per repeat po2-20 dispatch. The 20-request lifecycle passed with
+21 verified proofs including recovery, 63 tamper rejections, cancellation,
+helper timeout, restart, and shutdown. Nine workload-limit controls passed.
+Pressure stayed normal. Idle footprint fell 12.39% from the first proof, then
+varied 0.25% after settling. A separate po2-14 proof passed with the default
+tail-split/256 fallback and CPU differential.
+See `evidence/phase2-wp1-evalfast.json` for source hashes and verified run paths.
+This first MSL target stops after `remat_lu.py`; CUDA's `mksm2.py` shared-memory
+placement and `mksub.py` chain tails remain follow-on port work.
+
 Source brief: `Phase 2 spec Metal proving performance on macOS.md`, dated
 2026-11-04, SHA-256
 `22c73353915de7154577858ab4556d6d52fc6af3f463b3e6b2009f3ec5c707b7`.
@@ -44,7 +64,7 @@ brief remains the detailed technical and acceptance specification.
 | Package | Required gate | Status |
 | --- | --- | --- |
 | WP0 baseline and GPU timing | Sealed archive; five warm proofs per 10M fixture, one 46M proof; per-kernel GPU and pipeline statistics | Baseline, profiles, CPU-only build, limits, and 20-request lifecycle measured; transform GPU-only wall reconciliation misses 10%; Linux cross-target compile unavailable locally |
-| WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Reopened with reset iterations; evalfast-to-MSL phase split first. Prior trial missed gate; LogUp-removal diagnosis was percent-scale |
+| WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Opt-in evalfast phase split meets synthetic and single 10M diagnostic timing gates; exact synthetic and real-witness differentials, fallback proof, and 20-request lifecycle pass |
 | WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | Pending |
 | WP3 transforms | At most 0.8 s per po2-20 segment, exact primitive tests and unchanged Merkle outputs | Pending |
 | WP5 po2 21 assessment | Faster than po2 20 within measured memory ceiling | Pending; owner approval before changing default |

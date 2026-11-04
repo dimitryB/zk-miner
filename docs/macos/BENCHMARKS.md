@@ -1,5 +1,37 @@
 # macOS proving measurements
 
+## Reopened WP1 evalfast phase split — 2026-11-04
+
+The in-tree evalfast output through `remat_lu.py` is regenerated and translated
+to MSL. The three-kernel path is selected by `RISC0_RV32IM_EVALFAST=1`; the
+tail-split/256 evaluator remains the default fallback. The isolated po2-20
+CPU differential matched the fallback output hash, with 1.694 s repeat GPU
+time at 256 threads (1.741 s at 512 threads). Complete po2-14, po2-18 and
+po2-20 proofs passed real-witness CPU differentials and external verification.
+The same phase split without evalfast's `EF_WIDE` arithmetic took 4.766 s
+per repeat dispatch, so the measured gain cannot be attributed to removing
+LogUp work alone.
+
+| Verified 10M diagnostic, 12 GiB host reserve | Tail-split/256 | Evalfast phase split | Saving |
+| --- | ---: | ---: | ---: |
+| Arithmetic constraint wall | 47.813 s | 16.899 s | 30.914 s |
+| Arithmetic complete proof and verifier | 118.593 s | 86.494 s | 32.099 s |
+| Hashing constraint wall | 51.059 s | 16.948 s | 34.111 s |
+| Hashing complete proof and verifier | 124.648 s | 88.577 s | 36.072 s |
+
+These are single diagnostic proofs per fixture, with ten po2-20 segments each.
+The evalfast split kernel's median GPU time per segment was 1.624 s for
+arithmetic and 1.623 s for hashing; each segment stayed below 1.667 s.
+The 20-request lifecycle passed with 21 verified proofs including recovery,
+63 tamper rejections, cancellation, a calibrated helper watchdog, restart and
+shutdown. Nine workload-limit controls also passed. The first-to-last idle
+footprint fell 12.39%; after settling, the range was 0.25%. Pressure stayed
+normal. A separate po2-14 proof passed with
+the default tail-split/256 fallback and real-witness CPU differential. The
+first lifecycle attempt completed 20 steady proofs but its 10-second watchdog
+captured an incomplete sidecar; the calibrated 20-second rerun passed. Raw run
+paths and source hashes are in [evalfast evidence](evidence/phase2-wp1-evalfast.json).
+
 ## Reopened WP1 LogUp timing diagnosis — 2026-11-04
 
 An isolated timing-only shader removed the LogUp continuation at the

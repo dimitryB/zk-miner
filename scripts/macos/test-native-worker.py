@@ -46,6 +46,8 @@ def main():
     parser.add_argument("--po2", type=int, choices=range(14,21))
     parser.add_argument("--session-limit", type=int, default=67_108_864, help="maximum guest cycles, 1..67108864")
     parser.add_argument("--timeout-seconds", type=int, default=600, help="per-proof watchdog, 30..3600 seconds")
+    parser.add_argument("--failure-timeout-seconds", type=int, default=10,
+                        help="lifecycle watchdog while a real helper is running, 1..300 seconds")
     parser.add_argument("--min-guest-cycles", type=int, default=1)
     parser.add_argument("--warmup", action="store_true", help="one extra complete proof before the measured repeats")
     parser.add_argument("--paired-baseline", type=Path, help="frozen step-5 worker for a counterbalanced CPU-segment/resident-Metal comparison")
@@ -67,6 +69,8 @@ def main():
         parser.error("use 1..20 repeats; lifecycle acceptance requires at least three")
     if not 1 <= args.session_limit <= 67_108_864 or not 30 <= args.timeout_seconds <= 3600:
         parser.error("invalid session limit or watchdog")
+    if not 1 <= args.failure_timeout_seconds <= 300:
+        parser.error("invalid lifecycle failure watchdog")
     if not 1 <= args.min_guest_cycles <= args.session_limit:
         parser.error("minimum guest cycles must fit session limit")
     planned_requests, suite_timeout = suite_budget(args)
@@ -104,7 +108,7 @@ def main():
                ZKMINER_MACOS_MIN_GUEST_CYCLES=str(args.min_guest_cycles),
                ZKMINER_RISC0_MAX_GUEST_CYCLES=str(args.session_limit),
                ZKMINER_MACOS_LIFECYCLE="0" if args.proof_only else "1",
-               ZKMINER_MACOS_FAILURE_TIMEOUT_SECS="10", RAYON_NUM_THREADS=str(args.rayon_threads),
+               ZKMINER_MACOS_FAILURE_TIMEOUT_SECS=str(args.failure_timeout_seconds), RAYON_NUM_THREADS=str(args.rayon_threads),
                ZKMINER_RISC0_CPU_THREADS=str(args.rayon_threads), RISC0_GROTH16_NATIVE_THREADS=str(args.go_threads),
                ZKMINER_MACOS_ADMISSION_PRESSURE="1" if args.admission_pressure else "0",
                PATH=str(directory / "bin") + os.pathsep + os.environ["PATH"])

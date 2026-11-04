@@ -1,6 +1,6 @@
 //! Isolated evaluator feasibility gate. This never produces or submits a proof.
 use anyhow::{bail, ensure, Context, Result};
-use metal::{CompileOptions, ComputePipelineDescriptor};
+use metal::CompileOptions;
 use objc::{msg_send, sel, sel_impl};
 use rayon::prelude::*;
 use risc0_circuit_rv32im_sys::risc0_circuit_rv32im_cpu_poly_fp;
@@ -184,18 +184,14 @@ fn hash(buffer: &BufferImpl<E>) -> String {
 // queue and synchronous completion; count only successfully completed commands.
 fn dispatch(
     gpu: &MetalHalPoseidon2,
-    kernel: &ComputePipelineDescriptor,
+    pipeline: &metal::ComputePipelineState,
     args: &[KernelArg<'_>],
     count: usize,
 ) -> Result<Value> {
     metal::objc::rc::autoreleasepool(|| -> Result<Value> {
-        let pipeline = gpu
-            .device
-            .new_compute_pipeline_state_with_function(kernel.compute_function().unwrap())
-            .map_err(|e| anyhow::anyhow!(e))?;
         let command = gpu.cmd_queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_compute_pipeline_state(pipeline);
         for (index, arg) in args.iter().enumerate() {
             match arg {
                 KernelArg::Buffer { buffer, offset } => {
@@ -256,11 +252,12 @@ fn dispatch(
 
 fn run_case(
     gpu: &MetalHalPoseidon2,
-    kernel: &ComputePipelineDescriptor,
+    kernels: &[metal::ComputePipelineState],
     po2: usize,
     seed: u32,
     exponents: &[usize],
     timing_only: bool,
+    phase_split: bool,
 ) -> Result<Value> {
     let start = Instant::now();
     let domain = (1usize << po2) * 4;
@@ -306,6 +303,11 @@ fn run_case(
         );
     }
     let normalization_buffer = gpu.copy_from_elem("rv32im_normalization", &normalization);
+    let table = phase_split.then(|| gpu.alloc_extelem("rv32im_evalfast_table", 627));
+    let scratch = phase_split.then(|| storage(gpu, "rv32im_evalfast_scratch", domain * 4));
+    let scratch_slice = scratch
+        .as_ref()
+        .map(|buffer| buffer.slice(GUARD, domain * 4));
     emit(
         "inputs_ready",
         json!({"po2":po2,"seed":seed,"domain":domain,"setup_seconds":start.elapsed().as_secs_f64()}),
@@ -324,7 +326,55 @@ fn run_case(
         KernelArg::Integer(po2 as u32),
         KernelArg::Integer(domain as u32),
     ];
-    let command = dispatch(gpu, kernel, arguments, domain)?;
+    let execute = || -> Result<Value> {
+        if phase_split {
+            let table = table.as_ref().unwrap();
+            let scratch = scratch_slice.as_ref().unwrap();
+            let prep = dispatch(
+                gpu,
+                &kernels[0],
+                &[
+                    power_buf.as_arg(),
+                    out.as_arg(),
+                    mix.as_arg(),
+                    table.as_arg(),
+                ],
+                1,
+            )?;
+            let split = dispatch(
+                gpu,
+                &kernels[1],
+                &[
+                    check.as_arg(),
+                    data.as_arg(),
+                    accum.as_arg(),
+                    mix.as_arg(),
+                    out.as_arg(),
+                    table.as_arg(),
+                    scratch.as_arg(),
+                    KernelArg::Integer(domain as u32),
+                ],
+                2 * domain,
+            )?;
+            let combine = dispatch(
+                gpu,
+                &kernels[2],
+                &[
+                    check.as_arg(),
+                    scratch.as_arg(),
+                    normalization_buffer.as_arg(),
+                    KernelArg::Integer(domain as u32),
+                ],
+                domain,
+            )?;
+            return Ok(json!({"status":"Completed","gpu_seconds":
+                prep["gpu_seconds"].as_f64().unwrap() + split["gpu_seconds"].as_f64().unwrap()
+                + combine["gpu_seconds"].as_f64().unwrap(),
+                "prep":prep,"split":split,"combine":combine}));
+        }
+        dispatch(gpu, &kernels[0], arguments, domain)
+    };
+    let command = execute()?;
     let gpu_seconds = gpu_start.elapsed().as_secs_f64();
     emit(
         "gpu_complete",
@@ -334,7 +384,7 @@ fn run_case(
         let first_output_sha256 = hash(&check);
         check.view_mut(|values| values.fill(SENTINEL));
         let reuse_started = Instant::now();
-        let reuse_command = dispatch(gpu, kernel, arguments, domain)?;
+        let reuse_command = execute()?;
         let reuse_seconds = reuse_started.elapsed().as_secs_f64();
         ensure!(
             hash(&check) == first_output_sha256,
@@ -432,7 +482,7 @@ fn run_case(
     }
     check.view_mut(|values| values.fill(SENTINEL));
     let reuse_started = Instant::now();
-    let reuse_command = dispatch(gpu, kernel, arguments, domain)?;
+    let reuse_command = execute()?;
     let reuse_seconds = reuse_started.elapsed().as_secs_f64();
     compare()?;
     ensure!(
@@ -468,6 +518,7 @@ fn main() -> Result<()> {
         std::path::Path::new(&args[1]).with_extension("json"),
     )?)?;
     let timing_only = metadata["timing_only"].as_bool().unwrap_or(false);
+    let phase_split = metadata["phase_split"].as_bool().unwrap_or(false);
     ensure!(
         !timing_only || std::env::var("RV32IM_TIMING_ONLY").as_deref() == Ok("1"),
         "timing-only shader requires explicit RV32IM_TIMING_ONLY=1"
@@ -495,23 +546,31 @@ fn main() -> Result<()> {
             .new_library_with_source(&source, &options)
             .map_err(|e| anyhow::anyhow!("RV32IM MSL compilation: {e}"))?;
         let library_seconds = start.elapsed().as_secs_f64();
-        let function = library
-            .get_function("eval_check", None)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let kernel = ComputePipelineDescriptor::new();
-        kernel.set_compute_function(Some(&function));
-        let start = Instant::now();
-        let pipeline = gpu
-            .device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        emit(
-            "compiled",
-            json!({"library_seconds":library_seconds,"pipeline_seconds":start.elapsed().as_secs_f64(),
+        let entries: Vec<&str> = if phase_split {
+            vec!["ef_prep", "ef_eval_split", "ef_combine"]
+        } else {
+            vec![metadata["entry_point"].as_str().unwrap_or("eval_check")]
+        };
+        let mut pipelines = Vec::new();
+        for entry in entries {
+            let function = library
+                .get_function(entry, None)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let start = Instant::now();
+            let pipeline = gpu
+                .device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            emit(
+                "compiled",
+                json!({"entry_point":entry,"library_seconds":library_seconds,
+            "pipeline_seconds":start.elapsed().as_secs_f64(),
             "max_threads_per_threadgroup":pipeline.max_total_threads_per_threadgroup(),
             "thread_execution_width":pipeline.thread_execution_width(),
             "static_threadgroup_bytes":pipeline.static_threadgroup_memory_length()}),
-        )?;
+            )?;
+            pipelines.push(pipeline);
+        }
         let mut cases = Vec::new();
         if args[2] != "compile" {
             let seed: u32 = args.get(3).map(String::as_str).unwrap_or("1").parse()?;
@@ -524,7 +583,15 @@ fn main() -> Result<()> {
                         .any(|case: &Value| case["po2"].as_u64() == Some(po2 as u64)),
                     "duplicate po2"
                 );
-                cases.push(run_case(&gpu, &kernel, po2, seed, &exponents, timing_only)?);
+                cases.push(run_case(
+                    &gpu,
+                    &pipelines,
+                    po2,
+                    seed,
+                    &exponents,
+                    timing_only,
+                    phase_split,
+                )?);
             }
         }
         emit(
