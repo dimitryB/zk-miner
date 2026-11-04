@@ -1,5 +1,23 @@
 # macOS proving handoff
 
+## Phase 2 fold-only cleanup — 2026-11-04
+
+Engine `fca0c099582f15729f98af0743f45bc56c217705` removes the retired
+fold-only Metal adapter, hybrid feature chain, and `LocalProver::new_metal`.
+The old isolated hybrid probe manifest and launcher are removed from the miner.
+The shared `tools/macos-proof/src/main.rs` is retained unchanged because it is
+an input to the pinned external verifier. The resident RV32IM and recursion
+Metal feature paths remain active. The cleanup worker SHA-256 is
+`c5f369bb7f76d6bdb61823149997e850bbb47299981be58cde17ae7aff31b7f5`;
+it differs from the measured WP1 binary. A fresh po2-20 proof passed its
+real-witness CPU differential, unchanged verifier, and three tamper rejections.
+Native and CPU-only worker unit builds each passed five tests. The WP1 timing
+numbers below belong to the preceding WP1 worker; no performance claim is made
+for this cleanup build. The final-binary lifecycle passed 20 steady proofs plus
+one recovery proof and 63 tamper rejections; idle footprint drift was **−0.68%**
+with normal sampled pressure. Cancellation, worker timeout, restart and shutdown
+passed. See [cleanup evidence](evidence/phase2-fold-cleanup.json).
+
 ## Phase 2 WP1 checkpoint — 2026-11-04
 
 The Phase 2 branches now carry the bounded RV32IM evaluator trial. Engine

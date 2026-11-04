@@ -119,3 +119,20 @@ tamper rejections. First-to-last steady idle worker footprint changed by
 shutdown controls passed, as did nine workload-limit rejections. The helper
 timeout control was not exercised in this run. The checkpoint has no new crates
 or version bumps. Linux cross-target compilation remains unavailable locally.
+
+## Fold-only cleanup
+
+A dedicated follow-up engine commit,
+`fca0c099582f15729f98af0743f45bc56c217705`, removes the old fold-only
+Metal HAL, CPU fold adapter, hybrid feature chain and local prover constructor.
+The miner's isolated hybrid probe manifest and launcher are removed. The
+shared verifier source and its provenance script remain unchanged to preserve
+the pinned verifier binary. The active resident Metal worker was rebuilt and
+resealed at the cleanup engine commit; its SHA-256 is
+`c5f369bb7f76d6bdb61823149997e850bbb47299981be58cde17ae7aff31b7f5`.
+This binary differs from the preceding WP1 measurement binary, so its timing
+gate is not reinterpreted. A fresh po2-20 CPU differential and verified proof
+passed. The 20-request lifecycle plus recovery proof passed with 63 tamper
+rejections, −0.68% idle footprint drift and normal sampled pressure.
+Cancellation, worker timeout, restart and shutdown controls passed. See
+`evidence/phase2-fold-cleanup.json` for the validation record.

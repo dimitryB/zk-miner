@@ -1,5 +1,9 @@
 # macOS proving measurements
 
+The separate fold-only cleanup changed the worker binary after the WP1 timing
+campaign. Its validation is in [cleanup evidence](evidence/phase2-fold-cleanup.json);
+the performance measurements below refer to the preceding WP1 binary.
+
 ## Phase 2 WP1 bounded evaluator trial — 2026-11-04
 
 Engine `afd4342f90160c60829818dca953bcfe952a5639` splits all 20 generated
