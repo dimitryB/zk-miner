@@ -15,6 +15,9 @@ license gmmlib gmmlib/LICENSE.md
 
 echo "== IGC 2.28.4, with LLVM 16.0.6"
 fetch igc intel/intel-graphics-compiler 6b2da2b8a2661adeaebaacbbbf7f35b5ee9e8124 v2.28.4
+# A quadratic loop in MergeAllocas, which took the ahead-of-time compile of risc0's eval_check about
+# 48 minutes per Intel GPU target instead of about 5. The same code comes out; see the patch.
+patch -d igc -p1 --forward < "$(dirname "$(readlink -f "$0")")/patches/igc-2.28.4-mergeallocas-start-index.patch"
 fetch vc-intrinsics intel/vc-intrinsics a833c8e165ebcd6c44dbb8f771ab7197fc752472 v0.24.3
 fetch SPIRV-Tools KhronosGroup/SPIRV-Tools 28a883ba4c67f58a9540fb0651c647bb02883622
 fetch SPIRV-Headers KhronosGroup/SPIRV-Headers 9268f3057354a2cb65991ba5f38b16d81e803692

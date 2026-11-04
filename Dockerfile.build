@@ -596,6 +596,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         bison flex pkg-config zlib1g-dev libzstd-dev patchelf file \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/ci/intel-gpu-build-lib.sh scripts/ci/build-intel-igc.sh /usr/local/bin/
+COPY scripts/ci/patches/igc-2.28.4-mergeallocas-start-index.patch /usr/local/bin/patches/
 RUN build-intel-igc.sh /opt/zkminer-intel-gpu && rm -rf /tmp/intel-gpu-src
 
 FROM intel-igc AS intel-gpu-runtime
