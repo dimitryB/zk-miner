@@ -1,5 +1,50 @@
 # macOS proving measurements
 
+## Phase 2 WP1 bounded evaluator trial — 2026-11-04
+
+Engine `afd4342f90160c60829818dca953bcfe952a5639` splits all 20 generated
+RV32IM chain functions at low-live-value points and uses 256-thread groups.
+The worker SHA-256 is
+`9b0f07321888abf9292c466fe4d3dee93d499de3dca8b03cec491020d66bc2c1`;
+the original external verifier is unchanged. Synthetic CPU comparisons passed
+at po2 4/8/14/18/20 with output reuse, and real-witness differentials plus
+complete verification passed at po2 14/18/20. All three tamper checks passed
+for each complete proof.
+
+| Po2-20 synthetic split shader | 32 threads | 64 threads | 128 threads | 256 threads |
+| --- | ---: | ---: | ---: | ---: |
+| Repeated dispatch | 5.087 s | 5.079 s | 5.033 s | **4.866 s** |
+
+The in-tree fast Fp and FpExt reduction forms were ported as optional shader
+variants and passed the synthetic differential, but their repeated po2-20
+dispatches took 5.205 and 5.373 s at 256 threads. The split-only form is
+retained. Metal reported 32-thread execution width, 1024 maximum threads per
+group and zero static threadgroup bytes; register/spill counts were unavailable
+through the runtime API.
+
+| Single 10M diagnostic, 12 GiB host reserve | WP0 instrumented worker | WP1 split worker | Change |
+| --- | ---: | ---: | ---: |
+| Arithmetic constraint stage wall | 57.295 s | 47.813 s | −9.482 s |
+| Arithmetic constraint GPU execution | 55.902 s | 46.495 s | −9.407 s |
+| Arithmetic complete proof and external verification | 128.053 s | 118.593 s | −9.460 s |
+| Hashing constraint stage wall | 57.207 s | 51.059 s | −6.148 s |
+| Hashing constraint GPU execution | 55.812 s | 49.812 s | −6.000 s |
+| Hashing complete proof and external verification | 129.157 s | 124.648 s | −4.509 s |
+
+These are one diagnostic proof per worker and fixture, not paired warm medians.
+WP1 constraint wall time is **4.78 s per arithmetic segment** and **5.11 s per
+hashing segment**, above the ≤2.0 s gate. The five-pair ≥25 s whole-proof gate
+was therefore not claimed. Both WP1 proofs verified independently with six
+negative checks; group peaks were 15.417/15.429 GiB and sampled pressure was
+normal. The generated main/LogUp phase split and scratch-buffer lazy reduction
+remain future work. See [WP1 evidence](evidence/phase2-wp1-iteration.json).
+
+The checkpoint lifecycle passed 20 steady proofs plus one recovery proof and
+63 tamper rejections. Idle worker footprint changed by −0.42% from the first
+to twentieth steady request; all sampled pressure readings were normal.
+Cancellation, worker timeout, restart, shutdown, and nine limit controls
+passed. Helper timeout was not exercised in this run.
+
 ## Phase 2 starting baseline — 2026-11-04
 
 The Phase 1 source commits were rebuilt and sealed as a new Phase 2 baseline:

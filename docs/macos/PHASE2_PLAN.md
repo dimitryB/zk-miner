@@ -23,7 +23,7 @@ brief remains the detailed technical and acceptance specification.
 | Package | Required gate | Status |
 | --- | --- | --- |
 | WP0 baseline and GPU timing | Sealed archive; five warm proofs per 10M fixture, one 46M proof; per-kernel GPU and pipeline statistics | Baseline, profiles, CPU-only build, limits, and 20-request lifecycle measured; transform GPU-only wall reconciliation misses 10%; Linux cross-target compile unavailable locally |
-| WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Pending |
+| WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Bounded split/reduction/threadgroup trials complete; exact differential and 20-request lifecycle passed, but 4.78/5.11 s per segment misses performance gate |
 | WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | Pending |
 | WP3 transforms | At most 0.8 s per po2-20 segment, exact primitive tests and unchanged Merkle outputs | Pending |
 | WP5 po2 21 assessment | Faster than po2 20 within measured memory ceiling | Pending; owner approval before changing default |
@@ -88,3 +88,34 @@ failure remains under `target/macos/phase2/baseline/hash-10m.log`. A new
 hashing and stretch campaign uses the previously documented 12 GiB local trial
 override; the default worker policy is unchanged. Campaign settings are
 recorded separately in the evidence.
+
+## WP1 bounded iteration
+
+Engine `afd4342f90160c60829818dca953bcfe952a5639` adds a generated
+function-tail split to all 20 RV32IM chain functions and selects 256 threads
+per group. The pass reissues only literal field constants and immutable trace
+loads in each tail; the original CPU/CUDA normalized body check still runs
+before the transformation. The isolated Metal prototype matched the CPU oracle
+at po2 4, 8, 14, 18, and 20, including a repeated dispatch. Complete proofs
+at po2 14, 18, and 20 passed real-witness CPU differentials and the unchanged
+external verifier. The worker SHA-256 is
+`9b0f07321888abf9292c466fe4d3dee93d499de3dca8b03cec491020d66bc2c1`.
+
+The second iteration retargeted the in-tree fast Fp and extension-field
+reduction forms as opt-in RV32IM-only shader variants. Both were exact in the
+synthetic matrix but slower at po2 20, so production leaves them disabled. The
+third iteration swept 32/64/128/256 threads on the split shader; 256 was
+fastest. One diagnostic 10M proof per fixture measured constraint wall time
+at 47.813 s arithmetic and 51.059 s hashing, or 4.78 and 5.11 s per segment.
+The ≤2.0 s gate is missed, so no five-pair ≥25 s saving claim is made. The
+main/LogUp phase split from the evalfast pipeline, lazy Fp values across a
+scratch buffer, and the resulting larger occupancy target remain unported.
+See `BENCHMARKS.md` and `evidence/phase2-wp1-iteration.json` for the bounded
+trial and validation record.
+
+The lifecycle passed 20 steady proofs and one recovery proof, each with three
+tamper rejections. First-to-last steady idle worker footprint changed by
+−0.42%; pressure stayed normal. Cancellation, worker timeout, restart, and
+shutdown controls passed, as did nine workload-limit rejections. The helper
+timeout control was not exercised in this run. The checkpoint has no new crates
+or version bumps. Linux cross-target compilation remains unavailable locally.

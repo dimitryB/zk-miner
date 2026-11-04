@@ -1,5 +1,31 @@
 # macOS proving handoff
 
+## Phase 2 WP1 checkpoint — 2026-11-04
+
+The Phase 2 branches now carry the bounded RV32IM evaluator trial. Engine
+`afd4342f90160c60829818dca953bcfe952a5639` generates a low-live-value
+tail split for all 20 chain functions and selects 256-thread groups. The
+sealed native worker SHA-256 is
+`9b0f07321888abf9292c466fe4d3dee93d499de3dca8b03cec491020d66bc2c1`.
+Synthetic CPU comparisons passed at po2 4/8/14/18/20; complete po2 14/18/20
+proofs passed the real-witness CPU differential, unchanged verifier, and all
+three tamper checks. Native and CPU-only unit builds passed. The optional
+fast-reduction variants were slower and are disabled.
+The 20-request lifecycle passed with **−0.42%** first-to-last idle footprint
+drift, plus one verified restart proof, 63 tamper rejections, cancellation,
+worker timeout, shutdown, and nine limit controls. Helper timeout was not
+exercised. Linux cross-target compilation was unavailable locally.
+
+Single diagnostic 10M proofs measured **47.813 s arithmetic** and **51.059 s
+hashing** constraint wall time, or **4.78/5.11 s per segment**. Complete proof
+plus external verification took **118.593/124.648 s**, versus the WP0
+diagnostic **128.053/129.157 s**. The ≤2.0 s per-segment WP1 gate is missed;
+these are unpaired single proofs, so the ≥25 s five-pair whole-proof gate is
+unclaimed. The main/LogUp phase split and lazy scratch-buffer reduction remain
+unported. See [WP1 measurements](BENCHMARKS.md) and
+[WP1 evidence](evidence/phase2-wp1-iteration.json). The next package in the
+brief is WP2 segment pipelining.
+
 ## Phase 2 current status — 2026-11-04
 
 New `codex/hemi-macos-metal-phase2` branches started at miner
@@ -27,9 +53,7 @@ passed. First-to-last idle footprint drift was **4.49%**; see
 12–13% below transform wall time, outside the brief's 10% reconciliation gate;
 about 1.9 s is measured host dispatch overhead. Linux cross-target compilation
 was unavailable because only the Apple Silicon target is installed locally.
-Next: start WP1's evaluator split from this measured profile and keep the
-transform timing gap explicit. The protected circuit, verifier, seal, and
-dependency versions have not changed.
+The protected circuit, verifier, seal, and dependency versions have not changed.
 
 ## Review follow-up — validation complete
 

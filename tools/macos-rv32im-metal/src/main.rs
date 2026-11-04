@@ -420,7 +420,7 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     ensure!(
         args.len() >= 3,
-        "usage: prototype SHADER [compile|PO2] [SEED]"
+        "usage: prototype SHADER [compile|PO2[,PO2...]] [SEED]"
     );
     let source = std::fs::read_to_string(&args[1])?;
     let metadata: Value = serde_json::from_slice(&std::fs::read(
@@ -468,10 +468,18 @@ fn main() -> Result<()> {
         )?;
         let mut cases = Vec::new();
         if args[2] != "compile" {
-            let po2: usize = args[2].parse().context("invalid po2")?;
-            ensure!((4..=20).contains(&po2), "po2 must be 4..20");
             let seed: u32 = args.get(3).map(String::as_str).unwrap_or("1").parse()?;
-            cases.push(run_case(&gpu, &kernel, po2, seed, &exponents)?);
+            for value in args[2].split(',') {
+                let po2: usize = value.parse().context("invalid po2")?;
+                ensure!((4..=20).contains(&po2), "po2 must be 4..20");
+                ensure!(
+                    !cases
+                        .iter()
+                        .any(|case: &Value| case["po2"].as_u64() == Some(po2 as u64)),
+                    "duplicate po2"
+                );
+                cases.push(run_case(&gpu, &kernel, po2, seed, &exponents)?);
+            }
         }
         emit(
             "result",
