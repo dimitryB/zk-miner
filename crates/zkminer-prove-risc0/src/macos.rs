@@ -455,6 +455,8 @@ fn prove_staged(
     let recursion_before = risc0_zkvm::metal_recursion_stats();
     #[cfg(feature = "macos-rv32im-metal")]
     let segment_before = risc0_zkvm::metal_rv32im_stats();
+    #[cfg(feature = "macos-rv32im-metal")]
+    let gpu_before = risc0_zkp::hal::metal::metal_gpu_stats();
     let filename = if operation == "prove" {
         format!("{}-{request_id}.json", std::process::id())
     } else {
@@ -515,6 +517,9 @@ fn prove_staged(
                     "hal_kernel_source_sha256":hash(risc0_zkp::hal::metal::runtime_kernel_source().as_bytes()),
                     "cpu_differential_checks":cpu_checks,
                     "cpu_stages":["witness","accumulation","scatter","prefix_products","zeroize"],"normalization":"period_four_table"});
+                observed["rv32im_metal"]["gpu_kernels"] = json!(
+                    risc0_zkp::hal::metal::metal_gpu_stats_since(&gpu_before, "segment/")
+                );
             } else {
                 ensure!(
                     checks == 0 && dispatches == 0 && points == 0,
@@ -550,6 +555,12 @@ fn prove_staged(
                     "kernel_source_sha256":hash(risc0_zkvm::metal_recursion_kernel_source().as_bytes()),
                     "cpu_stages":["witness","accumulation"],
                 });
+                #[cfg(feature = "macos-rv32im-metal")]
+                {
+                    report["observed_stages"]["recursion_metal"]["gpu_kernels"] = json!(
+                        risc0_zkp::hal::metal::metal_gpu_stats_since(&gpu_before, "recursion/")
+                    );
+                }
             } else {
                 ensure!(
                     checks == 0 && points == 0,

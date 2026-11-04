@@ -1,5 +1,76 @@
 # macOS proving measurements
 
+## Phase 2 starting baseline — 2026-11-04
+
+The Phase 1 source commits were rebuilt and sealed as a new Phase 2 baseline:
+miner `9bc7466eaf6a4b48d8655d39f69cc89fa40f0298`, engine
+`dcbe9f4b9140a48d4792ffcd3a3eba19897be175`, worker SHA-256
+`1c70d2ef9eb3dddd94ded3588eedf7c93f3cca176a5b4a9d660ec570637938d8`.
+The unchanged external verifier SHA-256 is
+`2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c`.
+The archive is `target/macos/phase2/baseline/`. These measurements replace the
+earlier 117.2 s and 484.7 s observations for Phase 2 comparisons.
+
+| Fixture | Measured proofs | Complete median [minimum–maximum] | Segment/execution median | Recursion median | Identity/wrap median | Guarded group peak | Host reserve |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Arithmetic 10M | 5, after one warmup | 119.568 [117.595–119.607] s | 89.394 s | 11.438 s | 17.726 s | 19.435 GiB | 16 GiB |
+| Hashing 10M | 5, after one warmup | 130.641 [128.620–131.655] s | 98.718 s | 11.967 s | 18.362 s | 19.502 GiB | 12 GiB |
+| Arithmetic 46M | 1 | 501.037 s | 411.597 s | 63.380 s | 24.621 s | 15.402 GiB | 12 GiB |
+
+All 13 dispatched proofs passed the unchanged verifier and 39 negative checks.
+The first hashing campaign at the default 16 GiB reserve was refused before
+dispatch when conservative available memory was about 40 GiB; the failed
+attempt is retained in the WP0 evidence. The new hashing and stretch campaigns
+used the documented 12 GiB local override. Their settings differ from the
+arithmetic campaign and must be matched within each later paired comparison.
+Host snapshots during hashing and stretch showed Brave, Codex, Claude, and
+Colima running and reported fair thermal state. The snapshots are instantaneous,
+not a per-proof thermal trace. GPU kernel timing was added after this sealed
+baseline and is not attributed to its pre-instrumentation binary. See
+[baseline JSON](evidence/phase2-wp0-baseline.json) and
+[proof CSV](evidence/phase2-wp0-baseline.csv).
+
+The WP0 instrumented worker, byte-identical before and after engine commit
+`09c2f4d2836cbcd88cd29e65b6a6bdd8db262416`, produced two additional
+single-proof diagnostic profiles. Every Metal command buffer records device
+GPU time, host dispatch wall time, pipeline creation time and pipeline limits;
+the worker sidecar aggregates per kernel. Both proofs passed the unchanged
+verifier and six negative checks. The synchronous path has no segment CPU/GPU
+overlap.
+
+| Fixture and stage | Stage wall | GPU execution | Dispatch wall |
+| --- | ---: | ---: | ---: |
+| Arithmetic constraints | 57.295 s | 55.902 s | 57.294 s |
+| Arithmetic transforms | 17.693 s | 15.450 s | 17.383 s |
+| Arithmetic Merkle | 3.873 s | 3.607 s | 4.060 s |
+| Arithmetic recursion | 11.716 s | 7.572 s | 9.504 s |
+| Hashing constraints | 57.207 s | 55.812 s | 57.206 s |
+| Hashing transforms | 17.622 s | 15.510 s | 17.418 s |
+| Hashing Merkle | 3.855 s | 3.598 s | 4.060 s |
+| Hashing recursion | 11.562 s | 7.446 s | 9.406 s |
+
+Constraint GPU time is within 3% of its wall timer. Transform GPU time is
+about 12–13% below its wall timer, just outside WP0's 10% GPU-only
+reconciliation target; the measured host dispatch cost accounts for most of
+that difference across 1,873 transform commands per 10M proof. Merkle command
+times include some Poseidon calls outside the narrower Merkle timer, so their
+dispatch-wall sum slightly exceeds that timer. Recursion includes CPU witness
+and accumulation. See [GPU profile JSON](evidence/phase2-wp0-gpu-profile.json)
+and [stage CSV](evidence/phase2-wp0-gpu-profile.csv); these are diagnostic
+observations, not warm medians.
+
+The sealed instrumented worker also passed one po2-14 real-witness CPU
+differential proof, nine workload-limit rejections, and a 20-request lifecycle.
+The lifecycle verified 21 proofs including a post-restart proof and passed 63
+negative checks, helper cancellation, expected helper-timeout failure, worker
+watchdog, recovery and shutdown. First/last settled worker footprints were
+4.215/4.404 GiB, **4.49% drift**, below the 5% gate; readings varied between
+4.207 and 4.404 GiB rather than rising steadily. Native and CPU-only worker
+unit builds each passed five tests. Only the Apple Silicon target is installed
+in the pinned local Rust toolchain, so a Linux feature compile was not run.
+See [WP0 validation](evidence/phase2-wp0-validation.json) and
+[lifecycle CSV](evidence/phase2-wp0-lifecycle.csv).
+
 ## Refreshed resident worker — warm gates completed 2026-11-03
 
 The predeclared five-pair arithmetic comparison passed: **3.645× median

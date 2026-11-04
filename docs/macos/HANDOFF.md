@@ -1,5 +1,36 @@
 # macOS proving handoff
 
+## Phase 2 current status — 2026-11-04
+
+New `codex/hemi-macos-metal-phase2` branches started at miner
+`9bc7466eaf6a4b48d8655d39f69cc89fa40f0298` and engine
+`dcbe9f4b9140a48d4792ffcd3a3eba19897be175`. The WP0 engine timing
+checkpoint is `09c2f4d2836cbcd88cd29e65b6a6bdd8db262416`; this miner
+checkpoint contains its matching sidecar, tools and evidence. The starting worker is
+rebuilt and sealed in `target/macos/phase2/baseline/` (worker SHA-256
+`1c70d2ef9eb3dddd94ded3588eedf7c93f3cca176a5b4a9d660ec570637938d8`).
+New complete-proof measurements are **119.568 s arithmetic 10M** and
+**130.641 s hashing 10M** five-proof warm medians, plus a **501.037 s** single
+arithmetic 46M stretch. All 13 dispatched proofs and 39 negative checks passed.
+The first hashing attempt was refused before dispatch by the default 16 GiB
+host reserve; the subsequent hashing and stretch campaigns used a recorded
+12 GiB local override. See [Phase 2 plan](PHASE2_PLAN.md),
+[measurements](BENCHMARKS.md), [baseline evidence](evidence/phase2-wp0-baseline.json),
+and [GPU profile](evidence/phase2-wp0-gpu-profile.json).
+
+The instrumented worker SHA-256 is
+`9b7ab90957fefe60232e871a2823056d8683c8852476666483a8721b08cce545`.
+Two diagnostic 10M proofs and the po2-14 CPU differential verified. Native and
+CPU-only unit builds, the nine limit controls, and the 20-request lifecycle
+passed. First-to-last idle footprint drift was **4.49%**; see
+[WP0 validation](evidence/phase2-wp0-validation.json). The GPU-only sum is
+12–13% below transform wall time, outside the brief's 10% reconciliation gate;
+about 1.9 s is measured host dispatch overhead. Linux cross-target compilation
+was unavailable because only the Apple Silicon target is installed locally.
+Next: start WP1's evaluator split from this measured profile and keep the
+transform timing gap explicit. The protected circuit, verifier, seal, and
+dependency versions have not changed.
+
 ## Review follow-up — validation complete
 
 The refreshed pipeline is validated at the clean engine checkpoint
