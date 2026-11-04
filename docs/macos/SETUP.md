@@ -18,6 +18,15 @@ The former `ZKMINER_RISC0_MODE=metal`, `macos-metal` build and staging probe now
 fail with migration guidance. The old mode variable is unnecessary; `cpu` and
 `auto` are accepted only as deprecated compatibility inputs.
 
+Allow extra time for the first proof on a cold Metal driver cache. The
+[evaluator prototype](RV32IM_METAL_PROTOTYPE.md) observed about **50 seconds**
+of setup for the same RV32IM evaluator shader: 9.8 seconds compiling the
+library and 40.2 seconds creating the pipeline. This was one observation on
+the test Mac. The warm proof medians below do not include that cold cost.
+The worker currently compiles shader source at runtime. Building a `.metallib`
+offline requires [Apple's Metal compiler tools](https://developer.apple.com/documentation/metal/building-a-shader-library-by-precompiling-source-files);
+measure pipeline creation separately when testing a precompiled library.
+
 Use [RV32IM_METAL_WORKER.md](RV32IM_METAL_WORKER.md) for the original validated
 checkpoint, [engine refresh evidence](evidence/engine-refresh-validation.json)
 for the post-merge regression, and [HANDOFF.md](HANDOFF.md) for current follow-up
@@ -51,6 +60,17 @@ floor still apply. The post-refresh serial regression used an explicitly recorde
 12 GiB reserve; the production default remains 16 GiB. A smaller-machine po2-18
 profile has not been validated. Lowering the segment cap alone is not documented
 as establishing support for a 32 GiB Mac.
+
+For a controlled desktop admission test, set `ZKMINER_MACOS_HOST_RESERVE_GIB=12`
+on the single-worker acceptance command. This changes the initial 24 GiB proof
+budget plus reserve threshold from about 40 GiB to 36 GiB before resident credit.
+It still requires normal kernel pressure and does not change the in-flight 8 GiB
+headroom floor or 32 GiB group limit. Test with ordinary apps open and compare
+the headroom at the proof call, since it can change between preflight and dispatch.
+The [desktop spot check](evidence/rv32im-desktop-admission-spot-check.json)
+verified one 10M arithmetic proof at 39.28 GiB of estimated headroom with a
+12 GiB reserve and Brave open. This is a local test setting; the default
+remains 16 GiB.
 
 ## Native macOS wrapping
 

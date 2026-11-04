@@ -64,6 +64,25 @@ peak is **19.783 GiB**, including warmed proofs; this excludes the other retaine
 worker. The configuration is intended for a 64 GiB-class Mac or larger; validation
 used 128 GiB. See [hardware guidance](SETUP.md). Colima was left running throughout.
 
+In the November 4 [desktop spot check](evidence/rv32im-desktop-admission-spot-check.json),
+one worker verified the 10M arithmetic fixture with Brave open at both reserves.
+Estimated headroom just before the proof call was 40.43 GiB with the default
+16 GiB reserve and 39.28 GiB with a 12 GiB reserve. Both runs peaked at about
+15.42 GiB for the worker/helper group and sampled normal pressure throughout.
+This supports a local 12 GiB trial under desktop load. The kernel must already
+report normal pressure for admission; keep the byte check for the allocation
+the next proof is expected to add. Before changing the default, test cold
+startup, repeated warm requests and the 46M fixture with ordinary apps open.
+Track swap, pressure, guard outcomes and verification. The two-worker comparison
+adds the idle baseline's footprint and should remain separate.
+
+The engine still contains `metal_fold.rs`, `LocalProver::new_metal` and the
+`metal-hybrid` feature chain. The compile errors retire the feature from use.
+Before opening an upstream PR for the resident Mac backend, remove the legacy
+code and feature wiring, retain the shared `metal-runtime` dependency used by
+the active backend, and recheck the CPU and resident Metal builds. This is
+separate from the three small upstream PRs below.
+
 Earlier attempts remain separate: the first refused admission before measured
 pairs; the next verified seven proofs and two pairs, then an incorrectly computed
 outer suite timeout interrupted the next CPU proof. The owner quit Brave during
