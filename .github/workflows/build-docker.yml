@@ -85,7 +85,7 @@ jobs:
             extras: zkminer-rocm/lib/libamdhip64.so.7
             large: true
             timeout: 350
-            checkpoints: cook-rocm
+            checkpoints: rocm71-clang cook-rocm
           - target: dist-sp1-server-hip
             binary: sp1-gpu-server-hip
             extras: sp1-gpu-server-hip-lib/libamdhip64.so.7
@@ -211,6 +211,10 @@ jobs:
           # 2.4 hours (risc0-circuit-rv32im-sys, 2026-11-03). Cargo's jobs cannot go below four
           # instead (risc0's build scripts deadlock on its jobserver at 1 to 3).
           NVCC_THREADS: ${{ (matrix.large && vars.ZKMINER_LARGE_RUNNER) && '4' || '1' }}
+          # hipcc compiles a file's AMD targets five at a time on a large runner, one at a time on a
+          # standard one (the risc0 kernels' compiles run side by side already; each target multiplies
+          # their memory).
+          HIP_PARALLEL_JOBS: ${{ (matrix.large && vars.ZKMINER_LARGE_RUNNER) && '5' || '1' }}
           # The Intel risc0 kernels compiled ahead of time: every target Dockerfile.build lists on a
           # large runner; none on a standard one, where those four (three cards and SPIR-V) ran past
           # the six hours (run 41633120773). There the kernels ship as SPIR-V alone, which the
@@ -231,6 +235,7 @@ jobs:
             shift
             docker buildx build -f Dockerfile.build --target "$stage" \
               --build-arg NVCC_THREADS="$NVCC_THREADS" \
+              --build-arg HIP_PARALLEL_JOBS="$HIP_PARALLEL_JOBS" \
               ${INTEL_TARGETS:+--build-arg RISC0_INTEL_SYCL_TARGETS="$INTEL_TARGETS"} \
               --secret id=github_token,env=GITHUB_TOKEN \
               "${from[@]}" "$@" .

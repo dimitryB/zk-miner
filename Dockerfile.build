@@ -30,13 +30,13 @@ ARG CARGO_CHEF_VERSION=0.1.78
 ARG ROCM_VERSION=10.1
 ARG ROCM_PKG_VERSION=10.1.0-3
 ARG AMD_GPU_TARGETS=gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
-# The risc0 prover, compiled with ROCm 7.1, covers the same cards with three code objects instead of
-# five: gfx11-generic, which every RX 7000 (and RDNA3 APU) runs, and the two RX 9000 targets exactly,
-# because risc0's eval_check uses the gfx1200/gfx1201 matrix units (V_WMMA) and a gfx1201 register
-# bound only when compiled for those chips; its RX 7000 code uses nothing chip-specific (__GFX11__
-# only). Five exact targets with ROCm 7.1 took over five hours on a standard runner; generic code
-# objects run on ROCm 6.2 and later runtimes (checked on an RX 7900 XTX with 7.1 and 10.1).
-ARG RISC0_AMD_GPU_TARGETS=gfx11-generic,gfx1200,gfx1201
+# The risc0 prover, compiled with ROCm 7.1, for the same five exact targets. Not gfx11-generic, the one
+# code object every RX 7000 could run: built for it, the prover's proofs fail verification on an RX
+# 7900 XTX (all six benchmarks, "check != result"), where the same build for gfx1100 proves them all.
+ARG RISC0_AMD_GPU_TARGETS=gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
+# hipcc compiles a file's GPU targets this many at a time (clang's -parallel-jobs), which multiplies
+# the compiler's memory by as much. CI raises it on a runner with the memory for it.
+ARG HIP_PARALLEL_JOBS=1
 # Intel: oneAPI DPC++ 2026.0, and the GPUs the risc0 kernels are compiled for ahead of time: Battlemage
 # (bmg_g21: Arc B580/B570; bmg_g31: B-series Pro) and Alchemist (acm_g10: Arc A770/A750/A580), plus
 # SPIR-V, which the shipped compiler builds on first use for any other Intel GPU (A380, A310). SP1's
@@ -456,7 +456,17 @@ ENV ROCM_PATH=/opt/rocm/core-${ROCM_VERSION} \
 # buffered. ROCm 7.1's leaves it out. The prover ships with ROCm 7.1's runtime (build-rocm), and
 # SP1's HIP server, which needs 7.2 or later, with ROCm 10.1's (build-sp1-server-hip): each runs on
 # the runtime of the toolchain it was compiled and validated with.
+#
+# Its clang is ROCm 7.1's own, rebuilt with one compile-time fix (rocm71-clang below).
 # rocm/dev-ubuntu-22.04:7.1 — ROCm 7.1.0, pinned 2026-11-03
+FROM rocm/dev-ubuntu-22.04:7.1@sha256:f55ecea640588a014b9a0fcaba596ed9f79656bffea23644e73f9928280103a5 AS rocm71-clang
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates cmake ninja-build patch zlib1g-dev libzstd-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/ci/build-rocm71-clang.sh /usr/local/bin/
+COPY scripts/ci/patches/llvm-rocm-7.1-codegenprepare-comesbefore.patch /usr/local/bin/patches/
+RUN build-rocm71-clang.sh /out
+
 FROM rocm/dev-ubuntu-22.04:7.1@sha256:f55ecea640588a014b9a0fcaba596ed9f79656bffea23644e73f9928280103a5 AS rocm71-toolchain
 ARG RUST_VERSION
 
@@ -464,7 +474,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential git curl ca-certificates cmake pkg-config libssl-dev \
         protobuf-compiler libclang-dev file \
         hipcub-dev rocthrust-dev rocprim-dev \
-    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/lib/apt/lists/*
+
+# ROCm 7.1's clang with upstream LLVM's fix for a quadratic loop in CodeGenPrepare
+# (scripts/ci/build-rocm71-clang.sh). It generates the same code, and compiles risc0's RDNA4
+# (gfx1200, gfx1201) eval_check in minutes rather than hours per target.
+COPY --from=rocm71-clang /out/bin/clang-20 /opt/rocm-7.1.0/lib/llvm/bin/clang-20
+RUN /opt/rocm/lib/llvm/bin/clang --version | head -n 1 | grep -q 'zkminer-codegenprepare' \
     && /opt/rocm/bin/hipcc --version | head -n 3
 
 ENV RUSTUP_HOME=/usr/local/rustup \
@@ -497,10 +513,11 @@ WORKDIR /build
 FROM rocm71-toolchain AS cook-rocm
 ARG CARGO_CHEF_VERSION
 ARG RISC0_AMD_GPU_TARGETS
+ARG HIP_PARALLEL_JOBS
 ENV HIPCC=/opt/rocm/bin/hipcc \
     NVCC=off \
     RISC0_HIP_ARCH=${RISC0_AMD_GPU_TARGETS} \
-    HIPCC_COMPILE_FLAGS_APPEND="-DNDEBUG -mprintf-kind=buffered"
+    HIPCC_COMPILE_FLAGS_APPEND="-DNDEBUG -mprintf-kind=buffered -parallel-jobs=${HIP_PARALLEL_JOBS}"
 
 RUN cargo install cargo-chef --locked --version ${CARGO_CHEF_VERSION}
 COPY --from=planner /recipe.json recipe.json
