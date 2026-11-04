@@ -1,5 +1,18 @@
 # macOS proving handoff
 
+## Phase 2 WP1 reopened — 2026-11-04
+
+The owner reset WP1's iteration budget and specified a port of the in-tree
+evalfast pass pipeline output to MSL, starting with the main/LogUp phase split.
+The current tail-split/256 worker remains the fallback. A one-hour, timing-only
+LogUp-removal experiment finished within the hour: five counterbalanced
+po2-20 pairs measured **4.969 s** median repeat GPU time for the fallback and
+**4.470 s** for main-only, a **1.112×** ratio. The result is percent-scale and
+does not confirm the proposed multiples-scale live-state diagnosis. The
+diagnostic shader was never used for proofs. See
+[probe evidence](evidence/phase2-wp1-logup-probe.json) and
+[reopened WP1 scope](PHASE2_PLAN.md).
+
 ## Phase 2 fold-only cleanup — 2026-11-04
 
 Engine `fca0c099582f15729f98af0743f45bc56c217705` removes the retired

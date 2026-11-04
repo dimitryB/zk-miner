@@ -1,5 +1,26 @@
 # Phase 2: Metal proving performance on macOS
 
+## WP1 reopened — 2026-11-04
+
+The owner reset WP1's iteration budget. The explicit scope is to port the
+in-tree evalfast pass pipeline's output to MSL, beginning with its main/LogUp
+phase split and then the lazy-reduction representation across the phase
+boundary. The committed tail-split/256 worker remains the fallback until a new
+shader passes the synthetic CPU oracle and real-witness differentials. The
+prior bounded-trial gate miss remains a historical measurement, not a closure
+of the reopened package.
+
+The requested one-hour diagnosis finished within the hour: a diagnostic shader
+returns the main-chain value at the same `rv32im_v2_3` `x1102` boundary used by
+`accfirst_cuda.py`, omitting the LogUp continuation and the calls to v2_2..0.
+Five alternating, counterbalanced po2-20 timing pairs at 256 threads measured
+median repeat-command GPU time of 4.969 s for the unchanged fallback and
+4.470 s for main-only, a 1.112× ratio (0.499 s saved). Each pair was
+1.070–1.115×. The diagnostic does not check a CPU oracle and cannot produce a
+proof. This is a percent-scale result, so it does not confirm the proposed
+multiples-scale live-state diagnosis. See
+`evidence/phase2-wp1-logup-probe.{json,csv}`.
+
 Source brief: `Phase 2 spec Metal proving performance on macOS.md`, dated
 2026-11-04, SHA-256
 `22c73353915de7154577858ab4556d6d52fc6af3f463b3e6b2009f3ec5c707b7`.
@@ -23,7 +44,7 @@ brief remains the detailed technical and acceptance specification.
 | Package | Required gate | Status |
 | --- | --- | --- |
 | WP0 baseline and GPU timing | Sealed archive; five warm proofs per 10M fixture, one 46M proof; per-kernel GPU and pipeline statistics | Baseline, profiles, CPU-only build, limits, and 20-request lifecycle measured; transform GPU-only wall reconciliation misses 10%; Linux cross-target compile unavailable locally |
-| WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Bounded split/reduction/threadgroup trials complete; exact differential and 20-request lifecycle passed, but 4.78/5.11 s per segment misses performance gate |
+| WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Reopened with reset iterations; evalfast-to-MSL phase split first. Prior trial missed gate; LogUp-removal diagnosis was percent-scale |
 | WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | Pending |
 | WP3 transforms | At most 0.8 s per po2-20 segment, exact primitive tests and unchanged Merkle outputs | Pending |
 | WP5 po2 21 assessment | Faster than po2 20 within measured memory ceiling | Pending; owner approval before changing default |

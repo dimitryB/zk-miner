@@ -1,5 +1,25 @@
 # macOS proving measurements
 
+## Reopened WP1 LogUp timing diagnosis — 2026-11-04
+
+An isolated timing-only shader removed the LogUp continuation at the
+`rv32im_v2_3` `x1102` boundary. It was never used for proving and its output
+was not compared with the CPU polynomial. The unchanged tail-split/256 shader
+was the reference. Five alternating pairs at po2 20 used Metal command-buffer
+GPU timestamps; the order was reversed for the final two pairs.
+
+| Repeat dispatch GPU time | Tail-split/256 reference | Main only |
+| --- | ---: | ---: |
+| Median of five | 4.969 s | 4.470 s |
+
+The median ratio was **1.112×** (0.499 s saved); pair ratios were
+1.070–1.115×. This is a percent-scale change, not the multiples-scale signal
+proposed for the live-state diagnosis. Input and output guards held, inputs
+were unchanged, and each shader was deterministic on repeat dispatch. The two
+shaders intentionally produced different outputs. See
+[diagnostic evidence](evidence/phase2-wp1-logup-probe.json) and
+[samples](evidence/phase2-wp1-logup-probe.csv).
+
 The separate fold-only cleanup changed the worker binary after the WP1 timing
 campaign. Its validation is in [cleanup evidence](evidence/phase2-fold-cleanup.json);
 the performance measurements below refer to the preceding WP1 binary.

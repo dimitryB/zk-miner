@@ -241,7 +241,16 @@ fn dispatch(
             }
             bail!("Metal command failed: {:?}", command.status());
         }
-        Ok(json!({"status":"Completed","threads_per_threadgroup":threads}))
+        let gpu_start: f64 = unsafe { msg_send![command, GPUStartTime] };
+        let gpu_end: f64 = unsafe { msg_send![command, GPUEndTime] };
+        ensure!(
+            gpu_start > 0.0 && gpu_end > gpu_start,
+            "Metal GPU timestamps unavailable"
+        );
+        Ok(
+            json!({"status":"Completed","threads_per_threadgroup":threads,
+            "gpu_seconds":gpu_end - gpu_start}),
+        )
     })
 }
 
@@ -251,6 +260,7 @@ fn run_case(
     po2: usize,
     seed: u32,
     exponents: &[usize],
+    timing_only: bool,
 ) -> Result<Value> {
     let start = Instant::now();
     let domain = (1usize << po2) * 4;
@@ -320,6 +330,37 @@ fn run_case(
         "gpu_complete",
         json!({"po2":po2,"seed":seed,"gpu_seconds":gpu_seconds}),
     )?;
+    if timing_only {
+        let first_output_sha256 = hash(&check);
+        check.view_mut(|values| values.fill(SENTINEL));
+        let reuse_started = Instant::now();
+        let reuse_command = dispatch(gpu, kernel, arguments, domain)?;
+        let reuse_seconds = reuse_started.elapsed().as_secs_f64();
+        ensure!(
+            hash(&check) == first_output_sha256,
+            "timing-only dispatch was not deterministic"
+        );
+        ensure!(
+            [&ds, &acs, &os, &ms].map(hash) == before,
+            "evaluator modified input storage"
+        );
+        cs.view(|v| {
+            assert!(v[..GUARD]
+                .iter()
+                .chain(&v[v.len() - GUARD..])
+                .all(|e| *e == SENTINEL))
+        });
+        let result = json!({"po2":po2,"domain":domain,"seed":seed,
+            "gpu_dispatch_seconds":gpu_seconds,"reuse_dispatch_seconds":reuse_seconds,
+            "first_output_sha256":first_output_sha256,"output_sha256":hash(&check),
+            "completed_dispatches":2,"reuse_command":reuse_command,
+            "reuse_deterministic":true,"cpu_oracle_checked":false,"proof_eligible":false,
+            "guards_preserved":true,"inputs_unchanged":true,"command":command,
+            "case_seconds":start.elapsed().as_secs_f64(),"memory":memory()?,
+            "status":"timing_only"});
+        emit("case_complete", result.clone())?;
+        return Ok(result);
+    }
     let mut expected = vec![X::ZERO; domain];
     // Synchronous Metal completion precedes these shared immutable CPU reads.
     let slice =
@@ -426,6 +467,11 @@ fn main() -> Result<()> {
     let metadata: Value = serde_json::from_slice(&std::fs::read(
         std::path::Path::new(&args[1]).with_extension("json"),
     )?)?;
+    let timing_only = metadata["timing_only"].as_bool().unwrap_or(false);
+    ensure!(
+        !timing_only || std::env::var("RV32IM_TIMING_ONLY").as_deref() == Ok("1"),
+        "timing-only shader requires explicit RV32IM_TIMING_ONLY=1"
+    );
     let exponents: Vec<usize> = serde_json::from_value(metadata["poly_mix_exponents"].clone())?;
     ensure!(exponents.len() == 458, "invalid pinned mixing powers");
     let _guard = Guard::new()?;
@@ -478,13 +524,15 @@ fn main() -> Result<()> {
                         .any(|case: &Value| case["po2"].as_u64() == Some(po2 as u64)),
                     "duplicate po2"
                 );
-                cases.push(run_case(&gpu, &kernel, po2, seed, &exponents)?);
+                cases.push(run_case(&gpu, &kernel, po2, seed, &exponents, timing_only)?);
             }
         }
         emit(
             "result",
-            json!({"status":"passed","completed_dispatches":cases.iter().map(|c| c["completed_dispatches"].as_u64().unwrap()).sum::<u64>(),"cases":cases,
-            "scope":"isolated synthetic evaluator; no complete-proof acceleration claim"}),
+            json!({"status":if timing_only { "timing_only" } else { "passed" },
+            "completed_dispatches":cases.iter().map(|c| c["completed_dispatches"].as_u64().unwrap()).sum::<u64>(),"cases":cases,
+            "scope":if timing_only { "diagnostic timing only; CPU oracle not checked; never use for proofs" }
+                else { "isolated synthetic evaluator; no complete-proof acceleration claim" }}),
         )?;
         Ok(())
     })
