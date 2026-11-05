@@ -101,6 +101,8 @@ def collect_case(case, campaign):
         })
     assert len({row["worker_pid"] for row in output if row["arm"] == "wp1"}) == 1
     assert len({row["worker_pid"] for row in output if row["arm"] == "wp05"}) == 1
+    for pair in range(6):
+        assert output[2 * pair]["completed_dispatches"] == output[2 * pair + 1]["completed_dispatches"]
     assert len({row["journal_sha256"] for row in output}) == 1
     assert len({row["shader_sha256"] for row in output}) == 1
     measured = [row for row in output if not row["warmup"]]
@@ -108,6 +110,11 @@ def collect_case(case, campaign):
     times = {arm: [row["complete_seconds"] for row in measured if row["arm"] == arm]
              for arm in ("wp1", "wp05")}
     assert all(len(values) == 5 for values in times.values())
+    pair_ratios = []
+    for pair in range(1, 6):
+        proof_pair = output[2 * pair:2 * pair + 2]
+        by_arm = {row["arm"]: row["complete_seconds"] for row in proof_pair}
+        pair_ratios.append(by_arm["wp1"] / by_arm["wp05"])
     return {
         "fixture": case["fixture"], "run": str(run),
         "result_sha256": sha(run / "result.json"),
@@ -115,6 +122,9 @@ def collect_case(case, campaign):
         "warmups": 2, "measured_proofs_per_arm": 5,
         "median_complete_seconds": {arm: median(values) for arm, values in times.items()},
         "range_complete_seconds": {arm: [min(values), max(values)] for arm, values in times.items()},
+        "within_pair_baseline_to_candidate_ratios": pair_ratios,
+        "max_admission_wait_seconds": max(row["admission_wait_seconds"] for row in output),
+        "pressure_levels": sorted({row["pressure_level"] for row in output}),
         "median_complete_saving_seconds": median(times["wp1"]) - median(times["wp05"]),
         "saving_gate_passed": median(times["wp1"]) - median(times["wp05"]) >= 3,
         "rows": output, "host_before": case["host_before"], "host_after": case["host_after"],
@@ -158,12 +168,13 @@ def main():
     EVIDENCE.mkdir(parents=True, exist_ok=True)
     json_path = EVIDENCE / "phase2-wp05-paired.json"
     csv_path = EVIDENCE / "phase2-wp05-paired.csv"
-    json_path.write_text(json.dumps(report, indent=2) + "\n")
     with csv_path.open("w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=list(fixtures[0]["rows"][0]), lineterminator="\n")
         writer.writeheader()
         for fixture in fixtures:
             writer.writerows(fixture["rows"])
+    report["csv_sha256"] = sha(csv_path)
+    json_path.write_text(json.dumps(report, indent=2) + "\n")
     print(json_path)
     print(csv_path)
     print(report["status"])

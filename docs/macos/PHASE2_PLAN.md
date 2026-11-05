@@ -8,15 +8,35 @@ It adds WP0.5 command batching before WP2, makes the 20-request idle footprint
 criterion one-sided (at most 5% growth), and amends the WP3 mid-point decision.
 The WP1 final lifecycle's 10.60% decrease passes the revised memory rule;
 WP1 is closed at 78.688 s arithmetic and 80.779 s hashing paired medians.
-WP0.5 is the next package.
+WP0.5 is closed below; WP2 is next.
 
-Engine checkpoint `2e1d34e130122cdc74ad788f7f47d74c0a357c7c`
-adds command-buffer batching for NTT, shift/LDE, and Merkle stages, plus
-per-buffer counters. The sealed WP1 baseline binary and provenance live in
+Engine checkpoint `6b3ec9539fb3a4e5c267c2a4f8f81d6d90ac577d`
+adds command-buffer batching for NTT, shift/LDE, Merkle, and GPU-only prover
+stages, plus per-buffer counters. The sealed WP1 baseline binary and provenance live in
 `target/macos/phase2/wp1-baseline/` (manifest SHA-256
 `4fb202a4b4578b49763c90dbe89ee7a4edf45b7a8886d02377f968ee7b6882a2`).
 The 20-test Metal primitive suite, recursion offset differential, and
 CPU-only feature build passed before candidate timing.
+
+Three bounded batching iterations have verified complete po2-14, po2-18 and
+po2-20 proofs with exact real-witness CPU differentials and the unchanged
+external verifier. The final GPU profile cuts 10M command buffers from
+1,873 to 143 for transforms, 1,163 to 61 for Merkle, and 5,539 to 540 for
+recursion. Its host dispatch overhead remains 1.809/1.756 s for transforms
+and 0.703/0.715 s for recursion (arithmetic/hash), above the 0.3 s gate.
+The two earlier profiles and their raw runs are retained as iteration evidence.
+The po2-14/18/20 real-witness differentials, external verification and tamper
+checks, CPU-only build, Linux feature-path check, and 20-request lifecycle
+passed. The initial lifecycle's 10-second helper watchdog captured a partial
+sidecar and failed; the recorded 20-second rerun passed all controls with
+21 verified proofs and a 14.51% drop in idle footprint. The controlled
+five-pair campaign saved 2.049 s on arithmetic (77.758 → 75.709 s) and
+3.023 s on hashing (79.801 → 76.778 s), with all 24 proofs verified and
+72 tamper rejections. Arithmetic misses the required 3 s saving; transform
+and recursion host overhead also miss the 0.3 s target. WP0.5 is closed as
+gate-failed after three bounded iterations, retaining the best correct
+variant on the Phase 2 branch. WP2 is next. See
+`evidence/phase2-wp05-{gpu-profile,validation,paired}.json`.
 
 ## WP1 paired checkpoint — 2026-11-04
 
@@ -105,7 +125,7 @@ brief remains the detailed technical and acceptance specification.
 | --- | --- | --- |
 | WP0 baseline and GPU timing | Sealed archive; five warm proofs per 10M fixture, one 46M proof; per-kernel GPU and pipeline statistics | Baseline, profiles, CPU-only build, limits, and 20-request lifecycle measured; transform GPU-only wall reconciliation misses 10%; Linux cross-target compile unavailable locally |
 | WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Closed under the revised one-sided memory gate; five paired proofs per fixture pass timing and correctness; evalfast is default with tail-split override. |
-| WP0.5 command batching | Both 10M paired medians at least 3 s faster; transforms, recursion, and Merkle command counts at least 10× lower; host dispatch overhead at most 0.3 s per stage; full correctness and lifecycle gates | In progress; sealed WP1 worker archived at `target/macos/phase2/wp1-baseline/`, generic Metal stage batching implemented and primitive checks running. |
+| WP0.5 command batching | Both 10M paired medians at least 3 s faster; transforms, recursion, and Merkle command counts at least 10× lower; host dispatch overhead at most 0.3 s per stage; full correctness and lifecycle gates | Closed, gate-failed after three iterations. Counts and correctness/lifecycle pass; arithmetic saves 2.049 s (<3 s), hashing saves 3.023 s; transform and recursion host overhead exceed 0.3 s. Best correct variant retained. |
 | WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | Pending |
 | WP3 transforms | At most 0.8 s per po2-20 segment, exact primitive tests and unchanged Merkle outputs | Pending |
 | WP5 po2 21 assessment | Faster than po2 20 within measured memory ceiling | Pending; owner approval before changing default |

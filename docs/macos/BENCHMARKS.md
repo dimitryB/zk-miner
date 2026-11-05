@@ -1,5 +1,49 @@
 # macOS proving measurements
 
+## WP0.5 Metal command batching — 2026-11-05
+
+The third bounded batching iteration keeps kernel code, arguments and dispatch
+order unchanged and commits each GPU-only stage as a command buffer. A verified
+10M profile per fixture gave these command-buffer counts against the WP0
+profile and host dispatch overheads. Both profiles used the unchanged external
+verifier and passed three tamper rejections per proof.
+
+| Stage | WP0 buffers | WP0.5 buffers | Reduction | WP0.5 overhead, arithmetic / hashing |
+| --- | ---: | ---: | ---: | ---: |
+| Polynomial transforms | 1,873 | 143 | 13.10× | 1.809 / 1.756 s |
+| Merkle commitments | 1,163 | 61 | 19.07× | 0.226 / 0.194 s |
+| Recursion | 5,539 | 540 | 10.26× | 0.703 / 0.715 s |
+
+The ≥10× command-count gate passes for all three stages. The ≤0.3 s host
+overhead target passes for Merkle and fails for transforms and recursion.
+The earlier two profiles and raw runs are retained in the evidence directory.
+The po2-14/18/20 complete real-witness CPU differentials, Metal primitives,
+CPU-only and Linux feature checks, and 20-request lifecycle passed; see
+[profile](evidence/phase2-wp05-gpu-profile.json) and
+[validation](evidence/phase2-wp05-validation.json).
+
+The sealed WP1 worker and the batching candidate each completed one excluded
+warmup and five alternating, counterbalanced measured proofs per fixture.
+Both arms used po2 20, 18 Rayon and 18 Go threads, the default 16 GiB reserve,
+the same helper and unchanged external verifier. Brave was absent in before
+and after snapshots. All 24 proofs verified, all 72 tamper checks rejected,
+admission wait was zero, and pressure stayed normal.
+
+| Complete proof plus verifier, median of five | Sealed WP1 | Batching | Saving | Gate |
+| --- | ---: | ---: | ---: | --- |
+| Arithmetic 10M | 77.758 s | 75.709 s | 2.049 s | Fail (<3 s) |
+| Hashing 10M | 79.801 s | 76.778 s | 3.023 s | Pass |
+
+Arithmetic ranges were 76.767–77.776 s (WP1) and 74.706–75.746 s
+(batching); the five within-pair baseline/candidate ratios were
+1.0267, 1.0269, 1.0403, 1.0141, and 1.0276. Hashing ranges were
+79.769–79.809 s (WP1) and 76.759–77.758 s (batching); ratios were
+1.0259, 1.0394, 1.0397, 1.0268, and 1.0396. The paired median gate
+requires at least 3 s saved on **both** fixtures, so WP0.5 is gate-failed.
+The best correct batching variant is retained as the checkpoint. See
+[paired evidence](evidence/phase2-wp05-paired.json) and
+[all rows](evidence/phase2-wp05-paired.csv).
+
 ## WP1 paired gate and hashing re-baseline — 2026-11-04
 
 The sealed WP0 worker and the opt-in evalfast worker each completed one

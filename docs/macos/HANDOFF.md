@@ -1,14 +1,37 @@
 # macOS proving handoff
 
-## WP0.5 command batching — 2026-11-04
+## WP0.5 command batching — 2026-11-05
 
 The revised Phase 2 source brief has SHA-256
 `299ebd441aa2e1c0c70f7587a88b8cc32154d0835a0eaea0d807adef11028597`.
-Engine `2e1d34e130122cdc74ad788f7f47d74c0a357c7c` batches GPU-only
-NTT/shift/LDE and Merkle stages at their CPU access boundaries. The sealed
+Engine `6b3ec9539fb3a4e5c267c2a4f8f81d6d90ac577d` batches GPU-only
+NTT/shift/LDE, Merkle, and prover stages at CPU access boundaries. The sealed
 WP1 worker is archived at `target/macos/phase2/wp1-baseline/` for the paired
-campaign. Metal primitive and recursion offset tests, plus the CPU-only
-feature build, passed. Complete-proof validation and the paired gate remain.
+campaign. Three bounded iterations reduced command buffers from 1,873 to
+143 for transforms, 1,163 to 61 for Merkle, and 5,539 to 540 for recursion
+in a 10M profile. Transform host overhead remains 1.809/1.756 s and
+recursion overhead 0.703/0.715 s (arithmetic/hash), above the 0.3 s target.
+The [profile](evidence/phase2-wp05-gpu-profile.json) retains both fixtures.
+
+The 20-test Metal primitive suite, recursion offset differential, po2-14/18/20
+complete real-witness CPU differentials, unchanged verifier and tamper checks,
+CPU-only feature build, and Colima Linux feature-path check passed. The
+20-request lifecycle passed with 21 externally verified proofs, 63 tamper
+rejections, failure/recovery controls, and a 14.51% lower idle worker
+footprint. A first run with the 10-second helper watchdog failed on a partial
+sidecar; the 20-second rerun passed. Both attempts are bound in
+[validation evidence](evidence/phase2-wp05-validation.json).
+
+The controlled five-pair campaign against the sealed WP1 worker saved
+2.049 s arithmetic (77.758 → 75.709 s) and 3.023 s hashing
+(79.801 → 76.778 s). All 24 proofs and 72 tamper rejections passed;
+admission wait was zero and sampled pressure stayed normal. Brave was absent
+before and after both fixtures, with the default 16 GiB reserve. Arithmetic
+misses the required 3 s saving, and transforms/recursion miss the 0.3 s host
+overhead gate. WP0.5 is closed as gate-failed after three bounded iterations;
+the best correct batching variant remains on the Phase 2 branch. WP2 is next.
+See [paired evidence](evidence/phase2-wp05-paired.json) and
+[rows](evidence/phase2-wp05-paired.csv).
 
 The WP1 paired CSV now fills both GPU columns. The sealed WP0 worker could
 not timestamp individual kernels, so its values are labeled references from
