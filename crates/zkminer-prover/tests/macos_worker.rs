@@ -247,9 +247,14 @@ fn native_thread_comparison() {
         pools.push(pool);
     }
     let mut rows = Vec::new();
+    let first_case: usize = std::env::var("ZKMINER_MACOS_PAIRED_START_CASE")
+        .unwrap_or_else(|_| "0".into())
+        .parse()
+        .unwrap();
+    assert!(first_case < settings.len());
     for round in 0..=samples {
         let mut order: Vec<_> = (0..settings.len()).collect();
-        if round % 2 == 1 {
+        if (round + first_case) % 2 == 1 {
             order.reverse();
         }
         for index in order {

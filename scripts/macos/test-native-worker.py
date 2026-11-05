@@ -55,6 +55,8 @@ def main():
     parser.add_argument("--paired-baseline", type=Path, help="frozen step-5 worker for a counterbalanced CPU-segment/resident-Metal comparison")
     parser.add_argument("--paired-metal-baseline", type=Path,
                         help="sealed WP0 worker for a counterbalanced Metal/Metal comparison")
+    parser.add_argument("--paired-start-case", type=int, choices=(0, 1), default=0,
+                        help="which paired arm runs first in round zero")
     args = parser.parse_args()
     if args.paired_baseline and args.paired_metal_baseline:
         parser.error("select one paired baseline")
@@ -63,6 +65,8 @@ def main():
             parser.error("paired Metal baseline requires resident segment and recursion Metal")
         args.paired_metal_baseline = args.paired_metal_baseline.resolve(strict=True)
         args.thread_cases = "18:18,18:18"
+    elif args.paired_start_case:
+        parser.error("--paired-start-case requires --paired-metal-baseline")
     if args.paired_baseline:
         if args.worker_kind != "native-rv32im-metal" or args.segment_hal != "metal" or args.recursion_hal != "metal":
             parser.error("paired baseline requires the resident worker with segment and recursion Metal")
@@ -134,7 +138,8 @@ def main():
             ZKMINER_MACOS_WORKER_BINARIES=json.dumps([str(args.paired_baseline), str(paths(args.worker_kind)["binary"])]))
     if args.paired_metal_baseline:
         env.update(ZKMINER_MACOS_SEGMENT_CASES="metal,metal",
-            ZKMINER_MACOS_WORKER_BINARIES=json.dumps([str(args.paired_metal_baseline), str(paths(args.worker_kind)["binary"])]))
+            ZKMINER_MACOS_WORKER_BINARIES=json.dumps([str(args.paired_metal_baseline), str(paths(args.worker_kind)["binary"])]),
+            ZKMINER_MACOS_PAIRED_START_CASE=str(args.paired_start_case))
     if args.recursion_cases:
         env["ZKMINER_MACOS_RECURSION_CASES"] = args.recursion_cases
     if args.calibration:
@@ -152,6 +157,7 @@ def main():
         report["paired_baseline"] = {"path":str(args.paired_baseline), "sha256":sha(args.paired_baseline)}
     if args.paired_metal_baseline:
         report["paired_metal_baseline"] = {"path":str(args.paired_metal_baseline), "sha256":sha(args.paired_metal_baseline)}
+        report["paired_start_case"] = args.paired_start_case
     if args.calibration:
         report["calibration"] = {"path":str(args.calibration), "sha256":sha(args.calibration)}
     print(directory, flush=True)

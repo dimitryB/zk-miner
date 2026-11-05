@@ -1,5 +1,54 @@
 # macOS proving measurements
 
+## WP3 fused Metal transforms — 2026-11-05
+
+Engine `8520c737725698ddb156ccda2a41e0521213b878` fuses commit
+interpolation, zk-shift, LDE expansion and evaluation. Its po2-20 path uses
+resident twiddle and scale tables, a 4096-element threadgroup tile with
+radix-four butterflies, and a column-parallel launch grid. The pre-WP3
+radix-two route remains available with `RISC0_METAL_NTT_RADIX2=1`.
+
+The five-pair campaign compared the sealed WP2 worker with this WP3 worker,
+using one excluded warmup per arm, five alternating measured proofs per arm,
+and the opposite start arm for hashing. Both arms used po2 20, 18 Rayon/Go
+threads, 8 GiB host reserve, the same helper and unchanged verifier. All 24
+proofs verified and all 72 tamper tests rejected. Measured admission wait
+was zero. Brave, Codex, Claude and Colima were present; thermal snapshots
+were nominal before arithmetic and fair thereafter. Background load was
+recorded, as the revised brief requires, and no process was closed for this
+campaign.
+
+| Complete proof plus verifier, median of five | Sealed WP2 | WP3 | Saving |
+| --- | ---: | ---: | ---: |
+| Arithmetic 10M | 72.684 s | 61.589 s | 11.095 s |
+| Hashing 10M | 76.409 s | 65.384 s | 11.025 s |
+
+The arithmetic ranges were 71.677–72.688 s (WP2) and 60.575–62.632 s
+(WP3); within-pair WP2/WP3 ratios were 1.1606, 1.1646, 1.1999, 1.1645
+and 1.1802. Hashing ranges were 74.389–77.443 s and 62.351–66.618 s;
+ratios were 1.1931, 1.1713, 1.1686, 1.1663 and 1.1620. The largest
+paired guard peak was 22.544 GiB, under the existing 24 GiB initial budget
+and 32 GiB ceiling; sampled pressure was normal. See
+[paired JSON](evidence/phase2-wp3-paired.json) and
+[all paired rows](evidence/phase2-wp3-paired.csv).
+
+With segment pipelining disabled for one externally verified arithmetic
+proof, the steady po2-20 transform medians were 0.455 s GPU and 0.636 s
+dispatch wall per segment, passing the 0.8 s wall gate. The explicit traffic
+model counts 148.822 GB of requested DATA/ACCUM reads and writes per segment;
+dividing by 0.455 s gives 327 GB/s, or 54.4% of the spec's 600 GB/s ceiling.
+That is a requested-buffer model, not a DRAM hardware-counter reading.
+Queued transform GPU timestamps in the paired proof include interleaved
+segment work under WP2 overlap; the isolated profile is the stage-gate source.
+
+One 46M stretch proof passed the external verifier and all three tamper
+tests in 217.957 s, with a 17.905 GiB guard peak. This is below the 220 s
+minimum line and above the 180 s pass line. Both WP3 10M medians remain
+above the 60 s midpoint; the owner decides whether the hashing 5.384 s miss
+is close enough for the reserved WP2b iteration. Exact primitive, Merkle,
+lifecycle, CPU-only and Linux feature checks are bound in the separate
+[WP3 validation](evidence/phase2-wp3-validation.json).
+
 ## WP2 Metal segment pipeline — 2026-11-05
 
 Engine `a80fcb3c0d912f0ca82befe0fbcbff18e9f35eaa` keeps the preceding

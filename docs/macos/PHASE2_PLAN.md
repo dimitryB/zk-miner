@@ -1,5 +1,59 @@
 # Phase 2: Metal proving performance on macOS
 
+## WP3 transform checkpoint — 2026-11-05
+
+The current re-export has SHA-256
+`07467098c3493a0bbc0f543b0960676ba3a3e21ebd1fb7a65d10bb8dec40dc97`.
+It clarifies that each package pairs against the immediately preceding closed
+checkpoint. WP3 therefore uses the sealed WP2 worker at
+`target/macos/phase2/wp2-baseline/` (manifest SHA-256
+`274a86fb0e10438983285aed6232a6ef922fcb7a73d3cec4bb64f7be9420ca19`).
+It also attributes about 3–4 s of the WP2 campaign's measured 6 s to
+pipelining itself, with the earlier WP0.5 batching contribution included in
+that WP1 comparison. Engine
+`7143255acda4e51383237a479b51f914a8be904a` adds fused commit NTT,
+zk-shift, LDE, resident twiddles and folded bit reversal; engine
+`8520c737725698ddb156ccda2a41e0521213b878` makes radix-four tiles and
+column-parallel dispatch the default. `RISC0_METAL_NTT_RADIX2=1` selects the
+old transform route for bisection. The separate local Merkle differential
+uses existing engine crates and adds no dependency or version to the miner
+or engine production graph.
+
+WP3's fixed five-pair campaign against sealed WP2 passed all 24 proofs and
+72 tamper checks: arithmetic 72.684 → 61.589 s and hashing
+76.409 → 65.384 s, saving 11.095 and 11.025 s. Brave, Codex, Claude and
+Colima were present, as recorded by the revised spec's background-load
+protocol; both arms used po2 20, 18 Rayon/Go threads and 8 GiB reserve.
+The largest paired guard peak was 22.544 GiB, below the existing 24 GiB
+initial budget and 32 GiB ceiling. One pipeline-disabled complete proof
+measured 0.455 s GPU and 0.636 s dispatch wall steady transform time per
+segment; the requested-buffer traffic model gives 327 GB/s, above the
+180 GB/s floor. The 21-test Metal primitive suite on both default and
+radix-two fallback, exact Merkle differential,
+real-witness CPU differentials at po2 14/18/20, CPU-only build, three
+offline Colima feature paths, and 20-request lifecycle passed. Idle footprint
+fell 14.58%; the 46M stretch verified in 217.957 s with a 17.905 GiB guard
+peak. See `evidence/phase2-wp3-{paired,validation}.json` and
+`evidence/phase2-wp3-paired.csv`.
+
+The WP3 stage and paired-saving gates pass. The midpoint's 60 s line is
+missed by 1.589 s arithmetic and 5.384 s hashing; the revised brief leaves
+a near miss to the owner before the reserved WP2b wider-overlap iteration.
+The 46M result is below the 220 s minimum line but above the 180 s pass
+line. A separate browser-closed repeat was stopped after arithmetic once
+the revised recorded-load rule was re-read; its partial ledger is retained.
+A first lifecycle attempt passed 20 steady proofs and idle drift, then used
+a 60 s helper-timeout deadline that exceeded the tiny proof's 45.4 s
+completion. The 35 s rerun passed every control and is the closure run.
+
+Earlier WP3 launch-grid diagnostics are recorded in
+`docs/macos/evidence/phase2-wp3-start.json`. Full butterfly coverage measured
+2.420 s steady transform wall time per po2-20 segment; a bounded grid per
+column measured 2.220 s. Both complete arithmetic proofs passed the pinned
+external verifier and its three tamper tests. The 20-test Metal primitive
+suite passed for each variant. These were unfused pre-port diagnostics and
+are separate from the final paired gate measurement above.
+
 ## Revised source brief — 2026-11-05
 
 The current re-export of `Phase 2 spec Metal proving performance on macOS.md`
@@ -173,7 +227,8 @@ brief remains the detailed technical and acceptance specification.
 | WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Closed under the revised one-sided memory gate; five paired proofs per fixture pass timing and correctness; evalfast is default with tail-split override. |
 | WP0.5 command batching | Revised 2026-11-05 gate: about 2–3 s saved; command counts and correctness/lifecycle gates | Closed with batching default after three iterations. Arithmetic saves 2.049 s, hashing saves 3.023 s; the former 3 s and 0.3 s targets missed, and the remaining transform gap moves to WP3. |
 | WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | Closed, passed: 6.029/6.050 s paired savings; 15.50% idle decrease; overlap cancellation and CPU differential passed. |
-| WP3 transforms | At most 0.8 s per po2-20 segment, exact primitive tests and unchanged Merkle outputs | Pending |
+| WP3 transforms | At most 0.8 s transform wall time per po2-20 segment, at least 30% of the approximately 600 GB/s bandwidth ceiling, exact primitive tests and unchanged Merkle outputs | Closed, stage and paired-saving gates passed: 0.636 s isolated transform wall, 327 GB/s modeled requested-buffer bandwidth, 11.095/11.025 s paired savings. Midpoint 60 s line missed. |
+| WP2b wider overlap | At least 4 s saved at 10M against WP3, lifecycle and cancellation green | Reserved for the owner's midpoint near-miss decision. |
 | WP5 po2 21 assessment | Faster than po2 20 within measured memory ceiling | Pending; owner approval before changing default |
 | WP4 recursion evaluator | At most 7 s lift/join at 10M, exact differential | Pending |
 | WP6 pipeline cache | Warm process first dispatch at most 5 s, stale archive rebuilds | Pending |
@@ -181,8 +236,9 @@ brief remains the detailed technical and acceptance specification.
 | WP8 Poseidon254 | Exact differential and verified identity receipts | Optional; requires owner approval before starting |
 
 The mid-point decision after WP3 targets both 10M warm medians at most 60 s.
-A near miss within a few seconds is the owner's call and continues to WP5 with
-the profile; a large miss above roughly 70 s stops for a re-plan. The final
+A near miss within a few seconds is the owner's call; the revised order is
+WP2b wider overlap, then WP5 with the profile. A large miss above roughly
+70 s stops for a re-plan. The final
 pass lines are at most 45 s for both 10M fixtures and 180 s for
 46M; minimum acceptance is 55 s and 220 s respectively. Every complete proof
 must pass the unchanged verifier and the three tamper rejections. Campaigns use

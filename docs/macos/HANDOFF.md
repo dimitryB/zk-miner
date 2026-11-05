@@ -1,5 +1,50 @@
 # macOS proving handoff
 
+## WP3 fused transforms — 2026-11-05
+
+The revised Phase 2 source brief SHA-256 is
+`07467098c3493a0bbc0f543b0960676ba3a3e21ebd1fb7a65d10bb8dec40dc97`.
+Engine `7143255acda4e51383237a479b51f914a8be904a` adds the fused
+commit interpolation, zk-shift, LDE and evaluation path with resident
+twiddles and scale tables. Engine
+`8520c737725698ddb156ccda2a41e0521213b878` makes radix-four
+threadgroup tiles and a column-parallel grid the default. The old path is
+selectable with `RISC0_METAL_NTT_RADIX2=1` for bisection. There is no proof
+format, admission budget, or external verifier change.
+
+The final 21-test Metal primitive suite passed on both the default fused
+path and `RISC0_METAL_NTT_RADIX2=1` fallback. A standalone local
+differential matched the unfused path's witness, coefficients, full LDE and
+all Merkle nodes at po2 12/14/18. The fixed five-pair campaign against the
+sealed WP2 archive verified all 24 proofs and rejected all 72 tamper cases.
+Complete medians were 72.684 → 61.589 s arithmetic and 76.409 → 65.384 s
+hashing, saving 11.095 and 11.025 s. Both arms used po2 20, 18 Rayon/Go
+threads and 8 GiB reserve; measured admission wait was zero. Brave, Codex,
+Claude and Colima were present and recorded; thermal snapshots changed from
+nominal to fair. The largest paired guard peak was 22.544 GiB, below the
+24 GiB initial budget and 32 GiB ceiling.
+
+A separate pipeline-disabled complete proof measured 0.455 s GPU and
+0.636 s dispatch wall steady transform time per segment, passing the 0.8 s
+stage gate. The requested-buffer traffic model gives about 327 GB/s,
+54.4% of the 600 GB/s reference ceiling. A 46M stretch proof passed the
+unchanged verifier and three tamper checks in 217.957 s complete latency,
+with 17.905 GiB guard peak. The 10M medians are above the 60 s midpoint;
+the revised brief leaves a near miss to the owner before reserved WP2b.
+The paired and per-proof data are in [WP3 paired evidence](evidence/phase2-wp3-paired.json)
+and [paired rows](evidence/phase2-wp3-paired.csv); the remaining validation
+is recorded in [WP3 validation](evidence/phase2-wp3-validation.json).
+
+An additional browser-closed campaign was started after misreading an older
+protocol; its arithmetic fixture completed, then the repeat was stopped.
+The revised WP3 brief says to record background load and close nothing to
+improve a number, so the original Brave-present campaign is the gate run.
+The extra partial run remains under `target/macos/phase2/wp3-pairs/` as a
+diagnostic. A first 20-request lifecycle attempt verified all 20 steady
+proofs with a 14.83% idle-footprint decrease, then failed only the harness's
+helper-timeout assertion: its 60 s deadline exceeded the tiny proof's 45.4 s
+completion. The 35 s rerun is the closure check.
+
 ## WP2 segment pipeline — 2026-11-05
 
 The updated source brief SHA-256 is
