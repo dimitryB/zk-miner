@@ -23,9 +23,9 @@ def gpu_stage(row):
     kernel = row["kernel"]
     if kernel in {"eval_check", "ef_prep", "ef_eval_split", "ef_combine"}:
         return "constraint_evaluation"
-    if kernel.startswith("multi_ntt") or kernel in {"multi_bit_reverse", "zk_shift", "batch_expand"}:
+    if kernel.startswith("multi_ntt") or kernel in {"multi_bit_reverse", "zk_shift", "batch_expand", "batch_transforms"}:
         return "polynomial_transforms"
-    if kernel in {"poseidon2_rows", "poseidon2_fold", "sha_rows", "sha_fold"}:
+    if kernel in {"poseidon2_rows", "poseidon2_fold", "sha_rows", "sha_fold", "batch_merkle"}:
         return "merkle_commitments"
     return "other_segment_gpu"
 

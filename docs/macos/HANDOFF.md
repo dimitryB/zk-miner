@@ -1,5 +1,19 @@
 # macOS proving handoff
 
+## WP0.5 command batching — 2026-11-04
+
+The revised Phase 2 source brief has SHA-256
+`299ebd441aa2e1c0c70f7587a88b8cc32154d0835a0eaea0d807adef11028597`.
+Engine `2e1d34e130122cdc74ad788f7f47d74c0a357c7c` batches GPU-only
+NTT/shift/LDE and Merkle stages at their CPU access boundaries. The sealed
+WP1 worker is archived at `target/macos/phase2/wp1-baseline/` for the paired
+campaign. Metal primitive and recursion offset tests, plus the CPU-only
+feature build, passed. Complete-proof validation and the paired gate remain.
+
+The WP1 paired CSV now fills both GPU columns. The sealed WP0 worker could
+not timestamp individual kernels, so its values are labeled references from
+the separate verified WP0 GPU profile; evalfast values are from paired proofs.
+
 ## WP1 paired checkpoint — 2026-11-04
 
 Engine `d194533fa` is pushed. The five-pair campaign against the sealed WP0
@@ -17,10 +31,9 @@ rebuilt worker SHA-256 is
 `6896db28ae15053f63377dff745ca64ac67cba68c1f52e1c8ba3d02928e983e9`.
 Default and fallback proofs passed real-witness CPU differentials and external
 verification. The final-build lifecycle verified 21 proofs and passed all
-failure and recovery controls, but idle footprint after request 20 was 10.60%
-below request 1. This fails the source spec's literal ±5% memory gate. The
-settled range was 3.68%, with normal pressure. WP1's paired timing gate is
-closed; formal package closure is pending that memory criterion. See
+failure and recovery controls. Idle footprint after request 20 was 10.60%
+below request 1; this passes the revised one-sided memory gate. The settled
+range was 3.68%, with normal pressure. WP1 is closed. See
 [default-path evidence](evidence/phase2-wp1-default.json).
 
 ## Reopened WP1 evalfast port — 2026-11-04

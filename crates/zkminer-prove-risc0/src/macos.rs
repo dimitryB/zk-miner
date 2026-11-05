@@ -496,6 +496,7 @@ fn prove_staged(
             let checks =
                 after.completed_constraint_checks - segment_before.completed_constraint_checks;
             let dispatches = after.completed_dispatches - segment_before.completed_dispatches;
+            let command_buffers = after.completed_command_buffers - segment_before.completed_command_buffers;
             let points = after.evaluation_points - segment_before.evaluation_points;
             let witness = after.cpu_witness_calls - segment_before.cpu_witness_calls;
             let accumulation = after.cpu_accumulation_calls - segment_before.cpu_accumulation_calls;
@@ -505,6 +506,8 @@ fn prove_staged(
                     checks == info.stats.segments as u64
                         && points > 0
                         && dispatches > checks
+                        && command_buffers > 0
+                        && command_buffers <= dispatches
                         && witness == checks
                         && accumulation == checks,
                     "missing RV32IM Metal segment execution evidence"
@@ -512,7 +515,8 @@ fn prove_staged(
                 observed["segment"] = json!("metal");
                 observed["other_segment_operations"] = json!("metal_shared_buffers");
                 observed["rv32im_metal"] = json!({"completed_constraint_checks":checks,"evaluation_points":points,
-                    "completed_dispatches":dispatches,"cpu_witness_calls":witness,"cpu_accumulation_calls":accumulation,
+                    "completed_dispatches":dispatches,"completed_command_buffers":command_buffers,
+                    "cpu_witness_calls":witness,"cpu_accumulation_calls":accumulation,
                     "threads_per_threadgroup":256,"evalfast_phase_split":std::env::var("RISC0_RV32IM_TAIL_SPLIT").as_deref()!=Ok("1"),
                     "kernel_source_sha256":hash(risc0_zkvm::metal_rv32im_kernel_source().as_bytes()),
                     "hal_kernel_source_sha256":hash(risc0_zkp::hal::metal::runtime_kernel_source().as_bytes()),

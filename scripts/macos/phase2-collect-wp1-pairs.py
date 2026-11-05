@@ -18,7 +18,7 @@ def read(path):
     return json.loads(path.read_text())
 
 
-def collect_case(case, campaign, baseline, candidate_shader):
+def collect_case(case, campaign, baseline, candidate_shader, wp0_profile):
     run = Path(case["run"])
     assert case["status"] == "passed" and sha(run / "result.json") == case["result_sha256"]
     result = read(run / "result.json")
@@ -67,7 +67,14 @@ def collect_case(case, campaign, baseline, candidate_shader):
             segment_gpu = split["gpu_seconds"] / 10
         else:
             assert not rv.get("evalfast_phase_split", False)
-            segment_gpu = None
+            # The sealed WP0 worker predates per-kernel timestamps. Use its
+            # separately verified profile as a labelled fixture reference.
+            segment_gpu = wp0_profile["kernels"]["constraint_evaluation/eval_check"]["gpu_seconds"] / 10
+        gpu_kernels = ({name: item["gpu_seconds"] for name, item in
+                        wp0_profile["kernels"].items()} if arm == "wp0" else
+                       {name: item["gpu_seconds"] for name, item in
+                        rv["gpu_kernels"].items()})
+        assert gpu_kernels and segment_gpu > 0
         memory = row["resources"]["idle_after_verification_and_settle"]["native_memory"]
         assert memory["reserve_bytes"] == 16 * 1024**3
         assert row["rayon_threads"] == row["gomaxprocs"] == 18
@@ -79,8 +86,8 @@ def collect_case(case, campaign, baseline, candidate_shader):
                                  row["timings"]["external_verifier_ms"]) / 1000,
             "admission_wait_seconds": row["admission_wait_ms"] / 1000,
             "segment_gpu_seconds": segment_gpu,
-            "gpu_kernel_seconds": json.dumps({name: item["gpu_seconds"]
-                for name, item in rv.get("gpu_kernels", {}).items()}, sort_keys=True),
+            "gpu_kernel_seconds": json.dumps(gpu_kernels, sort_keys=True),
+            "gpu_measurement_source": "wp0_profile_reference" if arm == "wp0" else "paired_sidecar",
             "worker_pid": worker["worker_pid"],
             "guard_peak_footprint_bytes": memory["guard_peak_footprint_bytes"],
             "idle_worker_footprint_bytes": memory["group"]["worker"]["footprint_bytes"],
@@ -146,8 +153,11 @@ def main():
     assert prior["worker_sha256"] == campaign["candidate_worker_sha256"]
     assert prior["engine_commit"] == campaign["engine_commit"]
     assert len(campaign["cases"]) == 2
-    fixtures = [collect_case(case, campaign, baseline, prior["shader_sha256"])
-                for case in campaign["cases"]]
+    wp0_profile = read(EVIDENCE / "phase2-wp0-gpu-profile.json")
+    assert wp0_profile["status"] == "measured"
+    profiles = {profile["fixture"]: profile for profile in wp0_profile["profiles"]}
+    fixtures = [collect_case(case, campaign, baseline, prior["shader_sha256"],
+                             profiles[case["fixture"]]) for case in campaign["cases"]]
     assert [f["fixture"] for f in fixtures] == list(EXPECTED_CYCLES)
     report = {
         "schema_version": 1, "status": "passed" if all(
@@ -167,7 +177,7 @@ def main():
         "verified_proofs": 24, "tamper_rejections": 72,
         "fixtures": fixtures,
         "hashing_rebaseline_note": "The WP0 hashing median here used a closed browser and the default 16 GiB reserve in the same paired campaign; it replaces the non-comparable Brave-open 12 GiB historical median.",
-        "limitation": "The sealed WP0 worker does not emit per-kernel GPU timestamps in its proof sidecar. Its separate WP0 profile has GPU timings; candidate sidecars record per-kernel times for every paired proof.",
+        "limitation": "The sealed WP0 worker does not emit per-kernel GPU timestamps in its proof sidecar. WP0 GPU values are fixture-level references from a separate verified, instrumented proof (worker SHA differs from the sealed archive); they are repeated on its five paired rows. Evalfast values come from each paired sidecar. GPU columns must not be treated as paired GPU measurements.",
     }
     EVIDENCE.mkdir(parents=True, exist_ok=True)
     json_path = EVIDENCE / "phase2-wp1-paired.json"

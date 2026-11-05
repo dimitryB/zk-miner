@@ -70,7 +70,8 @@ def main():
             sidecar = worker["observed_stages"][label]["gpu_kernels"]
             assert all(name.startswith(prefix) and stats["invalid_gpu_timestamps"] == 0
                        for name, stats in sidecar.items())
-            sidecar_count = sum(stats["commands"] for stats in sidecar.values())
+            sidecar_count = sum(stats.get("command_buffers", stats["commands"])
+                                for stats in sidecar.values())
             logged = [command for command in commands if criterion(command)]
             assert sidecar_count == len(logged)
             sidecar_gpu = sum(stats["gpu_seconds"] for stats in sidecar.values())

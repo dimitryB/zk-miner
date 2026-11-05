@@ -1,11 +1,12 @@
 {
   "schema_version": 1,
-  "status": "memory_gate_failed",
+  "status": "passed",
+  "source_spec_sha256": "299ebd441aa2e1c0c70f7587a88b8cc32154d0835a0eaea0d807adef11028597",
   "engine_commit": "5acb4b8721b54ba2621d89f5f8d677cd5eca29d2",
   "worker_sha256": "6896db28ae15053f63377dff745ca64ac67cba68c1f52e1c8ba3d02928e983e9",
   "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
-  "paired_evidence_sha256": "81bdd382b7fbd0aff46dadb2d84f044c03dfa8529e26a852061a8de03b19704b",
-  "collector_sha256": "9bd5c59f8de932db8bb35cdfb2aad031299f7d47e42eec8687f13c24bef1ec85",
+  "paired_evidence_sha256": "329b3d41c50337757db0a0ff530fecaf13eb451ce8b3ad7eadbef613e690e4d5",
+  "collector_sha256": "5fb3ec664106e06955a4c5781383aa280124b692566f21dc76ffffc54739e8b0",
   "default": {
     "run": "/Users/dbur/dev/zk-miner/target/macos/native-wrap/worker-runs/17e5694aa0fc48cab2c1e816e6e132e6",
     "result_sha256": "a83121977332ec6037c82282381889586e5109ada754be1488e93c8c7ac820e6",
@@ -33,7 +34,7 @@
     "idle_last_bytes": 4091023104,
     "idle_first_to_last_fraction": -0.10595512918902084,
     "idle_post_settle_range_fraction": 0.03681864495446696,
-    "idle_first_to_last_within_5_percent": false,
+    "idle_growth_at_most_5_percent": true,
     "pressure_levels": [
       1
     ],

@@ -76,7 +76,7 @@ def lifecycle(run, worker_sha, shader):
             "idle_first_bytes": idle[0], "idle_last_bytes": idle[-1],
             "idle_first_to_last_fraction": drift,
             "idle_post_settle_range_fraction": settled_range,
-            "idle_first_to_last_within_5_percent": abs(drift) <= 0.05,
+            "idle_growth_at_most_5_percent": drift <= 0.05,
             "pressure_levels": pressure, "helper_cancel": controls["helper_cancel"],
             "helper_timeout_control_observed": True,
             "worker_timeout": controls["worker_timeout"],
@@ -101,7 +101,8 @@ def main():
     fallback = proof(args.fallback, False, prior["fallback"]["shader_sha256"], worker["binary_sha256"])
     life = lifecycle(args.lifecycle, worker["binary_sha256"], prior["shader_sha256"])
     report = {"schema_version": 1,
-              "status": "passed" if life["idle_first_to_last_within_5_percent"] else "memory_gate_failed",
+              "status": "passed" if life["idle_growth_at_most_5_percent"] else "memory_gate_failed",
+              "source_spec_sha256": "299ebd441aa2e1c0c70f7587a88b8cc32154d0835a0eaea0d807adef11028597",
               "engine_commit": worker["source"]["engine_head"],
               "worker_sha256": worker["binary_sha256"],
               "verifier_sha256": paired["verifier_sha256"],

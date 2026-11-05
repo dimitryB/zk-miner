@@ -35,10 +35,9 @@ Engine `5acb4b8721b54ba2621d89f5f8d677cd5eca29d2` makes evalfast the
 default. `RISC0_RV32IM_TAIL_SPLIT=1` selects the tail-split/256 fallback. A
 rebuilt sealed worker (`6896db28…`) passed a complete po2-14 CPU differential
 and external verification on each route. Its 20-request lifecycle passed all
-functional controls and verified 21 proofs, but idle footprint fell 10.60%
-from request 1 to request 20. This misses the source spec's literal ±5%
-memory gate, despite a 3.68% settled range and no upward leak. WP1's timing
-gate is met; formal package closure remains pending this memory criterion.
+functional controls and verified 21 proofs. Idle footprint fell 10.60%
+from request 1 to request 20, with a 3.68% settled range and no upward leak.
+This passes the revised one-sided memory gate, so WP1 is closed.
 See [default-path evidence](evidence/phase2-wp1-default.json).
 
 ## Reopened WP1 evalfast phase split — 2026-11-04

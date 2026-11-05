@@ -1,5 +1,23 @@
 # Phase 2: Metal proving performance on macOS
 
+## Revised source brief — 2026-11-04
+
+The re-exported `Phase 2 spec Metal proving performance on macOS.md` has
+SHA-256 `299ebd441aa2e1c0c70f7587a88b8cc32154d0835a0eaea0d807adef11028597`.
+It adds WP0.5 command batching before WP2, makes the 20-request idle footprint
+criterion one-sided (at most 5% growth), and amends the WP3 mid-point decision.
+The WP1 final lifecycle's 10.60% decrease passes the revised memory rule;
+WP1 is closed at 78.688 s arithmetic and 80.779 s hashing paired medians.
+WP0.5 is the next package.
+
+Engine checkpoint `2e1d34e130122cdc74ad788f7f47d74c0a357c7c`
+adds command-buffer batching for NTT, shift/LDE, and Merkle stages, plus
+per-buffer counters. The sealed WP1 baseline binary and provenance live in
+`target/macos/phase2/wp1-baseline/` (manifest SHA-256
+`4fb202a4b4578b49763c90dbe89ee7a4edf45b7a8886d02377f968ee7b6882a2`).
+The 20-test Metal primitive suite, recursion offset differential, and
+CPU-only feature build passed before candidate timing.
+
 ## WP1 paired checkpoint — 2026-11-04
 
 The five-pair campaign against the sealed WP0 archive passed both timing
@@ -17,10 +35,9 @@ by default; `RISC0_RV32IM_TAIL_SPLIT=1` selects the tail-split/256 fallback.
 Both routes passed a rebuilt-worker po2-14 real-witness CPU differential and
 external verification. The final build's 20-request lifecycle also passed
 functionally, with 21 verified proofs and 63 tamper rejections. Its idle
-footprint fell 10.60% from request 1 to request 20, outside the source spec's
-literal ±5% memory condition. The later settled range was 3.68% and pressure
-stayed normal. Record WP1's performance gate as passed and formal package
-closure as pending the memory criterion; see
+footprint fell 10.60% from request 1 to request 20, which passes the revised
+one-sided memory condition. The later settled range was 3.68% and pressure
+stayed normal. WP1 is closed; see
 `evidence/phase2-wp1-default.json`.
 
 ## WP1 reopened — 2026-11-04
@@ -64,7 +81,7 @@ See `evidence/phase2-wp1-evalfast.json` for source hashes and verified run paths
 This first MSL target stops after `remat_lu.py`; CUDA's `mksm2.py` shared-memory
 placement and `mksub.py` chain tails remain follow-on port work.
 
-Source brief: `Phase 2 spec Metal proving performance on macOS.md`, dated
+Original source brief: `Phase 2 spec Metal proving performance on macOS.md`, dated
 2026-11-04, SHA-256
 `22c73353915de7154577858ab4556d6d52fc6af3f463b3e6b2009f3ec5c707b7`.
 This page records implementation status and measured checkpoints. The source
@@ -87,7 +104,8 @@ brief remains the detailed technical and acceptance specification.
 | Package | Required gate | Status |
 | --- | --- | --- |
 | WP0 baseline and GPU timing | Sealed archive; five warm proofs per 10M fixture, one 46M proof; per-kernel GPU and pipeline statistics | Baseline, profiles, CPU-only build, limits, and 20-request lifecycle measured; transform GPU-only wall reconciliation misses 10%; Linux cross-target compile unavailable locally |
-| WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Five paired proofs per fixture pass timing and correctness; evalfast is default with tail-split override. Formal closure pending the literal ±5% first-to-last idle footprint gate (observed −10.60%). |
+| WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Closed under the revised one-sided memory gate; five paired proofs per fixture pass timing and correctness; evalfast is default with tail-split override. |
+| WP0.5 command batching | Both 10M paired medians at least 3 s faster; transforms, recursion, and Merkle command counts at least 10× lower; host dispatch overhead at most 0.3 s per stage; full correctness and lifecycle gates | In progress; sealed WP1 worker archived at `target/macos/phase2/wp1-baseline/`, generic Metal stage batching implemented and primitive checks running. |
 | WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | Pending |
 | WP3 transforms | At most 0.8 s per po2-20 segment, exact primitive tests and unchanged Merkle outputs | Pending |
 | WP5 po2 21 assessment | Faster than po2 20 within measured memory ceiling | Pending; owner approval before changing default |
@@ -96,8 +114,10 @@ brief remains the detailed technical and acceptance specification.
 | WP7 admission | No refusal under specified desktop load with at least 40 GiB truly free; pressure refusal still works | Pending |
 | WP8 Poseidon254 | Exact differential and verified identity receipts | Optional; requires owner approval before starting |
 
-The mid-point decision after WP3 requires both 10M warm medians to be at most
-60 s. The final pass lines are at most 45 s for both 10M fixtures and 180 s for
+The mid-point decision after WP3 targets both 10M warm medians at most 60 s.
+A near miss within a few seconds is the owner's call and continues to WP5 with
+the profile; a large miss above roughly 70 s stops for a re-plan. The final
+pass lines are at most 45 s for both 10M fixtures and 180 s for
 46M; minimum acceptance is 55 s and 220 s respectively. Every complete proof
 must pass the unchanged verifier and the three tamper rejections. Campaigns use
 one excluded warmup per arm, five measured proofs, and retain failures.
@@ -120,7 +140,7 @@ full verified proof. Each checkpoint also runs the 20-request lifecycle,
 limit controls, and CPU-only and Linux feature checks. The source brief gives
 the exact per-package performance gates and bounded iteration rules.
 
-Checkpoint order is WP0, WP1, WP2, WP3, then the 60-second mid-point decision,
+Checkpoint order is WP0, WP1, WP0.5, WP2, WP3, then the 60-second mid-point decision,
 WP5, WP4, WP6/WP7, and optional WP8. Changing the default po2, raising the
 32 GiB ceiling, or starting WP8 requires owner approval. Engine commits precede
 miner commits that cite the engine SHA. Only personal fork Phase 2 branches are
