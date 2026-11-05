@@ -51,7 +51,16 @@ def main():
     parser.add_argument("--min-guest-cycles", type=int, default=1)
     parser.add_argument("--warmup", action="store_true", help="one extra complete proof before the measured repeats")
     parser.add_argument("--paired-baseline", type=Path, help="frozen step-5 worker for a counterbalanced CPU-segment/resident-Metal comparison")
+    parser.add_argument("--paired-metal-baseline", type=Path,
+                        help="sealed WP0 worker for a counterbalanced Metal/Metal comparison")
     args = parser.parse_args()
+    if args.paired_baseline and args.paired_metal_baseline:
+        parser.error("select one paired baseline")
+    if args.paired_metal_baseline:
+        if args.worker_kind != "native-rv32im-metal" or args.segment_hal != "metal" or args.recursion_hal != "metal":
+            parser.error("paired Metal baseline requires resident segment and recursion Metal")
+        args.paired_metal_baseline = args.paired_metal_baseline.resolve(strict=True)
+        args.thread_cases = "18:18,18:18"
     if args.paired_baseline:
         if args.worker_kind != "native-rv32im-metal" or args.segment_hal != "metal" or args.recursion_hal != "metal":
             parser.error("paired baseline requires the resident worker with segment and recursion Metal")
@@ -117,6 +126,9 @@ def main():
     if args.paired_baseline:
         env.update(ZKMINER_RISC0_MODE="cpu", ZKMINER_MACOS_SEGMENT_CASES="cpu,metal",
             ZKMINER_MACOS_WORKER_BINARIES=json.dumps([str(args.paired_baseline), str(paths(args.worker_kind)["binary"])]))
+    if args.paired_metal_baseline:
+        env.update(ZKMINER_MACOS_SEGMENT_CASES="metal,metal",
+            ZKMINER_MACOS_WORKER_BINARIES=json.dumps([str(args.paired_metal_baseline), str(paths(args.worker_kind)["binary"])]))
     if args.recursion_cases:
         env["ZKMINER_MACOS_RECURSION_CASES"] = args.recursion_cases
     if args.calibration:
@@ -131,6 +143,8 @@ def main():
     report.update(worker_kind=args.worker_kind, segment_hal=args.segment_hal, segment_check_cpu=args.segment_check_cpu, recursion_hal=args.recursion_hal, recursion_cases=args.recursion_cases)
     if args.paired_baseline:
         report["paired_baseline"] = {"path":str(args.paired_baseline), "sha256":sha(args.paired_baseline)}
+    if args.paired_metal_baseline:
+        report["paired_metal_baseline"] = {"path":str(args.paired_metal_baseline), "sha256":sha(args.paired_metal_baseline)}
     if args.calibration:
         report["calibration"] = {"path":str(args.calibration), "sha256":sha(args.calibration)}
     print(directory, flush=True)
@@ -145,6 +159,8 @@ def main():
             raise RuntimeError("native worker build changed during acceptance")
         if args.paired_baseline and sha(args.paired_baseline) != report["paired_baseline"]["sha256"]:
             raise RuntimeError("baseline worker changed during acceptance")
+        if args.paired_metal_baseline and sha(args.paired_metal_baseline) != report["paired_metal_baseline"]["sha256"]:
+            raise RuntimeError("Metal baseline worker changed during acceptance")
         if sha(binary) != build["binary_sha256"] or acceptance.test_sources() != build["source_inputs"]:
             raise RuntimeError("WorkerPool acceptance sources changed during the run")
         if args.calibration and sha(args.calibration) != report["calibration"]["sha256"]:

@@ -513,7 +513,7 @@ fn prove_staged(
                 observed["other_segment_operations"] = json!("metal_shared_buffers");
                 observed["rv32im_metal"] = json!({"completed_constraint_checks":checks,"evaluation_points":points,
                     "completed_dispatches":dispatches,"cpu_witness_calls":witness,"cpu_accumulation_calls":accumulation,
-                    "threads_per_threadgroup":256,"evalfast_phase_split":std::env::var("RISC0_RV32IM_EVALFAST").as_deref()==Ok("1"),
+                    "threads_per_threadgroup":256,"evalfast_phase_split":std::env::var("RISC0_RV32IM_TAIL_SPLIT").as_deref()!=Ok("1"),
                     "kernel_source_sha256":hash(risc0_zkvm::metal_rv32im_kernel_source().as_bytes()),
                     "hal_kernel_source_sha256":hash(risc0_zkp::hal::metal::runtime_kernel_source().as_bytes()),
                     "cpu_differential_checks":cpu_checks,

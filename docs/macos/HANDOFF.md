@@ -1,5 +1,28 @@
 # macOS proving handoff
 
+## WP1 paired checkpoint — 2026-11-04
+
+Engine `d194533fa` is pushed. The five-pair campaign against the sealed WP0
+archive passed the timing gate with Brave closed, the default 16 GiB reserve,
+18 Rayon and 18 Go threads, and no admission waits. Arithmetic complete
+median was 118.554 → 78.688 s (39.867 s saved); hashing was
+119.566 → 80.779 s (38.787 s saved). The 119.566 s WP0 hashing median is the
+controlled re-baseline; the old 130.6 s Brave-open, 12 GiB result is not a
+comparison arm. All 24 proofs and 72 tamper rejections passed. See
+[paired evidence](evidence/phase2-wp1-paired.json).
+
+Engine `5acb4b8721b54ba2621d89f5f8d677cd5eca29d2` flips evalfast to
+the default and provides `RISC0_RV32IM_TAIL_SPLIT=1` for the fallback. The
+rebuilt worker SHA-256 is
+`6896db28ae15053f63377dff745ca64ac67cba68c1f52e1c8ba3d02928e983e9`.
+Default and fallback proofs passed real-witness CPU differentials and external
+verification. The final-build lifecycle verified 21 proofs and passed all
+failure and recovery controls, but idle footprint after request 20 was 10.60%
+below request 1. This fails the source spec's literal ±5% memory gate. The
+settled range was 3.68%, with normal pressure. WP1's paired timing gate is
+closed; formal package closure is pending that memory criterion. See
+[default-path evidence](evidence/phase2-wp1-default.json).
+
 ## Reopened WP1 evalfast port — 2026-11-04
 
 Engine `d194533fa5138a8d9a352c977ae622d59cca4d41` regenerates the

@@ -37,7 +37,7 @@ def main():
             "vscode": "/Visual Studio Code.app/" in processes,
             "xcode": "/Xcode.app/" in processes,
         },
-        "scope": "instantaneous host observation; no app or VM was stopped for timing",
+        "scope": "instantaneous host observation; process changes are recorded by the campaign driver",
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")

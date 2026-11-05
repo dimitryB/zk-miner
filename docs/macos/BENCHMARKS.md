@@ -1,5 +1,46 @@
 # macOS proving measurements
 
+## WP1 paired gate and hashing re-baseline — 2026-11-04
+
+The sealed WP0 worker and the opt-in evalfast worker each completed one
+excluded warmup and five alternating, counterbalanced measured proofs per
+fixture. Brave was closed before the campaign and absent in the before/after
+snapshots for both fixtures. Both arms used po2 20, 18 Rayon and 18 Go threads,
+the default 16 GiB host reserve, the same helper and unchanged external
+verifier. There were no admission waits or failed proofs. All 24 proofs
+verified and all 72 tamper checks rejected; pressure stayed normal.
+
+| Complete proof plus verifier, median of five | WP0 archive | Evalfast | Saving |
+| --- | ---: | ---: | ---: |
+| Arithmetic 10M | 118.554 s | 78.688 s | 39.867 s |
+| Hashing 10M | 119.566 s | 80.779 s | 38.787 s |
+
+Arithmetic ranges were 117.103–118.952 s (WP0) and 78.403–78.765 s
+(evalfast); within-pair ratios were 1.5005, 1.4867, 1.5121, 1.5079, and
+1.5117. Hashing ranges were 119.149–120.065 s (WP0) and 80.576–81.717 s
+(evalfast); within-pair ratios were 1.4750, 1.4743, 1.4632, 1.4841, and
+1.4867. Median evalfast split-kernel GPU time per segment was 1.692 s for
+arithmetic and 1.633 s for hashing. Both complete-latency savings exceed the
+25 s WP1 gate, and both segment medians are below 2.0 s.
+
+The **119.566 s WP0 hashing median** is the clean re-baseline under the same
+conditions as evalfast. The earlier 130.6 s hashing result with Brave open and
+a 12 GiB reserve is historical and is not used for this comparison. Raw rows,
+host snapshots, source and binary hashes, and all five pair ratios are in
+[paired evidence](evidence/phase2-wp1-paired.json) and
+[paired CSV](evidence/phase2-wp1-paired.csv). The sealed WP0 proof sidecar lacks
+per-proof GPU kernel timestamps; its separate WP0 profile remains available.
+
+Engine `5acb4b8721b54ba2621d89f5f8d677cd5eca29d2` makes evalfast the
+default. `RISC0_RV32IM_TAIL_SPLIT=1` selects the tail-split/256 fallback. A
+rebuilt sealed worker (`6896db28…`) passed a complete po2-14 CPU differential
+and external verification on each route. Its 20-request lifecycle passed all
+functional controls and verified 21 proofs, but idle footprint fell 10.60%
+from request 1 to request 20. This misses the source spec's literal ±5%
+memory gate, despite a 3.68% settled range and no upward leak. WP1's timing
+gate is met; formal package closure remains pending this memory criterion.
+See [default-path evidence](evidence/phase2-wp1-default.json).
+
 ## Reopened WP1 evalfast phase split — 2026-11-04
 
 The in-tree evalfast output through `remat_lu.py` is regenerated and translated

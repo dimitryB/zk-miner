@@ -1,5 +1,28 @@
 # Phase 2: Metal proving performance on macOS
 
+## WP1 paired checkpoint — 2026-11-04
+
+The five-pair campaign against the sealed WP0 archive passed both timing
+gates with Brave closed and the default 16 GiB reserve: arithmetic complete
+median 118.554 → 78.688 s (39.867 s saved), hashing complete median
+119.566 → 80.779 s (38.787 s saved). Evalfast median split-kernel GPU time
+per segment was 1.692 s and 1.633 s. All 24 paired-campaign proofs verified,
+all 72 tamper checks rejected, and admission wait was zero. The hashing WP0
+median is now re-baselined under the same conditions; the prior 130.6 s
+Brave-open, 12 GiB result is historical. See
+`evidence/phase2-wp1-paired.{json,csv}`.
+
+Engine `5acb4b8721b54ba2621d89f5f8d677cd5eca29d2` now selects evalfast
+by default; `RISC0_RV32IM_TAIL_SPLIT=1` selects the tail-split/256 fallback.
+Both routes passed a rebuilt-worker po2-14 real-witness CPU differential and
+external verification. The final build's 20-request lifecycle also passed
+functionally, with 21 verified proofs and 63 tamper rejections. Its idle
+footprint fell 10.60% from request 1 to request 20, outside the source spec's
+literal ±5% memory condition. The later settled range was 3.68% and pressure
+stayed normal. Record WP1's performance gate as passed and formal package
+closure as pending the memory criterion; see
+`evidence/phase2-wp1-default.json`.
+
 ## WP1 reopened — 2026-11-04
 
 The owner reset WP1's iteration budget. The explicit scope is to port the
@@ -64,7 +87,7 @@ brief remains the detailed technical and acceptance specification.
 | Package | Required gate | Status |
 | --- | --- | --- |
 | WP0 baseline and GPU timing | Sealed archive; five warm proofs per 10M fixture, one 46M proof; per-kernel GPU and pipeline statistics | Baseline, profiles, CPU-only build, limits, and 20-request lifecycle measured; transform GPU-only wall reconciliation misses 10%; Linux cross-target compile unavailable locally |
-| WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Opt-in evalfast phase split meets synthetic and single 10M diagnostic timing gates; exact synthetic and real-witness differentials, fallback proof, and 20-request lifecycle pass |
+| WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Five paired proofs per fixture pass timing and correctness; evalfast is default with tail-split override. Formal closure pending the literal ±5% first-to-last idle footprint gate (observed −10.60%). |
 | WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | Pending |
 | WP3 transforms | At most 0.8 s per po2-20 segment, exact primitive tests and unchanged Merkle outputs | Pending |
 | WP5 po2 21 assessment | Faster than po2 20 within measured memory ceiling | Pending; owner approval before changing default |

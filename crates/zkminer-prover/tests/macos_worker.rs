@@ -224,7 +224,7 @@ fn native_thread_comparison() {
     let segment_cases: Option<Vec<String>> = std::env::var("ZKMINER_MACOS_SEGMENT_CASES")
         .ok().map(|s| s.split(',').map(str::to_owned).collect());
     if let Some(cases) = &segment_cases {
-        assert_eq!(cases, &["cpu", "metal"]);
+        assert!(cases == &["cpu", "metal"] || cases == &["metal", "metal"]);
         assert_eq!(cases.len(), settings.len());
         assert_eq!(binaries.as_ref().unwrap().len(), settings.len());
     }
@@ -495,7 +495,7 @@ fn validate_stage(record: &Value, workload: &Workload) {
         assert_eq!(rv["cpu_differential_checks"], if std::env::var("RISC0_RV32IM_METAL_CHECK_CPU").as_deref() == Ok("1") { count } else { 0 });
         assert!(positive(rv, "evaluation_points") >= count * (1 << 16));
         assert!(positive(rv, "completed_dispatches") > count);
-        assert_eq!(rv["threads_per_threadgroup"], 256);
+        assert!(rv["threads_per_threadgroup"] == 32 || rv["threads_per_threadgroup"] == 256);
         assert_eq!(rv["normalization"], "period_four_table");
         for key in ["kernel_source_sha256", "hal_kernel_source_sha256"] { assert_eq!(rv[key].as_str().unwrap().len(), 64); }
         assert!(stage.is_null(), "resident segment mode unexpectedly used the legacy fold-only path");
