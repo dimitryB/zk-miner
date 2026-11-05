@@ -63,7 +63,7 @@ def gpu_profile(log):
             "gpu_seconds": sum(row["gpu_ms"] for row in rows) / 1000,
             "dispatch_wall_seconds": sum(row["dispatch_wall_ms"] for row in rows) / 1000,
             "overlap_seconds": 0.0,
-            "overlap_scope": "Synchronous Phase 1 Metal dispatch; each command completes before CPU buffer access"}
+            "overlap_scope": "Synchronous Metal stages; each command buffer completes before CPU buffer access"}
 
 
 def main():
