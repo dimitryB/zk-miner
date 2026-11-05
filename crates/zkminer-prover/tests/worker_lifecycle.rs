@@ -294,6 +294,150 @@ fn a_worker_that_lost_its_server_is_replaced_and_the_next_proof_succeeds() {
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
 }
 
+/// What a preempted SP1 measurement staged goes with it. SIGKILL skips the executor's own cleanup, and
+/// the room is about to be given to the proof, so left there the two add up to a full tmpfs and a
+/// SIGBUS.
+#[test]
+fn preempting_an_sp1_measurement_unlinks_what_it_staged() {
+    let shm_name = format!("sp1_mocktest{}_t", std::process::id());
+    let shm_file = format!("/dev/shm/{shm_name}");
+    let mut env = mock_env("execute", "");
+    env.insert("MOCK_BACKEND".to_string(), "sp1".to_string());
+    env.insert("MOCK_HOLD_SHM".to_string(), shm_name);
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("sp1:measure:0", "sp1", mock_worker_path(), env)
+        .expect("failed to spawn mock worker");
+    let pool = Arc::new(pool);
+    let measurer = {
+        let pool = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            pool.execute_cycles("sp1", &[], &[], Some(Duration::from_secs(120)), None, None)
+        })
+    };
+    // The mock names the file only once it is mapped, which is how the kill will find it.
+    let started = Instant::now();
+    while !std::path::Path::new(&shm_file).exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the mock never staged"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    pool.test_preempt_all_inflight_measures();
+    let err = measurer.join().unwrap().expect_err("it was preempted");
+    assert!(
+        err.downcast_ref::<zkminer_prover_protocol::types::MeasurePreempted>()
+            .is_some(),
+        "{err:#}"
+    );
+    let leaked = std::path::Path::new(&shm_file).exists();
+    let _ = std::fs::remove_file(&shm_file);
+    assert!(
+        !leaked,
+        "preempting a measurement must not leave what it staged in /dev/shm"
+    );
+}
+
+/// The same preemption with a real SP1 worker and guest, for what they really leave in `/dev/shm`.
+///
+///   ZKMINER_TEST_SP1_WORKER=<zkminer-prove-sp1> cargo test -p zkminer-prover --features testing \\
+///     --test worker_lifecycle -- --ignored --test-threads=1 preempting_a_real_sp1_measurement
+#[test]
+#[ignore = "needs a real zkminer-prove-sp1, and no other SP1 execution on this host"]
+fn preempting_a_real_sp1_measurement_frees_its_dev_shm() {
+    /// What the tmpfs really has in use, which unlinked but still mapped pages count towards.
+    fn tmpfs_used() -> u64 {
+        let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statvfs(c"/dev/shm".as_ptr(), &mut fs) };
+        assert_eq!(rc, 0);
+        (fs.f_blocks - fs.f_bfree) as u64 * fs.f_frsize as u64
+    }
+    fn staged() -> u64 {
+        std::fs::read_dir("/dev/shm")
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("sp1_") || name.starts_with("sem.sp1_")
+            })
+            .map(|e| {
+                use std::os::unix::fs::MetadataExt;
+                e.metadata().map(|m| m.blocks() * 512).unwrap_or(0)
+            })
+            .sum()
+    }
+    let worker =
+        PathBuf::from(std::env::var("ZKMINER_TEST_SP1_WORKER").expect("the worker to run"));
+    let dir = std::env::temp_dir().join(format!("zkminer-preempt-shm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let elf_path = dir.join("guest.elf");
+    let exported = std::process::Command::new(&worker)
+        .args(["--export-guest", "sha256-chain"])
+        .arg(&elf_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(exported.success());
+    let elf = std::fs::read(&elf_path).unwrap();
+    assert_eq!(staged(), 0, "another SP1 execution is using /dev/shm");
+    let used_before = tmpfs_used();
+
+    let mut env = HashMap::new();
+    env.insert(
+        zkminer_prover_protocol::types::SP1_MEASURE_ONLY_ENV.to_string(),
+        "1".to_string(),
+    );
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("sp1:measure:0", "sp1", worker, env)
+        .expect("failed to spawn the SP1 worker");
+    let pool = Arc::new(pool);
+    let measurer = {
+        let pool = Arc::clone(&pool);
+        let input = 2_000_000u32.to_le_bytes().to_vec();
+        std::thread::spawn(move || {
+            pool.execute_cycles(
+                "sp1",
+                &elf,
+                &input,
+                Some(Duration::from_secs(300)),
+                None,
+                None,
+            )
+        })
+    };
+    let started = Instant::now();
+    while staged() < 500 * 1024 * 1024 {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "it never staged"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let before = staged();
+    pool.test_preempt_all_inflight_measures();
+    let err = measurer.join().unwrap().expect_err("it was preempted");
+    assert!(
+        err.downcast_ref::<zkminer_prover_protocol::types::MeasurePreempted>()
+            .is_some(),
+        "{err:#}"
+    );
+    let after = staged();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(after, 0, "{before} bytes staged, {after} left behind");
+    // Not just the names: the pages themselves came back.
+    let started = Instant::now();
+    while tmpfs_used() > used_before + 4 * 1024 * 1024 {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{} bytes still in use in /dev/shm, {used_before} before it staged",
+            tmpfs_used()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// A host OOM kills the largest process, which for SP1 is the server and not the worker, and the
 /// worker then exits on its own account. That must still read as a memory shortage, or a healthy card
 /// is excluded for what the host did. Needs a real OOM kill, so a worker adopted into a memory-capped

@@ -14,6 +14,8 @@
 //!   until the kernel kills it, before `MOCK_CRASH_ON` applies on `"prove"`: a host OOM killing a
 //!   server and not the worker. First lowers this worker's own cgroup limit to 256 MiB, and exits 99
 //!   if it cannot, so the child can never eat the host.
+//! - `MOCK_HOLD_SHM`: a `/dev/shm` name to create and map before hanging on an Execute, as SP1's native
+//!   executor stages a guest there, and leaves it behind if killed.
 //! - `MOCK_BACKEND`: backend name for the HelloAck response. Default: `"mock"`.
 //! - `MOCK_JOURNAL_HEX` / `MOCK_SEAL_HEX`: replay a fixed receipt. Execute reports the journal, and
 //!   Prove returns the journal and the seal, whatever the ELF and input. With a real receipt (the
@@ -146,6 +148,10 @@ fn main() {
                 if crash_on == "execute" || crash_on == "both" {
                     std::process::exit(1);
                 }
+                #[cfg(unix)]
+                if let Ok(name) = std::env::var("MOCK_HOLD_SHM") {
+                    hold_shm(&name);
+                }
                 if hang_on == "execute" || hang_on == "both" {
                     // Hang forever — simulating an in-flight measurement that holds its slot and its
                     // ledger reservations until it is SIGKILLed (by the measure watchdog, or by a
@@ -206,7 +212,39 @@ fn main() {
     }
 }
 
-/// The bytes of a hex environment variable (an optional `0x` prefix allowed); empty when unset.
+/// Map a new `/dev/shm/<name>` shared, touch it, and keep it mapped for good. Named only once it is
+/// mapped, so that a test that sees the name knows a kill will find the mapping.
+#[cfg(unix)]
+fn hold_shm(name: &str) {
+    use std::os::fd::AsRawFd;
+    const LEN: usize = 1024 * 1024;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(format!("/dev/shm/{name}.partial"))
+        .expect("create the /dev/shm file");
+    file.set_len(LEN as u64).expect("size the /dev/shm file");
+    let mapped = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            LEN,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(mapped, libc::MAP_FAILED, "map the /dev/shm file");
+    unsafe { std::ptr::write_bytes(mapped as *mut u8, 1, LEN) };
+    std::fs::rename(
+        format!("/dev/shm/{name}.partial"),
+        format!("/dev/shm/{name}"),
+    )
+    .expect("name the /dev/shm file");
+}
+
 /// Lower `memory.max` of the cgroup this process is in, and read it back.
 fn limit_own_cgroup_memory(bytes: u64) -> io::Result<()> {
     let own = std::fs::read_to_string("/proc/self/cgroup")?;
@@ -222,6 +260,7 @@ fn limit_own_cgroup_memory(bytes: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// The bytes of a hex environment variable (an optional `0x` prefix allowed); empty when unset.
 fn hex_env(name: &str) -> Vec<u8> {
     let Ok(v) = std::env::var(name) else {
         return Vec::new();

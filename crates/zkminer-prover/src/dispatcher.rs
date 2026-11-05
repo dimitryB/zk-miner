@@ -527,6 +527,7 @@ impl ProvingWatchdog {
                                 current_pid,
                                 (expected_start != 0).then_some(expected_start),
                             ) {
+                                crate::worker::unlink_group_sp1_shm(&slot_key, current_pid);
                                 unsafe {
                                     libc::kill(-(current_pid as i32), libc::SIGKILL);
                                     libc::kill(current_pid as i32, libc::SIGKILL);
@@ -1106,6 +1107,32 @@ fn read_card_occupancy(
 fn staging_capacity(room: u64, each: u64) -> usize {
     room.checked_div(each)
         .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// Would a proof fit with the in-flight measurements preempted? Their whole `charged` comes off what is
+/// reserved, as the ledger gives it back, but only what they are `holding` right now comes back to
+/// live memory. A charge is the measurement's cap, whatever its guest touches: crediting all of it
+/// would say yes on memory that was never there, and bond a job on a promise the proof's own
+/// reservation then refuses, which a submitter could arrange with a small guest that just spins.
+#[allow(clippy::too_many_arguments)]
+fn fits_with_measures_preempted(
+    expected_peak: u64,
+    resident: u64,
+    reserved: u64,
+    available: u64,
+    total: u64,
+    reserve: u64,
+    charged: u64,
+    holding: u64,
+) -> bool {
+    crate::memory::can_admit(
+        expected_peak,
+        resident,
+        reserved.saturating_sub(charged),
+        available.saturating_add(holding),
+        total,
+        reserve,
+    )
 }
 
 /// Would `need` (plus `reserve`) overflow `capacity` with what is already `held` there, after
@@ -4952,7 +4979,9 @@ impl WorkerPool {
         // 0 bytes against `u64::MAX` is always granted (`can_admit(0, ..)` holds), so the inert paths
         // return a live-but-empty reservation rather than a spurious `None`. `resident`/`reserve` are 0
         // and `available == total == capacity`: pure ledger-bounded concurrency, independent of live
-        // tmpfs occupancy (which the C1 orphan reaper + margin already keep clear of our own files).
+        // tmpfs occupancy. Our own files stay out of the way because a kill of ours unlinks them
+        // (`unlink_group_sp1_shm`), and the worker's startup sweep takes those of a death we did not
+        // cause, such as the kernel's OOM killer, after its 30 s age floor.
         self.shm_ledger.try_reserve(want, 0, capacity, capacity, 0)
     }
 
@@ -5100,7 +5129,8 @@ impl WorkerPool {
     /// reclassifies the kill as the typed transient `MeasurePreempted`. This takes NO *slot* lock
     /// (the measurement thread holds it, and never waits on `inflight_measures` while doing so), so
     /// it cannot deadlock against the measurement; the only work done under the lock is a `/proc`
-    /// read and two `kill(2)`s, none of which re-enter `inflight_measures`.
+    /// read, `unlink_group_sp1_shm` (bounded, whatever the worker is stuck on) and two `kill(2)`s,
+    /// none of which re-enter `inflight_measures`.
     #[cfg_attr(not(unix), allow(unused_variables))]
     fn preempt_one_measure(&self, key: &str, m: &InflightMeasure) -> bool {
         let map = self
@@ -5149,6 +5179,7 @@ impl WorkerPool {
                 // `kill(0)` (our whole group) or `kill(-1)` (every process we may signal). Identity is
                 // checked immediately above, and the `inflight_measures` lock is held across the kill
                 // so the slot cannot be redispatched out from under us.
+                crate::worker::unlink_group_sp1_shm(key, pid);
                 unsafe {
                     libc::kill(-(pid as i32), libc::SIGKILL);
                     libc::kill(pid as i32, libc::SIGKILL);
@@ -5288,8 +5319,8 @@ impl WorkerPool {
         }
         victims.sort_by_key(|(_, m)| std::cmp::Reverse(m.shm_bytes));
         // Kill the largest first and re-test after each, so the minimal set is preempted. Unlike host
-        // RAM there is no physical reclaim to wait on: the `shm_ledger` charge drops as the killed
-        // measurement's thread unwinds and drops its reservation, so poll the real `reserve_sp1_shm`.
+        // RAM there is nothing to wait on after the charge: `preempt_one_measure` unlinks what the
+        // measurement staged, so its pages go when it does. So poll the real `reserve_sp1_shm`.
         for (k, m) in &victims {
             let killed = self.preempt_one_measure(k, m);
             // Same start-floor-respecting bound as the host arm (see `reclaim_wait_budget`): a full
@@ -5741,7 +5772,7 @@ impl WorkerPool {
         // was permanent on this box — an idle SP1 worker keeps ~23 GB, so risc0 jobs were not claimed
         // on either card for as long as SP1 sat warm. Only looked at after a refusal: this runs per
         // candidate job, and reading each worker's slot and cgroup is not free.
-        crate::memory::plan_host_room(
+        if crate::memory::plan_host_room(
             expected_peak,
             resident,
             reserved,
@@ -5752,6 +5783,30 @@ impl WorkerPool {
             MIN_RECLAIMABLE_HOST,
         )
         .is_some()
+        {
+            return true;
+        }
+        // Nor does a measurement stand in the way: a claimed proof preempts one, as it has collateral
+        // behind it and a measurement has none (`preempt_measures_for_host`). Refusing the claim here
+        // means that never happens, and lets a submitter hold off SP1 claims for free by keeping
+        // measurements running.
+        let measures = self.inflight_measures_snapshot();
+        let charged = measures
+            .iter()
+            .fold(0u64, |sum, (_, m)| sum.saturating_add(m.host_bytes));
+        let holding = measures.iter().fold(0u64, |sum, (key, _)| {
+            sum.saturating_add(self.current_host_bytes_for_slot(key).unwrap_or(0))
+        });
+        fits_with_measures_preempted(
+            expected_peak,
+            resident,
+            reserved,
+            available,
+            total,
+            reserve,
+            charged,
+            holding,
+        )
     }
 
     /// Peak host memory this slot's worker has reached, in bytes.
@@ -7289,6 +7344,7 @@ impl WorkerPool {
                             // Identity-checked, as in the timeout watchdog.
                             #[cfg(unix)]
                             if crate::memory::pid_is_our_worker(pid, expected_start) {
+                                crate::worker::unlink_group_sp1_shm(&key, pid);
                                 unsafe {
                                     libc::kill(-(pid as i32), libc::SIGKILL);
                                     libc::kill(pid as i32, libc::SIGKILL);
@@ -7606,6 +7662,10 @@ impl WorkerPool {
             };
             if crate::memory::pid_is_our_worker(pid, expected_start) {
                 tracing::info!("Sending SIGTERM to worker {key} (PID {pid})");
+                // The SP1 worker has no SIGTERM handler, so its executor's cleanup is skipped by this
+                // as by a SIGKILL, and a miner restarted at once would stage beside what it left.
+                #[cfg(unix)]
+                crate::worker::unlink_group_sp1_shm(key, pid);
                 #[cfg(unix)]
                 unsafe {
                     // Signal the GROUP, not just the leader: a forked GPU helper
@@ -10613,6 +10673,83 @@ mod preemption_tests {
             0,
             "the guard must deregister the measurement when it drops"
         );
+    }
+
+    /// A measurement's charge has no collateral behind it and a claimed proof preempts it, so it must
+    /// not stop the claim. A proof's charge is another matter, as a proof is never preempted.
+    #[test]
+    fn a_claim_counts_on_preempting_a_measurement_but_not_a_proof() {
+        let (Some(total), Some(available)) = (
+            crate::memory::mem_total_bytes(),
+            crate::memory::mem_available_bytes(),
+        ) else {
+            return;
+        };
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
+        let peak = GIB;
+        if available < peak + reserve {
+            return; // Too little free on this host for the claim to fit in any case.
+        }
+        // Over the committed limit by a GiB: refused unless some of it can be given back.
+        let held = total - peak - reserve + GIB;
+        let pool = empty_pool();
+        let _charge = pool
+            .memory_ledger
+            .try_reserve(held, 0, u64::MAX, u64::MAX, 0)
+            .expect("the ledger takes a charge against an unbounded limit");
+        assert!(
+            !pool.backend_fits_for_claim(peak, "sp1", 0, 1),
+            "held by proofs: nothing can be preempted"
+        );
+        let (m, _flag) = fake_measure(held, 0);
+        pool.inflight_measures
+            .lock()
+            .unwrap()
+            .insert("sp1:measure:0".to_string(), m);
+        assert!(
+            pool.backend_fits_for_claim(peak, "sp1", 0, 1),
+            "held by a measurement: the proof preempts it"
+        );
+    }
+
+    /// A charge is a cap, not memory: only what a measurement really holds comes back to live headroom.
+    #[test]
+    fn a_measurements_charge_is_not_counted_as_free_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let fits = |available: u64, charged: u64, holding: u64| {
+            fits_with_measures_preempted(
+                18 * GIB,
+                0,
+                charged,
+                available * GIB,
+                92 * GIB,
+                3 * GIB,
+                charged,
+                holding,
+            )
+        };
+        // 5 GiB free, a measurement charged 24 but really using 0.5: 18 + 3 does not fit in 5.5.
+        assert!(!fits(5, 24 * GIB, GIB / 2));
+        // The same charge really in use: killing it gives the room back.
+        assert!(fits(5, 24 * GIB, 20 * GIB));
+        // Free memory that is already there is enough, whatever the measurement holds.
+        assert!(fits(40, 24 * GIB, GIB / 2));
+        // On a small box, what the measurement has reserved is what stands in the way.
+        let small = |charged: u64| {
+            fits_with_measures_preempted(
+                18 * GIB,
+                0,
+                12 * GIB,
+                25 * GIB,
+                28 * GIB,
+                3 * GIB,
+                charged,
+                0,
+            )
+        };
+        assert!(!small(0), "held by a proof: 12 + 18 + 3 exceeds 28");
+        assert!(small(12 * GIB), "held by a measurement: it goes");
     }
 
     /// `preempt_one_measure` SETS the LIVE registration's preempt flag (so the measurement thread

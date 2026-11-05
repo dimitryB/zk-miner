@@ -1,5 +1,6 @@
 pub mod codec;
 pub mod proc;
+pub mod sp1_shm;
 pub mod sys_rand;
 pub mod types;
 

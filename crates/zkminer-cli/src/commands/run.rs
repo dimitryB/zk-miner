@@ -6753,9 +6753,9 @@ async fn miner_brain(
                 if let Some(pool) = zkminer_prover::engine::worker_pool() {
                     let peak = measured_peak_for_job.unwrap_or(0);
                     if !pool.sp1_execute_provable_beside_server(peak) {
-                        if memory_skips_this_tick
-                            .insert(format!("sp1:provable:{:x}", job.info.program_id))
-                        {
+                        // Once a tick for all of them, not per program: the id is the submitter's
+                        // choice, so a program each would be one warning each, every tick.
+                        if memory_skips_this_tick.insert("sp1:provable".to_string()) {
                             tracing::warn!(
                                 "Not claiming SP1 job {}: its measured execute peak (~{:.1} GiB) plus \
                                  a warm sp1-gpu-server would exceed host RAM at prove time, so it is \

@@ -273,6 +273,8 @@ impl<V> LruCache<V> {
 
 type PkCache = LruCache<CudaPk>;
 use zkminer_prover_protocol::proc::{self, Outcome};
+#[cfg(any(target_os = "linux", test))]
+use zkminer_prover_protocol::sp1_shm::{is_sp1_shm_basename, sp1_shm_mapped_in};
 use zkminer_prover_protocol::types::{
     CUDA_DEVICE_ID_ENV, CUDA_VRAM_AVAILABLE_BYTES_ENV, CUDA_VRAM_BYTES_ENV, HOST_MEM_BUDGET_ENV,
 };
@@ -816,37 +818,6 @@ fn reap_orphaned_gpu_servers(our_device: Option<u32>, wait: Duration) {
 #[cfg(target_os = "linux")]
 const SP1_SHM_ORPHAN_MIN_AGE: Duration = Duration::from_secs(30);
 
-/// True for a `/dev/shm` basename the SP1 native executor creates: the memory image
-/// (`sp1_<uuid>_m`), the trace ring (`sp1_<uuid>_t`) and the ring's POSIX semaphores
-/// (`sem.sp1_<uuid>_t_filled` / `_empty`). Both prefixes are matched on purpose — glibc backs a
-/// named semaphore with a `sem.`-prefixed file in the same tmpfs (see sp1-jit `shm.rs`). The name
-/// carries a random uuid, not a pid, so it cannot be the discriminator; liveness is (see reaper).
-fn is_sp1_shm_basename(name: &str) -> bool {
-    name.starts_with("sp1_") || name.starts_with("sem.sp1_")
-}
-
-/// Record into `out` every SP1 `/dev/shm` basename a `/proc/<pid>/maps` blob currently maps. A
-/// segment that ANY live process maps is in use and must never be unlinked, whichever worker owns
-/// it. Reads `maps` not `fd` deliberately: SP1 `mmap`s a segment then CLOSES the fd, so the fd is
-/// usually gone while the mapping — and the segment's use — persists; keying on fds would unlink a
-/// live prover's ring.
-fn sp1_shm_mapped_in(maps: &str, out: &mut std::collections::HashSet<String>) {
-    for line in maps.lines() {
-        let Some(idx) = line.find("/dev/shm/") else {
-            continue;
-        };
-        // SP1's names are `sp1_` + base64url(uuid) + suffix; the base64url alphabet has no spaces,
-        // so the basename is the first whitespace-delimited token after the prefix. Taking that
-        // token also drops a trailing " (deleted)" annotation on an already-unlinked mapping.
-        let Some(name) = line[idx + "/dev/shm/".len()..].split_whitespace().next() else {
-            continue;
-        };
-        if is_sp1_shm_basename(name) {
-            out.insert(name.to_string());
-        }
-    }
-}
-
 /// Unlink `/dev/shm/sp1_*` segments (memory image, trace ring) and their `sem.sp1_*` semaphores
 /// left behind by a native executor that died WITHOUT running its `Drop` — a SIGBUS when /dev/shm
 /// filled, an OOM `SIGKILL`, an abort. A clean or in-band exit already unlinks them (sp1-jit RAII),
@@ -861,6 +832,8 @@ fn sp1_shm_mapped_in(maps: &str, out: &mut std::collections::HashSet<String>) {
 /// segments over time. The age floor defers the segment THIS respawn's death just leaked to a later
 /// pass (it is younger than the floor now); that is fine, because one stale ring does not fill a
 /// correctly-sized tmpfs, and the next pass reaps it once it has aged out of the create→mmap window.
+/// What the dispatcher kills itself it unlinks as it does so (`unlink_group_sp1_shm`), so this is for
+/// deaths it did not cause, and for a dispatcher that died too.
 ///
 /// The discriminator is LIVENESS, not a pid (the names are random uuids): a segment that any live
 /// process still maps (`/proc/*/maps`) is spared. The age floor is a second guard for the create→mmap

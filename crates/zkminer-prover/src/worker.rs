@@ -150,6 +150,105 @@ enum ExitProbe {
     Gone,
 }
 
+/// How long a kill waits on [`unlink_group_sp1_shm`] before going ahead.
+#[cfg(target_os = "linux")]
+const GROUP_SHM_SCAN_WAIT: Duration = Duration::from_millis(250);
+
+/// Unlink the SP1 `/dev/shm` segments a worker's process group maps. Call just before killing it.
+/// `key` is its backend or slot key: nothing else stages there, so nothing else is looked at.
+///
+/// sp1-jit removes these when an execution ends, in a `Drop` that a signal never reaches, so otherwise
+/// they stay until a worker starting 30 s or more later sweeps them up (`reap_orphaned_sp1_shm`). The
+/// ledger gives their room away the moment the killed execution's charge drops, so the next execution
+/// stages beside them and fills the tmpfs, which is a SIGBUS: measured, 2.1 GB stayed behind a killed
+/// measurement, past a worker started at once. Once unlinked, the pages go when the process does.
+///
+/// By what the group maps, so it is exact: another worker's segments are untouched, and there is no
+/// age to guess at, as the sweep has to. A segment the group created but has yet to map is missed, and
+/// holds nothing yet.
+///
+/// Never in the kill's way. Reading `/proc/<pid>/maps` takes the address space's lock, which a thread
+/// inside a GPU driver can hold for as long as the driver likes, and those are the workers that get
+/// killed. So the scan gets [`GROUP_SHM_SCAN_WAIT`] on a thread of its own, and the caller goes ahead
+/// without it after that, which only leaves those segments to the sweep.
+#[cfg(unix)]
+pub(crate) fn unlink_group_sp1_shm(key: &str, pgid: u32) {
+    if key.split(':').next() != Some(zkminer_prover_protocol::BACKEND_SP1) {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    run_bounded(GROUP_SHM_SCAN_WAIT, move |stop| {
+        unlink_group_sp1_shm_in(Path::new("/proc"), Path::new("/dev/shm"), pgid, stop);
+    });
+    #[cfg(not(target_os = "linux"))]
+    let _ = pgid;
+}
+
+/// Run `work` on a thread of its own and wait for it up to `budget`. Its `stop` is set if the wait runs
+/// out: the pid numbers it is working through mean less and less after the kill the caller goes on to.
+#[cfg(target_os = "linux")]
+fn run_bounded(budget: Duration, work: impl FnOnce(&AtomicBool) + Send + 'static) {
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let (done, finished) = std::sync::mpsc::channel();
+    let flag = stop.clone();
+    let spawned = std::thread::Builder::new()
+        .name("group-shm-unlink".to_string())
+        .spawn(move || {
+            work(&flag);
+            let _ = done.send(());
+        });
+    if spawned.is_ok() && finished.recv_timeout(budget).is_err() {
+        stop.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unlink_group_sp1_shm_in(proc_root: &Path, shm: &Path, pgid: u32, stop: &AtomicBool) -> usize {
+    if pgid == 0 {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return 0;
+    };
+    let mut names = std::collections::HashSet::new();
+    for e in entries.flatten() {
+        // Whatever was read before stopping is still this group's, and is unlinked below.
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let is_pid = e
+            .file_name()
+            .to_str()
+            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+        if !is_pid {
+            continue;
+        }
+        let Ok(stat) = std::fs::read(e.path().join("stat")) else {
+            continue;
+        };
+        let in_group = parse_stat_state_pgrp(&String::from_utf8_lossy(&stat))
+            .is_some_and(|(_, pgrp)| pgrp == pgid as i32);
+        if in_group {
+            if let Ok(maps) = std::fs::read(e.path().join("maps")) {
+                zkminer_prover_protocol::sp1_shm::sp1_shm_mapped_in(
+                    &String::from_utf8_lossy(&maps),
+                    &mut names,
+                );
+            }
+        }
+    }
+    let mut unlinked = 0;
+    for name in &names {
+        if std::fs::remove_file(shm.join(name)).is_ok() {
+            unlinked += 1;
+        }
+    }
+    if unlinked > 0 {
+        tracing::info!("unlinked {unlinked} SP1 /dev/shm segment(s) of killed worker group {pgid}");
+    }
+    unlinked
+}
+
 /// See `WorkerHandle::await_exit_visible`.
 #[cfg(unix)]
 fn await_exit_visible_of(pid: u32, budget: Duration) {
@@ -366,6 +465,7 @@ fn sweep_process_group(pid: u32, backend: &str) -> usize {
         backend,
         unsafe { libc::getpgrp() },
         &|pgid| {
+            unlink_group_sp1_shm(backend, pgid as u32);
             unsafe { libc::kill(-pgid, libc::SIGKILL) };
         },
     )
@@ -1191,6 +1291,7 @@ impl WorkerHandle {
                 // real orphan on this path had no way to know. `sweep_process_group` reports
                 // and kills; the kill after it then takes the leader too (and covers a member
                 // forked in the gap).
+                unlink_group_sp1_shm(&self.backend, pid);
                 let _ = sweep_process_group(pid, &self.backend);
                 // Gated on the SAME refusal the sweep applies. Issuing `kill(-pid)`
                 // unconditionally here would void that guarantee two lines after making it: if
@@ -1379,6 +1480,7 @@ impl Drop for WorkerHandle {
                         self.backend
                     );
                     if pid != 0 {
+                        unlink_group_sp1_shm(&self.backend, pid);
                         // Same refusal as the sweep: never `kill(-our_own_pgid)`.
                         if may_signal_group(pid) {
                             unsafe {
@@ -1504,6 +1606,132 @@ fn reap_within(child: &mut Child, budget: Duration) -> bool {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod group_shm_tests {
+    use super::{run_bounded, unlink_group_sp1_shm_in};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// A process in a synthetic `/proc`.
+    fn process(root: &Path, pid: u32, pgrp: u32, maps: &[&str]) {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("stat"),
+            format!("{pid} (a (b) c) S 1 {pgrp} {pgrp} 0 -1 0\n"),
+        )
+        .unwrap();
+        let lines: Vec<String> = maps
+            .iter()
+            .map(|m| format!("7f0000000000-7f0000001000 rw-s 00000000 00:2a 1234    {m}\n"))
+            .collect();
+        std::fs::write(dir.join("maps"), lines.concat()).unwrap();
+    }
+
+    #[test]
+    fn only_what_the_group_maps_is_unlinked() {
+        let root = std::env::temp_dir().join(format!("zkminer-group-shm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (proc_root, shm) = (root.join("proc"), root.join("shm"));
+        std::fs::create_dir_all(&proc_root).unwrap();
+        std::fs::create_dir_all(shm.join("sp1_x")).unwrap();
+        std::fs::write(root.join("outside"), "").unwrap();
+        for name in [
+            "sp1_a_t",
+            "sp1_a_m",
+            "sem.sp1_a_t_filled",
+            "sp1_b_t",
+            "sp1_unmapped_m",
+            "other",
+        ] {
+            std::fs::write(shm.join(name), "").unwrap();
+        }
+        // The worker, and the executor it forked, which is what really maps these.
+        process(
+            &proc_root,
+            77,
+            77,
+            &["/dev/shm/sp1_a_m", "/dev/shm/other", "/usr/lib/libc.so"],
+        );
+        process(
+            &proc_root,
+            78,
+            77,
+            &["/dev/shm/sp1_a_t (deleted)", "/dev/shm/sem.sp1_a_t_filled"],
+        );
+        // Another worker, mid-execution, and a name that tries to leave the directory.
+        process(&proc_root, 90, 90, &["/dev/shm/sp1_b_t"]);
+        process(&proc_root, 79, 77, &["/dev/shm/sp1_x/../../outside"]);
+        std::fs::create_dir_all(proc_root.join("not-a-pid")).unwrap();
+
+        let go = AtomicBool::new(false);
+        assert_eq!(
+            unlink_group_sp1_shm_in(&proc_root, &shm, 0, &go),
+            0,
+            "0 names no group"
+        );
+        assert_eq!(
+            unlink_group_sp1_shm_in(&proc_root, &shm, 12345, &go),
+            0,
+            "not in that group"
+        );
+        // Told to stop: it reads no more, and so unlinks nothing it has not read.
+        assert_eq!(
+            unlink_group_sp1_shm_in(&proc_root, &shm, 77, &AtomicBool::new(true)),
+            0
+        );
+        assert_eq!(unlink_group_sp1_shm_in(&proc_root, &shm, 77, &go), 3);
+        for gone in ["sp1_a_t", "sp1_a_m", "sem.sp1_a_t_filled"] {
+            assert!(!shm.join(gone).exists(), "{gone} should be gone");
+        }
+        for kept in ["sp1_b_t", "sp1_unmapped_m", "other"] {
+            assert!(shm.join(kept).exists(), "{kept} is not this group's");
+        }
+        assert!(root.join("outside").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A kill must go ahead whatever the scan is stuck on: a read of `maps` waits for the address space
+    /// lock, which a thread inside a GPU driver can hold indefinitely.
+    #[test]
+    fn a_stuck_scan_does_not_hold_up_the_kill() {
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let (release, seen) = (released.clone(), stopped.clone());
+        let started = Instant::now();
+        run_bounded(Duration::from_millis(50), move |stop| {
+            while !release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            seen.store(stop.load(Ordering::Acquire), Ordering::Release);
+        });
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(50), "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        // And the scan learns it was overtaken, once it can.
+        released.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !stopped.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the scan was not told to stop");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_quick_scan_is_waited_for_and_not_stopped() {
+        let (done, finished) = std::sync::mpsc::channel();
+        run_bounded(Duration::from_secs(30), move |stop| {
+            done.send(stop.load(Ordering::Acquire)).unwrap();
+        });
+        assert_eq!(
+            finished.try_recv(),
+            Ok(false),
+            "it had finished by the time the call returned"
+        );
     }
 }
 
