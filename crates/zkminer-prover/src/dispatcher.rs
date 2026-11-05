@@ -7120,6 +7120,12 @@ impl WorkerPool {
             // the card is fine, and three consecutive such kills would retire a healthy GPU for the
             // cooldown while the caller burnt its attempts and released the job at a penalty.
             #[cfg(unix)]
+            if is_eof {
+                if let Some(h) = slot.handle.as_mut() {
+                    h.await_exit_visible(Duration::from_secs(1));
+                }
+            }
+            #[cfg(unix)]
             let host_oom = !entry.intentional_kill.load(Ordering::Acquire)
                 && slot
                     .handle

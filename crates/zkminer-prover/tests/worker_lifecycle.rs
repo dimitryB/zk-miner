@@ -256,6 +256,76 @@ fn crash_then_ensure_alive_respawns_successfully() {
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
 }
 
+/// What the dispatcher makes of an SP1 worker that lost its `sp1-gpu-server` and exited: a new worker,
+/// whose next proof succeeds, and a slot not retired however often it happens, as that can be one
+/// job's doing and the job is what the retry budget is for. Exit code 75 is told apart only for a host
+/// OOM, which `a_lost_server_after_a_host_oom_is_a_memory_shortage` covers.
+#[test]
+fn a_worker_that_lost_its_server_is_replaced_and_the_next_proof_succeeds() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    let mut env = mock_env("", "prove");
+    env.insert(
+        "MOCK_CRASH_CODE".to_string(),
+        zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST.to_string(),
+    );
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), env.clone())
+        .expect("failed to spawn mock worker");
+
+    for round in 0..3 {
+        let result = pool.prove("mock", &[], &[], None, Some(Duration::from_secs(30)), None);
+        let e = result.expect_err("this worker exits on every proof");
+        assert!(
+            e.downcast_ref::<zkminer_prover::worker::WorkerDied>()
+                .is_some(),
+            "round {round}: {e:#}"
+        );
+        // Never sent to a dead worker again: the handle is gone, and the PID with it.
+        assert_eq!(pool.test_has_handle("mock:generic"), Some(false));
+        assert_eq!(pool.test_pid("mock:generic"), Some(0));
+        // One failure: the respawn that follows clears it, so repeats cannot retire the slot.
+        assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(1));
+    }
+
+    pool.test_set_spawn_env("mock:generic", mock_env("", ""));
+    let output = pool
+        .prove("mock", &[], &[], None, Some(Duration::from_secs(30)), None)
+        .expect("the replacement proves");
+    assert_eq!(output.cycles, 1000);
+    assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+}
+
+/// A host OOM kills the largest process, which for SP1 is the server and not the worker, and the
+/// worker then exits on its own account. That must still read as a memory shortage, or a healthy card
+/// is excluded for what the host did. Needs a real OOM kill, so a worker adopted into a memory-capped
+/// scope, whose limit the mock lowers before it allocates, and so a systemd user manager:
+///
+///   cargo test -p zkminer-prover --features testing --test worker_lifecycle -- --ignored \\
+///     a_lost_server_after_a_host_oom_is_a_memory_shortage
+#[test]
+#[ignore = "needs a systemd user manager to cap the worker's memory"]
+fn a_lost_server_after_a_host_oom_is_a_memory_shortage() {
+    let code = zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST;
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    let mut env = mock_env("", "prove");
+    env.insert("MOCK_CRASH_CODE".to_string(), code.to_string());
+    env.insert("MOCK_SERVER_OOM".to_string(), "1".to_string());
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), env)
+        .expect("failed to spawn mock worker");
+
+    let e = pool
+        .prove("mock", &[], &[], None, Some(Duration::from_secs(120)), None)
+        .expect_err("this worker exits on the proof");
+    let shortage = e
+        .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+        .unwrap_or_else(|| panic!("not read as a host OOM: {e:#}"));
+    assert!(shortage.attempted);
+    assert_eq!(
+        pool.test_consecutive_failures("mock:generic"),
+        Some(0),
+        "a host OOM is not charged to the slot"
+    );
+}
+
 // ---- Normal operation (no timeout, no crash) ----
 
 #[test]

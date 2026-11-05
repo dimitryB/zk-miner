@@ -150,6 +150,36 @@ enum ExitProbe {
     Gone,
 }
 
+/// See `WorkerHandle::await_exit_visible`.
+#[cfg(unix)]
+fn await_exit_visible_of(pid: u32, budget: Duration) {
+    let started = Instant::now();
+    while matches!(probe_exit_nowait(pid), ExitProbe::Running) && started.elapsed() < budget {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Whether a worker's exit is one a host OOM produces: see `WorkerHandle::died_of_host_oom`.
+///
+/// Three, as the kernel kills the largest process in the worker's cgroup, usually its server, and
+/// systemd then stops the scope that was capping it, as is its default for an OOM kill. So the worker
+/// is either the one killed (SIGKILL), or gets a SIGTERM from systemd, or sees its server gone first
+/// and exits by itself. Measured with a child OOM-killed in a capped scope: SIGTERM and the exit code
+/// each came up about half the time, and the plain SIGKILL test missed every one of them.
+#[cfg(unix)]
+fn exit_can_be_a_host_oom(exit: &ExitProbe) -> bool {
+    matches!(
+        exit,
+        ExitProbe::Exited {
+            signal: Some(libc::SIGKILL | libc::SIGTERM),
+            ..
+        } | ExitProbe::Exited {
+            code: Some(zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST),
+            ..
+        }
+    )
+}
+
 /// Observe a child's exit WITHOUT reaping it.
 ///
 /// `try_wait`/`wait` reap, which frees the pid — and with it the process-GROUP number,
@@ -1086,8 +1116,9 @@ impl WorkerHandle {
 
     /// Was this worker killed because the HOST ran out of memory, rather than failing on its own?
     ///
-    /// Only meaningful once the worker is dead. Two conditions must hold: it died by `SIGKILL`, and
-    /// our cgroup subtree's cumulative OOM-kill counter advanced during its lifetime.
+    /// Only meaningful once the worker is dead. Two conditions must hold: it died in a way a host OOM
+    /// produces (`exit_can_be_a_host_oom`), and our cgroup subtree's cumulative OOM-kill counter
+    /// advanced during its lifetime.
     ///
     /// This exists because the alternative is misattribution: an OOM-killed prover surfaces as EOF
     /// on its pipe, a broken pipe, or a bare "killed by signal 9", all of which read exactly like a
@@ -1097,7 +1128,8 @@ impl WorkerHandle {
     ///
     /// Deliberately conservative. The counter is subtree-wide, so a kill elsewhere in the subtree
     /// during this worker's lifetime can produce a false positive; that is the right direction to
-    /// err, because the consequence is a more informative log line rather than a wrong decision.
+    /// err, because the consequence is a retry that goes back to this card instead of avoiding it,
+    /// with the attempt still spent, rather than a healthy card being excluded for what the host did.
     /// `None` means we cannot tell: no cgroup v2, `memory.events` unreadable, or the child has
     /// already been reaped so its pid no longer identifies it.
     #[cfg(unix)]
@@ -1112,14 +1144,21 @@ impl WorkerHandle {
         }
         let before = self.oom_kills_at_spawn?;
         let now = crate::memory::oom_kill_count()?;
-        let killed_by_signal = matches!(
-            probe_exit_nowait(self.child.id()),
-            ExitProbe::Exited {
-                signal: Some(libc::SIGKILL),
-                ..
-            }
-        );
-        Some(killed_by_signal && now > before)
+        Some(exit_can_be_a_host_oom(&probe_exit_nowait(self.child.id())) && now > before)
+    }
+
+    /// After EOF on the worker's pipe, wait up to `budget` for its exit to be visible, for a question
+    /// about how it died (`died_of_host_oom`) to have an answer.
+    ///
+    /// A process closes its descriptors a moment before it can be waited for, so a reader woken by
+    /// the EOF can get there first and be told "still running". That reads a host OOM as a prover
+    /// failure.
+    #[cfg(unix)]
+    pub fn await_exit_visible(&mut self, budget: Duration) {
+        if self.reaped {
+            return;
+        }
+        await_exit_visible_of(self.child.id(), budget);
     }
 
     /// Get the worker's PID.
@@ -1465,6 +1504,101 @@ fn reap_within(child: &mut Child, budget: Duration) -> bool {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod exit_classification_tests {
+    use super::{await_exit_visible_of, exit_can_be_a_host_oom, probe_exit_nowait, ExitProbe};
+    use zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST;
+
+    /// An SP1 server is what the kernel kills when the host runs out of memory, and its worker then
+    /// exits with this code. Read as an ordinary failure, that would exclude a healthy card and spend
+    /// the job's attempts on what is a memory shortage.
+    #[test]
+    fn a_lost_server_can_be_a_host_oom_as_a_sigkill_can() {
+        let exited = |signal, code| ExitProbe::Exited { signal, code };
+        assert!(exit_can_be_a_host_oom(&exited(Some(libc::SIGKILL), None)));
+        // What systemd sends the rest of a capped scope after an OOM kill in it.
+        assert!(exit_can_be_a_host_oom(&exited(Some(libc::SIGTERM), None)));
+        assert!(exit_can_be_a_host_oom(&exited(
+            None,
+            Some(WORKER_EXIT_SERVER_LOST)
+        )));
+
+        assert!(!exit_can_be_a_host_oom(&exited(None, Some(0))));
+        assert!(!exit_can_be_a_host_oom(&exited(None, Some(1))));
+        assert!(!exit_can_be_a_host_oom(&exited(Some(libc::SIGSEGV), None)));
+        assert!(!exit_can_be_a_host_oom(&exited(Some(libc::SIGABRT), None)));
+        assert!(!exit_can_be_a_host_oom(&ExitProbe::Running));
+        assert!(!exit_can_be_a_host_oom(&ExitProbe::Gone));
+    }
+
+    /// The reader of an EOF can be ahead of the exit, and must not take "running" for an answer. A
+    /// child that closes its output and exits a moment later is as close as this gets to that.
+    #[test]
+    fn a_reader_of_the_eof_waits_for_the_exit_to_show() {
+        use std::io::Read;
+        let mut handle_like = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exec >&-; sleep 2; exit {WORKER_EXIT_SERVER_LOST}"))
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = handle_like.stdout.take().unwrap();
+        let mut sink = Vec::new();
+        out.read_to_end(&mut sink).unwrap();
+        // The EOF is here and the exit is not: this is the state `died_of_host_oom` used to be
+        // asked in.
+        assert!(matches!(
+            probe_exit_nowait(handle_like.id()),
+            ExitProbe::Running
+        ));
+        await_exit_visible_of(handle_like.id(), std::time::Duration::from_secs(5));
+        assert!(exit_can_be_a_host_oom(&probe_exit_nowait(handle_like.id())));
+        handle_like.wait().unwrap();
+    }
+
+    /// With nothing exiting, the wait is its budget and no longer: EOF can come from a worker that
+    /// closed its pipe and lives on, and a proof's retry must not hang on that.
+    #[test]
+    fn the_wait_for_an_exit_is_bounded() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        await_exit_visible_of(child.id(), std::time::Duration::from_millis(50));
+        let waited = started.elapsed();
+        assert!(waited >= std::time::Duration::from_millis(50), "{waited:?}");
+        assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
+        assert!(matches!(probe_exit_nowait(child.id()), ExitProbe::Running));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// And the code really reads that way off a real child's exit.
+    #[test]
+    fn the_exit_code_comes_through_waitid() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {WORKER_EXIT_SERVER_LOST}"))
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let probe = probe_exit_nowait(child.id());
+            if !matches!(probe, ExitProbe::Running) {
+                assert!(exit_can_be_a_host_oom(&probe), "{probe:?}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child.wait().unwrap();
     }
 }
 
