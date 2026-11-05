@@ -1,5 +1,14 @@
 # Phase 2: Metal proving performance on macOS
 
+## Revised source brief — 2026-11-05
+
+The current re-export of `Phase 2 spec Metal proving performance on macOS.md`
+has SHA-256 `966e6bbfd2cbef4912c5cd18903e776b9ffc67c50f612ac2f71805d53247359d`.
+It recalibrates WP0.5's 2–3 s batching closure while retaining its measured
+results, assigns the remaining transform host gap to WP3's wall-time gate, and
+keeps WP2 segment pipelining next. WP2 implementation and evidence are in
+progress on the existing Phase 2 branches.
+
 ## Revised source brief — 2026-11-04
 
 The re-exported `Phase 2 spec Metal proving performance on macOS.md` has
@@ -35,7 +44,10 @@ five-pair campaign saved 2.049 s on arithmetic (77.758 → 75.709 s) and
 72 tamper rejections. Arithmetic misses the required 3 s saving; transform
 and recursion host overhead also miss the 0.3 s target. WP0.5 is closed as
 gate-failed after three bounded iterations, retaining the best correct
-variant on the Phase 2 branch. WP2 is next. See
+variant on the Phase 2 branch. The 2026-11-05 source brief subsequently
+recalibrated the WP0.5 gate to the measured 2–3 s range and records this
+variant as the closed default; the original 3 s and 0.3 s misses remain in
+the evidence. WP2 is in progress. See
 `evidence/phase2-wp05-{gpu-profile,validation,paired}.json`.
 
 ## WP1 paired checkpoint — 2026-11-04
@@ -125,8 +137,8 @@ brief remains the detailed technical and acceptance specification.
 | --- | --- | --- |
 | WP0 baseline and GPU timing | Sealed archive; five warm proofs per 10M fixture, one 46M proof; per-kernel GPU and pipeline statistics | Baseline, profiles, CPU-only build, limits, and 20-request lifecycle measured; transform GPU-only wall reconciliation misses 10%; Linux cross-target compile unavailable locally |
 | WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Closed under the revised one-sided memory gate; five paired proofs per fixture pass timing and correctness; evalfast is default with tail-split override. |
-| WP0.5 command batching | Both 10M paired medians at least 3 s faster; transforms, recursion, and Merkle command counts at least 10× lower; host dispatch overhead at most 0.3 s per stage; full correctness and lifecycle gates | Closed, gate-failed after three iterations. Counts and correctness/lifecycle pass; arithmetic saves 2.049 s (<3 s), hashing saves 3.023 s; transform and recursion host overhead exceed 0.3 s. Best correct variant retained. |
-| WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | Pending |
+| WP0.5 command batching | Revised 2026-11-05 gate: about 2–3 s saved; command counts and correctness/lifecycle gates | Closed with batching default after three iterations. Arithmetic saves 2.049 s, hashing saves 3.023 s; the former 3 s and 0.3 s targets missed, and the remaining transform gap moves to WP3. |
+| WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | In progress |
 | WP3 transforms | At most 0.8 s per po2-20 segment, exact primitive tests and unchanged Merkle outputs | Pending |
 | WP5 po2 21 assessment | Faster than po2 20 within measured memory ceiling | Pending; owner approval before changing default |
 | WP4 recursion evaluator | At most 7 s lift/join at 10M, exact differential | Pending |

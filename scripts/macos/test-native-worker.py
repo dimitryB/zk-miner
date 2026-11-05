@@ -19,7 +19,7 @@ def suite_budget(args):
         requests = len(args.thread_cases.split(',')) * (args.samples + 1)
         admission_waits = requests
     else:
-        requests = args.repeat + int(args.warmup) + (4 if not args.proof_only else 0)
+        requests = args.repeat + int(args.warmup) + int(args.pipeline_cancel) + (4 if not args.proof_only else 0)
         admission_waits = 0
     return requests, requests * args.timeout_seconds + admission_waits * 600 + 600
 
@@ -35,6 +35,8 @@ def main():
     parser.add_argument("--workload", choices=["fibonacci", "sha256-chain", "segment-boundary"], default="fibonacci")
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--proof-only", action="store_true")
+    parser.add_argument("--pipeline-cancel", action="store_true",
+                        help="cancel a po2-20 Metal proof while the next CPU segment overlaps prior GPU work")
     parser.add_argument("--rayon-threads", type=int, choices=range(1,19), default=18)
     parser.add_argument("--go-threads", type=int, choices=range(1,19), default=18)
     parser.add_argument("--admission-pressure", action="store_true")
@@ -69,6 +71,9 @@ def main():
     if args.segment_hal == "metal" and args.worker_kind != "native-rv32im-metal":
         parser.error("segment Metal requires the native-rv32im-metal worker")
     if args.segment_check_cpu and args.segment_hal != "metal":parser.error("CPU differential requires segment Metal")
+    if args.pipeline_cancel and (not args.proof_only or args.po2 != 20 or
+                                 args.segment_hal != "metal" or args.recursion_hal != "metal"):
+        parser.error("pipeline cancellation requires proof-only po2-20 Metal segment and recursion")
     if args.recursion_cases:
         cases = args.recursion_cases.split(',')
         if args.worker_kind != "native-recursion-metal" or sorted(cases) != ["cpu", "metal"]:
@@ -117,6 +122,7 @@ def main():
                ZKMINER_MACOS_MIN_GUEST_CYCLES=str(args.min_guest_cycles),
                ZKMINER_RISC0_MAX_GUEST_CYCLES=str(args.session_limit),
                ZKMINER_MACOS_LIFECYCLE="0" if args.proof_only else "1",
+               ZKMINER_MACOS_PIPELINE_CANCEL="1" if args.pipeline_cancel else "0",
                ZKMINER_MACOS_FAILURE_TIMEOUT_SECS=str(args.failure_timeout_seconds), RAYON_NUM_THREADS=str(args.rayon_threads),
                ZKMINER_RISC0_CPU_THREADS=str(args.rayon_threads), RISC0_GROTH16_NATIVE_THREADS=str(args.go_threads),
                ZKMINER_MACOS_ADMISSION_PRESSURE="1" if args.admission_pressure else "0",
@@ -141,6 +147,7 @@ def main():
               "planned_proof_requests":planned_requests,"suite_timeout_seconds":suite_timeout,
               "min_guest_cycles":args.min_guest_cycles,"program_sha256":sha(program),"input_sha256":sha(directory / "input.bin")}
     report.update(worker_kind=args.worker_kind, segment_hal=args.segment_hal, segment_check_cpu=args.segment_check_cpu, recursion_hal=args.recursion_hal, recursion_cases=args.recursion_cases)
+    report["pipeline_cancel"] = args.pipeline_cancel
     if args.paired_baseline:
         report["paired_baseline"] = {"path":str(args.paired_baseline), "sha256":sha(args.paired_baseline)}
     if args.paired_metal_baseline:

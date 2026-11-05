@@ -1227,6 +1227,59 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         );
         assert!(helpers().is_empty(), "helper survived a successful proof");
     }
+    let pipeline_cancel = std::env::var("ZKMINER_MACOS_PIPELINE_CANCEL").as_deref() == Ok("1");
+    if pipeline_cancel {
+        assert!(!lifecycle && workload.po2 == 20 && observed_mode() == "metal");
+        let before = sidecar_paths();
+        let test_log = evidence.parent().unwrap().join("test.log");
+        let log_before = fs::metadata(&test_log).unwrap().len() as usize;
+        ledger(&evidence, &json!({"case":"segment-pipeline-cancel","status":"started"}));
+        let mut observed = None;
+        let failure = std::thread::scope(|scope| {
+            let task = scope.spawn(|| {
+                pool.prove(
+                    "risc0",
+                    &elf,
+                    &workload.input,
+                    Some(workload.po2),
+                    Some(proof_timeout()),
+                    None,
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(240);
+            while !task.is_finished() && Instant::now() < deadline {
+                if let Some((_, record)) = new_sidecar(&before) {
+                    let log = fs::read_to_string(&test_log).unwrap();
+                    if let Some(recent) = log.get(log_before..) {
+                        if let Some(marker) = recent.lines().rev().find(|line| {
+                            line.contains("[metal_pipeline] cpu_begin set=")
+                                && line.contains("gpu_owned_set=Some(")
+                        }) {
+                            pool.cancel(KEY, record["request_id"].as_u64().unwrap())
+                                .unwrap();
+                            observed = Some((record, marker.to_owned()));
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if observed.is_none() && !task.is_finished() {
+                pool.cancel(KEY, 0).unwrap();
+            }
+            task.join().unwrap()
+        });
+        ledger(&evidence, &json!({
+            "case":"segment-pipeline-cancel",
+            "status":if failure.is_err() && observed.is_some() {"expected_failure"} else {"failed"},
+            "error":failure.as_ref().err().map(|error|format!("{error:#}")),
+            "observed_overlap":observed,
+        }));
+        assert!(failure.is_err(), "cancelled pipeline request unexpectedly completed");
+        let (record, _) = observed.expect("cancellation did not observe overlapping segments");
+        assert!(helpers().is_empty(), "owned helper survived pipeline cancellation");
+        assert_group_gone(record["worker_pid"].as_u64().unwrap() as u32);
+    }
     if lifecycle {
         // Trigger real parent cancellation only after this request's helper is running.
         let before = sidecar_paths();
@@ -1419,7 +1472,7 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
     fs::write(evidence.join("complete.json"), serde_json::to_vec_pretty(&json!({
         "status":"complete_independently_verified", "requested_mode":mode(),"observed_mode":observed_mode(),
         "verified_proofs":repeats + usize::from(lifecycle), "helper_cancel":lifecycle,"helper_timeout":lifecycle && worker_kind() != "native","worker_timeout":lifecycle,
-        "restart":lifecycle,"shutdown":true,"workload":workload.name,"po2":workload.po2,
+        "restart":lifecycle,"shutdown":true,"pipeline_cancel":pipeline_cancel,"workload":workload.name,"po2":workload.po2,
         "min_segments":workload.min_segments,"expected_journal_hex":workload.expected_hex,
         "admission_pressure":pressure,"unique_completed_requests":request_identities.len(),
     })).unwrap()).unwrap();
