@@ -6,8 +6,42 @@ The current re-export of `Phase 2 spec Metal proving performance on macOS.md`
 has SHA-256 `966e6bbfd2cbef4912c5cd18903e776b9ffc67c50f612ac2f71805d53247359d`.
 It recalibrates WP0.5's 2–3 s batching closure while retaining its measured
 results, assigns the remaining transform host gap to WP3's wall-time gate, and
-keeps WP2 segment pipelining next. WP2 implementation and evidence are in
-progress on the existing Phase 2 branches.
+keeps WP2 segment pipelining next. WP2 is closed below on the existing Phase 2
+branches.
+
+## WP2 checkpoint — 2026-11-05
+
+Engine `6ebdadd840257b4c8b59171f6e12f063b496b1a7` commits the evalfast
+phase command buffer without waiting; engine
+`a80fcb3c0d912f0ca82befe0fbcbff18e9f35eaa` overlaps the next segment's
+CPU witness and accumulation with the previous GPU-owned buffer set, logging
+buffer-set handoffs and completion. `RISC0_SEGMENT_PIPELINE=0` restores the
+synchronous route for bisection. No kernel, proof format, or 32 GiB ceiling
+change was needed.
+
+Po2-14/18/20 real-witness CPU differentials and the unchanged external
+verifier passed, including all three tamper rejections. Targeted cancellation
+occurred at `cpu_begin set=12 gpu_owned_set=Some(11)` and left no worker group
+or helper. The 20-request lifecycle passed with 21 verified proofs, expected
+cancel/timeout failures, recovery, shutdown, normal pressure, and a 15.50%
+decrease in idle footprint. A first lifecycle attempt retained in evidence
+failed only its harness assertion: the 20-second watchdog fired during
+recursion before the helper had started. The 35-second rerun reached the helper
+and passed. The CPU-only worker and its five tests passed; Colima compiled the
+recursion Metal, RV32IM prove, and zkVM Metal-recursion Linux paths.
+
+Against the sealed WP1 worker, the fixed five-pair campaign passed both 10M
+gates: arithmetic 80.419 → 74.391 s (6.029 s saved), hashing
+81.463 → 75.413 s (6.050 s saved). All 24 proofs and 72 tamper rejections
+passed. The campaign used an 8 GiB reserve on both arms with Brave, Codex,
+Claude, and Colima present; thermal snapshots changed from nominal to fair.
+One excluded arithmetic warmup waited 60.95 s for admission, while all
+measured proofs had zero wait. The maximum paired WP2 guard peak was
+22.014 GiB, below the existing 24 GiB initial resident budget and 32 GiB
+ceiling. One 46M stretch proof verified in 284.415 s with 46 handoffs and
+normal pressure. WP2 is closed and WP3 is next. See
+`evidence/phase2-wp2-{paired,validation}.json` and
+`evidence/phase2-wp2-paired.csv`.
 
 ## Revised source brief — 2026-11-04
 
@@ -138,7 +172,7 @@ brief remains the detailed technical and acceptance specification.
 | WP0 baseline and GPU timing | Sealed archive; five warm proofs per 10M fixture, one 46M proof; per-kernel GPU and pipeline statistics | Baseline, profiles, CPU-only build, limits, and 20-request lifecycle measured; transform GPU-only wall reconciliation misses 10%; Linux cross-target compile unavailable locally |
 | WP1 RV32IM evaluator | At most 2.0 s per po2-20 segment, at least 25 s saved per 10M proof, exact CPU differential | Closed under the revised one-sided memory gate; five paired proofs per fixture pass timing and correctness; evalfast is default with tail-split override. |
 | WP0.5 command batching | Revised 2026-11-05 gate: about 2–3 s saved; command counts and correctness/lifecycle gates | Closed with batching default after three iterations. Arithmetic saves 2.049 s, hashing saves 3.023 s; the former 3 s and 0.3 s targets missed, and the remaining transform gap moves to WP3. |
-| WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | In progress |
+| WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | Closed, passed: 6.029/6.050 s paired savings; 15.50% idle decrease; overlap cancellation and CPU differential passed. |
 | WP3 transforms | At most 0.8 s per po2-20 segment, exact primitive tests and unchanged Merkle outputs | Pending |
 | WP5 po2 21 assessment | Faster than po2 20 within measured memory ceiling | Pending; owner approval before changing default |
 | WP4 recursion evaluator | At most 7 s lift/join at 10M, exact differential | Pending |

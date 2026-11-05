@@ -129,14 +129,88 @@ def overlap_cancellation(run, worker_sha, verifier_sha):
     }
 
 
+def switch_diagnostic(run, worker_sha, verifier_sha, enabled):
+    result = read(run / "result.json")
+    assert result["status"] == "passed" and result["po2"] == 20
+    assert result["worker_build"]["binary_sha256"] == worker_sha
+    assert result["verifier_build"]["binary_sha256"] == verifier_sha
+    assert result["results"]["verified_proofs"] == 1
+    requests = [json.loads(line) for line in
+                (run / "acceptance/requests.jsonl").read_text().splitlines()]
+    complete = [row for row in requests if row.get("status") == "complete_independently_verified"]
+    assert len(complete) == 1
+    row = complete[0]
+    assert row["worker"]["stats"]["segments"] == 10
+    verification = check_verification(run / "acceptance/proof-0/verification.json")
+    log = (run / "test.log").read_text()
+    counts = {name: log.count("[metal_pipeline] " + name) for name in
+              ("cpu_begin", "cpu_witness_ready", "gpu_submit", "gpu_complete", "accum_overlap")}
+    expected = {"cpu_begin": 10, "cpu_witness_ready": 10, "gpu_submit": 10,
+                "gpu_complete": 10, "accum_overlap": 9} if enabled else dict.fromkeys(counts, 0)
+    assert counts == expected
+    memory = row["resources"]["idle_after_verification_and_settle"]["native_memory"]
+    return {
+        "run": str(run), "result_sha256": sha(run / "result.json"),
+        "request_ledger_sha256": sha(run / "acceptance/requests.jsonl"),
+        "test_log_sha256": sha(run / "test.log"),
+        "verification_sha256": verification,
+        "enabled": enabled, "handoff_counts": counts,
+        "complete_seconds": (row["timings"]["prove_call_ms"] +
+                             row["timings"]["external_verifier_ms"]) / 1000,
+        "execution_and_segment_seconds": row["worker"]["stage_ms"]["execution_and_segment"] / 1000,
+        "guard_peak_footprint_bytes": memory["guard_peak_footprint_bytes"],
+        "pressure_level": memory["pressure_level"],
+    }
+
+
+def stretch(run, worker_sha, verifier_sha):
+    result = read(run / "result.json")
+    assert result["status"] == "passed" and result["po2"] == 20
+    assert result["iterations"] == 4_600_000 and result["workload"] == "fibonacci"
+    assert result["worker_build"]["binary_sha256"] == worker_sha
+    assert result["verifier_build"]["binary_sha256"] == verifier_sha
+    assert result["results"]["verified_proofs"] == 1
+    requests = [json.loads(line) for line in
+                (run / "acceptance/requests.jsonl").read_text().splitlines()]
+    complete = [row for row in requests if row.get("status") == "complete_independently_verified"]
+    assert len(complete) == 1
+    row = complete[0]
+    assert row["worker"]["stats"]["user_cycles"] == 46_003_116
+    assert row["worker"]["stats"]["segments"] == 46
+    verification = check_verification(run / "acceptance/proof-0/verification.json")
+    log = (run / "test.log").read_text()
+    handoffs = {name: log.count("[metal_pipeline] " + name) for name in
+                ("cpu_begin", "gpu_submit", "gpu_complete", "accum_overlap")}
+    assert handoffs == {"cpu_begin": 46, "gpu_submit": 46,
+                        "gpu_complete": 46, "accum_overlap": 45}
+    memory = row["resources"]["idle_after_verification_and_settle"]["native_memory"]
+    return {
+        "run": str(run), "result_sha256": sha(run / "result.json"),
+        "request_ledger_sha256": sha(run / "acceptance/requests.jsonl"),
+        "test_log_sha256": sha(run / "test.log"),
+        "verification_sha256": verification,
+        "guest_cycles": row["worker"]["stats"]["user_cycles"],
+        "segments": row["worker"]["stats"]["segments"],
+        "handoff_counts": handoffs,
+        "complete_seconds": (row["timings"]["prove_call_ms"] +
+                             row["timings"]["external_verifier_ms"]) / 1000,
+        "guard_peak_footprint_bytes": memory["guard_peak_footprint_bytes"],
+        "pressure_level": memory["pressure_level"],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for po2 in (14, 18, 20):
         parser.add_argument(f"--po2-{po2}", type=Path, required=True)
     parser.add_argument("--lifecycle", type=Path, required=True)
     parser.add_argument("--overlap-cancel", type=Path, required=True)
+    parser.add_argument("--diagnostic-enabled", type=Path, required=True)
+    parser.add_argument("--diagnostic-disabled", type=Path, required=True)
+    parser.add_argument("--stretch", type=Path, required=True)
     parser.add_argument("--failed-lifecycle", type=Path)
     parser.add_argument("--linux", type=Path, required=True)
+    parser.add_argument("--cpu-build-log", type=Path, required=True)
     parser.add_argument("--engine", type=Path, required=True)
     args = parser.parse_args()
     worker = verify_worker("native-rv32im-metal", args.engine.resolve())
@@ -148,10 +222,22 @@ def main():
                      verifier["binary_sha256"])
     cancelled = overlap_cancellation(args.overlap_cancel.resolve(strict=True),
                                      worker["binary_sha256"], verifier["binary_sha256"])
+    diagnostics = [switch_diagnostic(args.diagnostic_enabled.resolve(strict=True),
+                                     worker["binary_sha256"], verifier["binary_sha256"], True),
+                   switch_diagnostic(args.diagnostic_disabled.resolve(strict=True),
+                                     worker["binary_sha256"], verifier["binary_sha256"], False)]
+    stretch_result = stretch(args.stretch.resolve(strict=True), worker["binary_sha256"],
+                             verifier["binary_sha256"])
     linux = args.linux.resolve(strict=True)
     linux_result = read(linux)
     assert linux_result["status"] == "passed"
     assert linux_result["engine_commit"] == worker["source"]["engine_head"]
+    cpu_worker = verify_worker("cpu", args.engine.resolve())
+    assert cpu_worker["source"]["engine_head"] == worker["source"]["engine_head"]
+    cpu_log = args.cpu_build_log.resolve(strict=True)
+    cpu_text = cpu_log.read_text()
+    assert "test result: ok. 5 passed; 0 failed" in cpu_text
+    assert "worker sealed to exact source" in cpu_text
     failed_lifecycle = None
     if args.failed_lifecycle:
         failed_run = args.failed_lifecycle.resolve(strict=True)
@@ -177,7 +263,11 @@ def main():
         "worker_sha256": worker["binary_sha256"],
         "verifier_sha256": verifier["binary_sha256"],
         "collector_sha256": sha(Path(__file__)),
-        "cpu_only_feature_build": "passed; native CPU worker build and tests on the same engine revision",
+        "cpu_only_feature_build": {
+            "status": "passed", "worker_sha256": cpu_worker["binary_sha256"],
+            "manifest_sha256": sha(ROOT / "target/macos/worker-build.json"),
+            "tests_passed": 5, "log_path": str(cpu_log), "log_sha256": sha(cpu_log),
+        },
         "linux_feature_check": {
             "source_revision": linux_result["engine_commit"],
             "result_sha256": sha(linux),
@@ -186,6 +276,9 @@ def main():
         "real_witness_differentials": checks,
         "lifecycle": life,
         "overlap_cancellation": cancelled,
+        "same_binary_pipeline_switch_diagnostics": diagnostics,
+        "diagnostic_complete_saving_seconds": diagnostics[1]["complete_seconds"] - diagnostics[0]["complete_seconds"],
+        "arithmetic_46m_stretch": stretch_result,
         "failed_lifecycle_attempt": failed_lifecycle,
     }
     EVIDENCE.mkdir(parents=True, exist_ok=True)

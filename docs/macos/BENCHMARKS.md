@@ -1,5 +1,54 @@
 # macOS proving measurements
 
+## WP2 Metal segment pipeline — 2026-11-05
+
+Engine `a80fcb3c0d912f0ca82befe0fbcbff18e9f35eaa` keeps the preceding
+segment's committed buffer set GPU-owned while the CPU fills the next witness
+set. It commits the three evalfast phases together and overlaps the next CPU
+accumulation with the prior deferred finalize. `RISC0_SEGMENT_PIPELINE=0`
+selects the synchronous path. The single same-binary arithmetic diagnostic
+was 86.474 s synchronous and 82.439 s pipelined; that observation is not the
+paired gate.
+
+The fixed campaign compared the sealed WP1 worker with the WP2 worker on the
+same fixtures, helper, verifier, po2 20, 18 Rayon and 18 Go threads, and 8 GiB
+host reserve. Each arm completed one excluded warmup and five alternating,
+counterbalanced measured proofs per fixture. Brave, Codex, Claude, and a Colima
+process were present in the before and after snapshots. The sampled thermal
+state was nominal before arithmetic and fair afterward. No background process
+was closed for timing. One arithmetic warmup waited 60.95 s for admission;
+all measured rows had zero admission wait. All 24 proofs passed the unchanged
+verifier and all 72 tamper tests rejected; pressure stayed normal.
+
+| Complete proof plus verifier, median of five | Sealed WP1 | WP2 pipeline | Saving | ≥6 s gate |
+| --- | ---: | ---: | ---: | --- |
+| Arithmetic 10M | 80.419 s | 74.391 s | 6.029 s | Pass |
+| Hashing 10M | 81.463 s | 75.413 s | 6.050 s | Pass |
+
+Arithmetic measured ranges were 79.459–81.462 s (WP1) and 72.650–74.659 s
+(WP2); its five within-pair WP1/WP2 ratios were 1.0948, 1.0937, 1.0656,
+1.0811, and 1.0958. Hashing ranges were 81.416–82.437 s and
+75.389–75.444 s; ratios were 1.0806, 1.0930, 1.0796, 1.0796, and 1.0809.
+Both margins over the gate are small, so these are measured checkpoints rather
+than a claim about statistical significance. Median evalcheck GPU time per
+segment was 1.662/1.640 s for WP1 and 1.670/1.714 s for WP2
+(arithmetic/hashing); the latency saving comes from CPU/GPU overlap.
+The largest paired WP2 guard peak was 22.014 GiB, below the existing 24 GiB
+initial admission budget and 32 GiB worker/helper ceiling. Neither limit was
+raised. See [paired JSON](evidence/phase2-wp2-paired.json) and
+[all paired rows](evidence/phase2-wp2-paired.csv).
+
+One 46M arithmetic stretch proof completed in 284.415 s with 46 segments,
+45 accumulation overlaps, a 17.787 GiB guard peak, normal pressure, external
+verification and all three tamper rejections. The po2-14/18/20 real-witness
+CPU differentials, a cancellation during an overlapped segment, and the
+20-request lifecycle passed; the latter verified 21 proofs including recovery,
+rejected 63 tamper cases, and finished with a 15.50% lower idle footprint.
+The CPU-only build and five tests passed, as did the three Colima Linux
+feature-path checks. WP2 is closed with both latency gates passed.
+See [WP2 validation](evidence/phase2-wp2-validation.json) for source-bound
+raw runs and feature checks.
+
 ## WP0.5 Metal command batching — 2026-11-05
 
 The third bounded batching iteration keeps kernel code, arguments and dispatch
@@ -39,8 +88,9 @@ Arithmetic ranges were 76.767–77.776 s (WP1) and 74.706–75.746 s
 1.0267, 1.0269, 1.0403, 1.0141, and 1.0276. Hashing ranges were
 79.769–79.809 s (WP1) and 76.759–77.758 s (batching); ratios were
 1.0259, 1.0394, 1.0397, 1.0268, and 1.0396. The paired median gate
-requires at least 3 s saved on **both** fixtures, so WP0.5 is gate-failed.
-The best correct batching variant is retained as the checkpoint. See
+required at least 3 s saved on **both** fixtures, so the original WP0.5 gate
+failed. The 2026-11-05 source brief recalibrated its closure to the measured
+2–3 s range and kept batching as the default checkpoint. See
 [paired evidence](evidence/phase2-wp05-paired.json) and
 [all rows](evidence/phase2-wp05-paired.csv).
 

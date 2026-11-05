@@ -1,8 +1,47 @@
 # macOS proving handoff
 
+## WP2 segment pipeline — 2026-11-05
+
+The updated source brief SHA-256 is
+`966e6bbfd2cbef4912c5cd18903e776b9ffc67c50f612ac2f71805d53247359d`.
+Engine `6ebdadd840257b4c8b59171f6e12f063b496b1a7` introduced a
+deferred Metal evalcheck command buffer, and engine
+`a80fcb3c0d912f0ca82befe0fbcbff18e9f35eaa` overlaps the next segment's
+CPU accumulation with the previous finalize. The CPU/GPU buffer-set ownership
+and completion handoffs are logged. `RISC0_SEGMENT_PIPELINE=0` disables the
+pipeline for bisection. The kernel source, arguments, and proof format are
+unchanged.
+
+Complete po2-14/18/20 proofs passed real-witness CPU differentials, external
+verification, and all three tamper rejections each. A separate 10M proof was
+cancelled after its log showed `cpu_begin set=12 gpu_owned_set=Some(11)`;
+the supervisor left no worker group or helper. The 20-request lifecycle
+passed with 21 verified proofs, 63 tamper rejections, the helper controls,
+recovery, and shutdown. Idle footprint fell 15.50% from request 1 to 20.
+The first lifecycle run is retained as a harness diagnostic: its 20-second
+watchdog fired during recursion, before the helper existed, so the partial
+sidecar did not have final recursion fields. The 35-second rerun reached the
+helper and passed.
+
+The fixed five-pair campaign against sealed WP1 passed the 6 s median gate
+on both 10M fixtures: arithmetic 80.419 → 74.391 s (6.029 s), hashing
+81.463 → 75.413 s (6.050 s). All 24 proofs and 72 tamper rejections passed.
+Both arms used 8 GiB reserve and 18 Rayon/Go threads. Brave, Codex, Claude,
+and a Colima process remained present; thermal observations were nominal then
+fair. One warmup had a 60.95 s admission wait; measured rows had none.
+The paired WP2 peak was 22.014 GiB, so the existing 24 GiB initial budget
+and 32 GiB ceiling remain. The separate 46M stretch verified in 284.415 s.
+The CPU-only worker build and five tests passed. Colima compiled the
+recursion Metal, RV32IM prove, and zkVM Metal-recursion feature paths; the
+final zkVM compile ran offline after fetching missing lockfile-pinned crates.
+WP2 is closed; WP3 transforms is next.
+See [paired evidence](evidence/phase2-wp2-paired.json),
+[paired rows](evidence/phase2-wp2-paired.csv), and
+[validation evidence](evidence/phase2-wp2-validation.json).
+
 ## WP0.5 command batching — 2026-11-05
 
-The revised Phase 2 source brief has SHA-256
+The 2026-11-04 Phase 2 source brief has SHA-256
 `299ebd441aa2e1c0c70f7587a88b8cc32154d0835a0eaea0d807adef11028597`.
 Engine `6b3ec9539fb3a4e5c267c2a4f8f81d6d90ac577d` batches GPU-only
 NTT/shift/LDE, Merkle, and prover stages at CPU access boundaries. The sealed
@@ -27,9 +66,9 @@ The controlled five-pair campaign against the sealed WP1 worker saved
 (79.801 → 76.778 s). All 24 proofs and 72 tamper rejections passed;
 admission wait was zero and sampled pressure stayed normal. Brave was absent
 before and after both fixtures, with the default 16 GiB reserve. Arithmetic
-misses the required 3 s saving, and transforms/recursion miss the 0.3 s host
-overhead gate. WP0.5 is closed as gate-failed after three bounded iterations;
-the best correct batching variant remains on the Phase 2 branch. WP2 is next.
+missed the original 3 s saving and transforms/recursion missed the 0.3 s host
+overhead target. The 2026-11-05 source brief recalibrated WP0.5's closure to
+the measured 2–3 s range and retained batching as the default checkpoint.
 See [paired evidence](evidence/phase2-wp05-paired.json) and
 [rows](evidence/phase2-wp05-paired.csv).
 
