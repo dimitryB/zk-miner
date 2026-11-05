@@ -39,6 +39,9 @@ peak. See `evidence/phase2-wp3-{paired,validation}.json` and
 The WP3 stage and paired-saving gates pass. The midpoint's 60 s line is
 missed by 1.589 s arithmetic and 5.384 s hashing; the revised brief leaves
 a near miss to the owner before the reserved WP2b wider-overlap iteration.
+The next baseline arm is sealed at `target/macos/phase2/wp3-baseline/` with
+manifest SHA-256 `8f1f57c81a2955c91c7aa773c8309822d13557f8527bf1b2c93b4b2953888836`;
+it pins engine `8520c7377` and miner checkpoint `afa97e3`.
 The 46M result is below the 220 s minimum line but above the 180 s pass
 line. A separate browser-closed repeat was stopped after arithmetic once
 the revised recorded-load rule was re-read; its partial ledger is retained.

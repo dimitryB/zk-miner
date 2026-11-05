@@ -31,6 +31,9 @@ stage gate. The requested-buffer traffic model gives about 327 GB/s,
 unchanged verifier and three tamper checks in 217.957 s complete latency,
 with 17.905 GiB guard peak. The 10M medians are above the 60 s midpoint;
 the revised brief leaves a near miss to the owner before reserved WP2b.
+The next baseline arm is sealed at `target/macos/phase2/wp3-baseline/`:
+manifest SHA-256 `8f1f57c81a2955c91c7aa773c8309822d13557f8527bf1b2c93b4b2953888836`,
+engine `8520c7377`, miner checkpoint `afa97e3`.
 The paired and per-proof data are in [WP3 paired evidence](evidence/phase2-wp3-paired.json)
 and [paired rows](evidence/phase2-wp3-paired.csv); the remaining validation
 is recorded in [WP3 validation](evidence/phase2-wp3-validation.json).
