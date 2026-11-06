@@ -23,35 +23,108 @@ impl CurveType {
 // Constants (matching Constants.sol)
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// The on-chain 1-hour MIN_STAKING_AGE gate was removed; eligibility is now `block.number >
+/// depositBlock`. Kept only for the TUI's display constant.
 pub const MIN_STAKING_AGE: u64 = 3600; // 1 hour
 pub const GLOBAL_DEFAULT_COLLATERAL_BPS: u64 = 15000; // 150%
-pub const RELEASE_PENALTY_BPS: u64 = 2000; // 20% max
+/// Upper bound of a job's snapshotted release penalty (governance bounds 1%..30% on v2; the
+/// live default is 5% of the lock's collateral — read a job's own value with `getJobSnapshots`).
+pub const RELEASE_PENALTY_BPS: u64 = 3000; // 30% max
 pub const SLASH_BURN_BPS: u64 = 6500; // 65%
 pub const SLASH_BONUS_BPS: u64 = 3300; // 33%
 pub const SLASH_KEEPER_BPS: u64 = 200; // 2%
 pub const MIN_KEEPER_REWARD: u128 = 500_000_000_000_000_000; // 0.5e18
 pub const TIMESTAMP_SLACK: u64 = 30;
+/// The live default release penalty: 5% of the lock's collateral, burned.
 pub const RELEASE_PENALTY_FLOOR_BPS: u64 = 500; // 5%
 
-/// RISC_ZERO_V1 = keccak256("risczero.v1")
-pub const RISC_ZERO_V1: [u8; 32] = [0u8; 32]; // Placeholder — use risc_zero_v1_id() at runtime
+/// `PROVER_GRACE` (Constants.sol): a lock's prover may still FULFIL while job-local time is at or
+/// before `lockDeadline + PROVER_GRACE`, and RELEASE strictly before it; the slash opens 31 s after
+/// (`slashOpensAt = lockDeadline + PROVER_GRACE + 31`). `lockDeadline` here is the EFFECTIVE
+/// (pause-credited) deadline from `getJobStatusView`.
+pub const PROVER_GRACE_SECS: u64 = 30 * 60;
 
-/// Compute keccak256("risczero.v1") at runtime.
-pub fn risc_zero_v1_id() -> alloy::primitives::B256 {
-    alloy::primitives::keccak256("risczero.v1")
+/// A proof system registered on HemiProve v2. Each id names its zkVM AND the wrapper of its seals,
+/// and one id never accepts another wrapper's seal: an SP1 program's vkey (programId) is the same
+/// under both SP1 ids, but a Groth16 seal on a PLONK job reverts (`VerifierCallFailed`). The id is
+/// `keccak256(label)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProofSystem {
+    Risc0Groth16,
+    Sp1Groth16,
+    Sp1Plonk,
+    /// Not registered on 743111 at launch; joins by a timelock op after Day 1.
+    OpenVmHalo2,
 }
 
-/// Compute keccak256("sp1.v1") at runtime.
-pub fn sp1_v1_id() -> alloy::primitives::B256 {
-    alloy::primitives::keccak256("sp1.v1")
+impl ProofSystem {
+    pub const ALL: [ProofSystem; 4] = [
+        ProofSystem::Risc0Groth16,
+        ProofSystem::Sp1Groth16,
+        ProofSystem::Sp1Plonk,
+        ProofSystem::OpenVmHalo2,
+    ];
+
+    /// The registry label whose keccak256 is the `proofSystemId`.
+    pub fn label(self) -> &'static str {
+        match self {
+            ProofSystem::Risc0Groth16 => "risczero.groth16.v1",
+            ProofSystem::Sp1Groth16 => "sp1.groth16.v1",
+            ProofSystem::Sp1Plonk => "sp1.plonk.v1",
+            ProofSystem::OpenVmHalo2 => "openvm.halo2.v1",
+        }
+    }
+
+    /// The on-chain `proofSystemId` (`keccak256(label)`).
+    pub fn id(self) -> alloy::primitives::B256 {
+        alloy::primitives::keccak256(self.label())
+    }
+
+    /// Identify a job's proof system from its `proofSystemId`. `None` for anything else — including
+    /// the RETIRED ids (`risczero.v1`, `sp1.v1`, `openvm.v1`), which the v2 router refuses at submit,
+    /// and `CUSTOM_VERIFIER`.
+    pub fn from_id(id: alloy::primitives::B256) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.id() == id)
+    }
+
+    /// The zkVM backend (worker family) that produces this system's proofs.
+    pub fn backend(self) -> &'static str {
+        match self {
+            ProofSystem::Risc0Groth16 => "risc0",
+            ProofSystem::Sp1Groth16 | ProofSystem::Sp1Plonk => "sp1",
+            ProofSystem::OpenVmHalo2 => "openvm",
+        }
+    }
 }
 
-/// Compute keccak256("openvm.v1") at runtime.
-pub fn openvm_v1_id() -> alloy::primitives::B256 {
-    alloy::primitives::keccak256("openvm.v1")
+/// `risczero.groth16.v1`.
+pub fn risc_zero_groth16_v1_id() -> alloy::primitives::B256 {
+    ProofSystem::Risc0Groth16.id()
 }
 
-/// Compute keccak256("custom") at runtime.
+/// `sp1.groth16.v1`.
+pub fn sp1_groth16_v1_id() -> alloy::primitives::B256 {
+    ProofSystem::Sp1Groth16.id()
+}
+
+/// `sp1.plonk.v1`.
+pub fn sp1_plonk_v1_id() -> alloy::primitives::B256 {
+    ProofSystem::Sp1Plonk.id()
+}
+
+/// `openvm.halo2.v1`.
+pub fn openvm_halo2_v1_id() -> alloy::primitives::B256 {
+    ProofSystem::OpenVmHalo2.id()
+}
+
+/// Either SP1 id: a program's vkey, ELF, cycles and journal are identical under both, only the seal
+/// wrapper differs. Use this wherever the question is about the PROGRAM (e.g. its registry
+/// `elf_hash` requirement), not about the seal.
+pub fn is_sp1_id(id: alloy::primitives::B256) -> bool {
+    id == sp1_groth16_v1_id() || id == sp1_plonk_v1_id()
+}
+
+/// Compute keccak256("custom") at runtime (`CUSTOM_VERIFIER`; zkminer does not serve these).
 pub fn custom_verifier_id() -> alloy::primitives::B256 {
     alloy::primitives::keccak256("custom")
 }
@@ -371,5 +444,37 @@ mod tests {
         assert_eq!(burn, expected_burn);
         assert_eq!(bonus, remaining - expected_burn);
         assert_eq!(keeper + burn + bonus, collateral);
+    }
+
+    #[test]
+    fn proof_system_ids_match_the_deployed_constants() {
+        // Handoff §3 / Constants.sol values on 743111.
+        let hex = |p: ProofSystem| format!("{:x}", p.id());
+        assert_eq!(
+            hex(ProofSystem::Risc0Groth16),
+            "f8fe527fde36a1f428dcd6b89b775a345a829f12ff8f54ba488149a8dc3960c5"
+        );
+        assert_eq!(
+            hex(ProofSystem::Sp1Groth16),
+            "023973b8ade217f37321f4b8d736956d5d075aee2500f6edd67d63f4ef51429d"
+        );
+        assert_eq!(
+            hex(ProofSystem::Sp1Plonk),
+            "1ea5c35f3bde6fda536b672488334cd2e98e3ff554f1835725ba35ce0cf3579f"
+        );
+        assert_eq!(
+            hex(ProofSystem::OpenVmHalo2),
+            "c2f840cd747be40c46b043261812b681bb030ae49b44faf1249979380dca5155"
+        );
+        for p in ProofSystem::ALL {
+            assert_eq!(ProofSystem::from_id(p.id()), Some(p));
+        }
+        // Retired ids are refused at submit on v2: they must never resolve.
+        for retired in ["risczero.v1", "sp1.v1", "openvm.v1"] {
+            assert_eq!(ProofSystem::from_id(alloy::primitives::keccak256(retired)), None);
+        }
+        assert_eq!(ProofSystem::from_id(custom_verifier_id()), None);
+        assert!(is_sp1_id(sp1_groth16_v1_id()) && is_sp1_id(sp1_plonk_v1_id()));
+        assert!(!is_sp1_id(risc_zero_groth16_v1_id()));
     }
 }

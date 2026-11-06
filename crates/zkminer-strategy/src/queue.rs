@@ -67,6 +67,24 @@ pub enum Rejection {
     NoUsableDevice,
 }
 
+/// Where a job the planner did not admit belongs in its model: on the device where it would finish
+/// earliest, its run time there (`cycles` over the device's throughput) after the device's backlog.
+/// With `cycles` unknown (0), or no throughput for a device, it is taken to run `unknown` there.
+/// `None` with no device at all.
+pub fn place(slots: &[DeviceSlot], cycles: u64, unknown: Duration) -> Option<(String, Duration)> {
+    slots
+        .iter()
+        .map(|slot| {
+            let run = if cycles > 0 && slot.throughput > 0.0 {
+                Duration::from_secs_f64(cycles as f64 / slot.throughput)
+            } else {
+                unknown
+            };
+            (slot.device_id.clone(), slot.backlog.saturating_add(run))
+        })
+        .min_by_key(|(_, finish)| *finish)
+}
+
 /// Decide whether to claim `estimated_cycles` of work, and where it would run.
 ///
 /// * `horizon` — how far ahead to queue per device. `ZERO` disables look-ahead entirely and
@@ -378,6 +396,11 @@ impl QueueModel {
         self.assigned.remove(job);
     }
 
+    /// Whether `job` is modelled.
+    pub fn contains(&self, job: &[u8; 32]) -> bool {
+        self.assigned.contains_key(job)
+    }
+
     /// Jobs currently modelled as outstanding.
     pub fn outstanding(&self) -> usize {
         self.assigned.len()
@@ -419,6 +442,40 @@ mod model_tests {
         let mut k = [0u8; 32];
         k[0] = n;
         k
+    }
+
+    /// A job the planner did not place goes where it would finish first; unknown, where the
+    /// backlog is shortest.
+    #[test]
+    fn an_unplanned_job_is_placed_where_it_finishes_first() {
+        let slot = |id: &str, backlog: u64, throughput: f64| DeviceSlot {
+            device_id: id.to_string(),
+            backlog: Duration::from_secs(backlog),
+            throughput,
+        };
+        let slots = [
+            slot("gpu0", 20, 3e6),
+            slot("gpu1", 0, 1e6),
+            slot("gpu-intel0", 5, 0.0),
+        ];
+        // 42M cycles: gpu0 20 + 14 = 34 s, gpu1 0 + 42 = 42 s, gpu-intel0 5 + 60 (unknown) = 65 s.
+        assert_eq!(
+            place(&slots, 42_000_000, Duration::from_secs(60)),
+            Some(("gpu0".to_string(), Duration::from_secs(34)))
+        );
+        // Cycles unknown: the shortest backlog, for `unknown` more.
+        assert_eq!(
+            place(&slots, 0, Duration::from_secs(60)),
+            Some(("gpu1".to_string(), Duration::from_secs(60)))
+        );
+        assert_eq!(place(&[], 1, Duration::from_secs(60)), None);
+
+        let mut model = QueueModel::new();
+        assert!(!model.contains(&job(1)));
+        model.commit(job(1), "gpu0", Duration::from_secs(34));
+        assert!(model.contains(&job(1)));
+        model.settle(&job(1));
+        assert!(!model.contains(&job(1)));
     }
     const T: f64 = 1e9;
 

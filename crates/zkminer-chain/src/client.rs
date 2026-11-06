@@ -53,8 +53,26 @@ pub struct ChainClient {
     /// (`gasleft() < CUSTOM_VERIFIER_GAS_LIMIT*2 + SETTLEMENT_GAS_BUFFER + 100k`
     /// ≈ 4.6M) reverts `InsufficientGasForFullSettlement()` if the tx is
     /// under-provisioned — and eth_estimateGas under-provisions this check.
-    /// Default 5_000_000 per INTERACTION_GUIDE §9; bump for verifier-heavy paths.
+    /// A FLOOR: every fulfil sends at least `jobs::fulfill_gas_formula` for the job.
     pub fulfill_gas_limit: u64,
+    /// First block of every HemiProve log scan — the deployment's `fromBlock` (no HemiProve log
+    /// exists below it). 0 = no floor.
+    pub scan_from_block: u64,
+    /// Key-wide fee ceiling (wei) for the fulfil and release ladders (handoff §10; config
+    /// `chain.fee_ceiling_gwei`). The per-nonce ratchet cap for those two paths is the larger of
+    /// this and `8 x` the nonce's seed.
+    pub fee_ceiling: u128,
+    /// A watch-only client (see [`Self::new_watch_only`]): its transport refuses every send.
+    watch_only: bool,
+    /// Unix seconds of the last send the node refused for insufficient ETH (0 = none). Read by the
+    /// brain's claim gate: a key that cannot fund a fulfil must not take on new locks.
+    funds_short_at: Arc<AtomicU64>,
+    /// The `maxFeePerGas` the last [`Self::base_fees`] quoted (wei, saturated to u64; 0 = none yet).
+    /// Lets the claim gate size a fulfil's ETH need without an RPC of its own.
+    last_max_fee: Arc<AtomicU64>,
+    /// The base fee of the last header read for fees (wei, saturated; 0 = none yet): the fallback when
+    /// a header read fails, instead of a fixed figure ~1e6 x the live base fee.
+    last_base_fee: Arc<AtomicU64>,
     /// Serializes nonce assignment across concurrent tx submissions from this
     /// account, so two in-flight jobs never grab the same nonce. Held only around
     /// nonce-fetch + send (not the receipt wait), so proofs still run in parallel.
@@ -75,9 +93,7 @@ pub struct ChainClient {
     /// otherwise get a fresh nonce and queue behind the stuck fulfill → strand).
     abandoned_fulfill_nonces:
         Arc<std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, u64>>>,
-    /// Cache of ProgramRegistry metadata keyed by programId. Registered program
-    /// metadata is immutable, so once fetched we never re-query the registry for
-    /// the same program. Shared across clones.
+    /// Short-TTL cache of ProgramRegistry metadata keyed by programId. Shared across clones.
     pub(crate) program_info_cache: Arc<std::sync::Mutex<ProgramInfoCache>>,
     /// Counts every JSON-RPC request sent to the endpoint (total + rolling minute).
     rpc_meter: Arc<crate::rpc_meter::RpcMeter>,
@@ -92,23 +108,31 @@ pub struct ChainClient {
     submit_tx_cache: Arc<std::sync::Mutex<SubmitTxCache>>,
 }
 
-/// FIFO-bounded programId → ProgramInfo cache (see `ChainClient::program_info_cache`). Registered
-/// metadata is immutable, so a bounded cache only ever drops a cold entry (re-fetched on demand);
-/// the bound stops a submitter who registers unboundedly many distinct programIds from growing the
-/// long-lived client's heap without limit.
+/// FIFO-bounded programId → ProgramInfo cache (see `ChainClient::program_info_cache`) with a TTL:
+/// registered metadata can change (URIs, build hashes, status), so entries are re-read after
+/// `PROGRAM_INFO_TTL`. The bound stops a submitter who registers unboundedly many distinct programIds
+/// from growing the long-lived client's heap without limit.
 #[derive(Default)]
 pub(crate) struct ProgramInfoCache {
-    map: std::collections::HashMap<alloy::primitives::B256, crate::programs::ProgramInfo>,
+    map: std::collections::HashMap<
+        alloy::primitives::B256,
+        (crate::programs::ProgramInfo, std::time::Instant),
+    >,
     order: std::collections::VecDeque<alloy::primitives::B256>,
 }
 
 /// Bound on the program-info cache: comfortably covers the distinct programs a miner works with,
 /// while capping heap growth under a flood of distinct submitter-chosen programIds.
 const PROGRAM_INFO_CACHE_CAP: usize = 4096;
+/// How long a cached program-info entry is trusted before it is re-read.
+const PROGRAM_INFO_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl ProgramInfoCache {
     pub(crate) fn get(&self, id: &alloy::primitives::B256) -> Option<crate::programs::ProgramInfo> {
-        self.map.get(id).cloned()
+        self.map
+            .get(id)
+            .filter(|(_, at)| at.elapsed() < PROGRAM_INFO_TTL)
+            .map(|(info, _)| info.clone())
     }
 
     pub(crate) fn insert(
@@ -116,7 +140,7 @@ impl ProgramInfoCache {
         id: alloy::primitives::B256,
         info: crate::programs::ProgramInfo,
     ) {
-        if self.map.insert(id, info).is_none() {
+        if self.map.insert(id, (info, std::time::Instant::now())).is_none() {
             self.order.push_back(id);
             while self.order.len() > PROGRAM_INFO_CACHE_CAP {
                 if let Some(old) = self.order.pop_front() {
@@ -194,10 +218,116 @@ pub enum OwnedHealOutcome {
     RefusedNotOurs,
 }
 
+/// The best chain-time observation so far: the block timestamp that implies the LATEST chain time
+/// now, and the monotonic instant it was read. Every on-chain window (fulfil <= D+G, release < D+G)
+/// is judged by `block.timestamp`, not by this host's clock. A header from a lagging or
+/// load-balanced replica implies an EARLIER chain time and is ignored (only a header that moves the
+/// estimate forward replaces it), so one stale sample can never push the deadline guards late.
+static CHAIN_CLOCK: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+/// The chain time implied by the best observation, if any.
+fn observed_chain_now() -> Option<u64> {
+    let g = CHAIN_CLOCK.lock().unwrap_or_else(|p| p.into_inner());
+    g.map(|(ts, at)| ts.saturating_add(at.elapsed().as_secs()))
+}
+
+/// The latest header read (its timestamp, and when it was read), whatever it implies: the chain's
+/// clock as the endpoint reports it now. Unlike [`CHAIN_CLOCK`] it can move back, so a chain that
+/// falls behind (a stall, catch-up blocks with past timestamps) shows in [`chain_clock_skew_secs`].
+static LAST_HEADER: std::sync::Mutex<Option<(u64, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// Record a freshly-read block timestamp (kept only if it implies a later chain time than the
+/// current estimate — see [`CHAIN_CLOCK`]).
+pub fn note_chain_time(block_timestamp: u64) {
+    *LAST_HEADER.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some((block_timestamp, std::time::Instant::now()));
+    let mut g = CHAIN_CLOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let current = g.map(|(ts, at)| ts.saturating_add(at.elapsed().as_secs()));
+    if current.is_none_or(|c| block_timestamp > c) {
+        *g = Some((block_timestamp, std::time::Instant::now()));
+    }
+}
+
+fn wall_now() -> u64 {
+    chrono::Utc::now().timestamp().max(0) as u64
+}
+
+/// The current chain time, estimated from ABOVE: `max(wall clock, best observed header + elapsed)`.
+/// Use it for every decision to STOP or START something before an on-chain deadline (stop proving,
+/// stop fulfilling, start releasing): over-estimating the time there only gives up a little early,
+/// while under-estimating it lands a release after D+G (a 100% slash) or publishes a late seal.
+pub fn chain_now() -> u64 {
+    let wall = wall_now();
+    observed_chain_now().map_or(wall, |c| c.max(wall))
+}
+
+/// The current chain time, estimated from BELOW: `min(wall clock, best observed header + elapsed)`.
+/// Use it only to decide that a deadline has ALREADY passed (skip a release that "would revert",
+/// drop a breadcrumb as dead): there an over-estimate abandons a lock that could still be saved.
+pub fn chain_now_floor() -> u64 {
+    let wall = wall_now();
+    observed_chain_now().map_or(wall, |c| c.min(wall))
+}
+
+/// The chain's clock minus this host's, in seconds, from the latest header read (`None` before the
+/// first): its timestamp, plus the time since it was read, against the wall clock. Negative: the
+/// host clock runs ahead of the chain's. A header read before a host suspend reads as skewed by the
+/// suspend's length (`Instant` does not count it), so re-read one before acting on a large value.
+pub fn chain_clock_skew_secs() -> Option<i64> {
+    let g = LAST_HEADER.lock().unwrap_or_else(|p| p.into_inner());
+    g.map(|(ts, at)| ts.saturating_add(at.elapsed().as_secs()) as i64 - wall_now() as i64)
+}
+
+/// Default key-wide fee ceiling for the fulfil and release ladders (handoff §10 example: 15-50
+/// HEMI jobs with 100 HEMI collateral at 50,000 HEMI/ETH -> ~3.6-4.7 gwei).
+pub const DEFAULT_FEE_CEILING_GWEI: f64 = 4.0;
+
+/// How long one "insufficient funds" send refusal keeps the claim gate shut (re-armed by every
+/// further refusal; cleared early once the balance covers a fulfil again).
+pub const FUNDS_SHORT_HOLD_SECS: u64 = 600;
+
+/// Hemi orders transactions by tip, and a 1-wei tip is accepted by the RPC but never mined (handoff
+/// §1, §10). Every send states BOTH fee fields with at least this tip.
+pub const MIN_PRIORITY_FEE_WEI: u128 = 10_000_000; // 0.01 gwei
+
+/// The fee rule every zkminer send starts from (the reference daemons'): tip =
+/// `max(2 x eth_maxPriorityFeePerGas, 0.01 gwei)` and maxFee = `2 x baseFee + tip`. Per-attempt
+/// escalation and the per-nonce replacement floor build on these.
+pub fn hemi_fees(base_fee: u128, suggested_tip: u128) -> (u128, u128) {
+    let tip = suggested_tip.saturating_mul(2).max(MIN_PRIORITY_FEE_WEI);
+    let max_fee = base_fee.saturating_mul(2).saturating_add(tip);
+    (tip, max_fee)
+}
+
 impl ChainClient {
     /// Create a new ChainClient from config + signer.
     pub async fn new(config: &ZkMinerConfig, signer: PrivateKeySigner) -> Result<Self> {
         let address = signer.address();
+        Self::connect(config, signer, address, false).await
+    }
+
+    /// A client that reads the chain as `address` and can send nothing.
+    ///
+    /// It holds no key of the operator's: it signs with a throwaway key, and its transport refuses
+    /// every request that would broadcast a transaction or have the node sign one (see
+    /// [`crate::send_guard`]). Calls that depend on the sender (the claim quote) name `address`
+    /// explicitly, so they answer as they would for that prover.
+    pub async fn new_watch_only(config: &ZkMinerConfig, address: Address) -> Result<Self> {
+        Self::connect(config, PrivateKeySigner::random(), address, true).await
+    }
+
+    /// Whether this client was built by [`Self::new_watch_only`].
+    pub fn is_watch_only(&self) -> bool {
+        self.watch_only
+    }
+
+    async fn connect(
+        config: &ZkMinerConfig,
+        signer: PrivateKeySigner,
+        address: Address,
+        watch_only: bool,
+    ) -> Result<Self> {
         let wallet = EthereumWallet::from(signer.clone());
 
         let rpc_url = config.chain.rpc_url.parse().context("Invalid RPC URL")?;
@@ -215,6 +345,9 @@ impl ChainClient {
         // endpoint fails fast (Err, handled by the existing retry/poll paths) instead
         // of blocking forever. 45s is well above a healthy call yet finite.
         let http_client = alloy::transports::http::reqwest::Client::builder()
+            // An explicit User-Agent: the public Hemi RPC answers HTTP 403 to some client UAs (a
+            // blocklist, e.g. Python-urllib); identify ourselves rather than ride a library default.
+            .user_agent(concat!("zkminer/", env!("CARGO_PKG_VERSION")))
             .timeout(std::time::Duration::from_secs(45))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
@@ -233,8 +366,15 @@ impl ChainClient {
         //    heartbeat). The interval still governs any future/one-off get_receipt()
         //    caller (e.g. the sp1_demo command). Do NOT reintroduce get_receipt() in the
         //    miner paths believing this interval makes it cheap — use await_receipt.
+        // The send guard goes OUTERMOST, so a refused send is neither paced nor counted.
         let rpc_client = alloy::rpc::client::ClientBuilder::default()
-            .layer(crate::rpc_meter::ThrottleLayer::new(4))
+            .layer(crate::send_guard::SendGuardLayer::new(watch_only))
+            .layer(crate::rpc_meter::ThrottleLayer::new(
+                config
+                    .chain
+                    .max_requests_per_sec
+                    .unwrap_or(if watch_only { 1 } else { 4 }),
+            ))
             .layer(crate::rpc_meter::MeterLayer::new(rpc_meter.clone()))
             .transport(http, false)
             .with_poll_interval(std::time::Duration::from_secs(12));
@@ -263,8 +403,10 @@ impl ChainClient {
             .parse()
             .context("Invalid hemi_token address")?;
 
+        // Unset: the known deployment's for this chain (programs' ELF sources come only from it, and
+        // the deployment check requires the live one), else none.
         let program_registry: Option<Address> = if config.contracts.program_registry.is_empty() {
-            None
+            crate::deployment::known_deployment(config.chain.chain_id).map(|k| k.program_registry)
         } else {
             Some(
                 config
@@ -301,6 +443,16 @@ impl ChainClient {
             .chain
             .fulfill_gas_limit
             .unwrap_or(DEFAULT_FULFILL_GAS_LIMIT);
+        let scan_from_block = config.chain.scan_from_block.unwrap_or_else(|| {
+            crate::deployment::known_deployment(config.chain.chain_id)
+                .map(|k| k.scan_from_block)
+                .unwrap_or(0)
+        });
+        // Never below a fixed gas price the operator configured.
+        let fee_ceiling = ((config.chain.fee_ceiling_gwei.unwrap_or(DEFAULT_FEE_CEILING_GWEI) * 1e9)
+            .round()
+            .max(1.0) as u128)
+            .max(gas_price.unwrap_or(0));
 
         Ok(Self {
             provider: Arc::new(provider),
@@ -314,6 +466,12 @@ impl ChainClient {
             program_registry,
             gas_price,
             fulfill_gas_limit,
+            scan_from_block,
+            fee_ceiling,
+            watch_only,
+            funds_short_at: Arc::new(AtomicU64::new(0)),
+            last_max_fee: Arc::new(AtomicU64::new(0)),
+            last_base_fee: Arc::new(AtomicU64::new(0)),
             tx_lock: Arc::new(tokio::sync::Mutex::new(())),
             head_block: Arc::new(AtomicU64::new(0)),
             program_info_cache: Arc::new(std::sync::Mutex::new(ProgramInfoCache::default())),
@@ -327,6 +485,49 @@ impl ChainClient {
     /// Shared RPC request meter (total + rolling-minute counts).
     pub fn rpc_meter(&self) -> Arc<crate::rpc_meter::RpcMeter> {
         self.rpc_meter.clone()
+    }
+
+    /// Record that the node refused one of our sends for insufficient ETH (see
+    /// [`Self::funds_short`]). Pages once per hold window.
+    pub fn note_funds_short(&self) {
+        let now = wall_now();
+        let prev = self.funds_short_at.swap(now, Ordering::Relaxed);
+        if prev == 0 || now.saturating_sub(prev) >= FUNDS_SHORT_HOLD_SECS {
+            tracing::error!(
+                "PAGE: FUNDS-SHORT — the node refused a send from {} for insufficient ETH; no new \
+                 claims until the balance covers a fulfil (fund the key for fulfil gas limit x fee \
+                 ceiling per pending fulfil)",
+                self.address
+            );
+        }
+    }
+
+    /// True while a recent send was refused for insufficient ETH.
+    pub fn funds_short(&self) -> bool {
+        let t = self.funds_short_at.load(Ordering::Relaxed);
+        t != 0 && wall_now().saturating_sub(t) < FUNDS_SHORT_HOLD_SECS
+    }
+
+    /// Clear the funds-short hold (the brain re-read the balance and it covers a fulfil again).
+    pub fn clear_funds_short(&self) {
+        self.funds_short_at.store(0, Ordering::Relaxed);
+    }
+
+    /// After anchoring at the PENDING count on a fresh start: anything in `[mined, pending)` is a tx a
+    /// previous run left in the mempool, with no owner in this process and no record here. If it is
+    /// stuck (out-bid by a block-filler, under a raised base fee), every later fulfil and release
+    /// queues behind it unmined, and nothing would ever bid at that nonce. Record the abandonment
+    /// evidence the gap watchdog acts on: a tx that mines in the next block or two is pruned before the
+    /// watchdog's persistence gate passes, and one that does not is displaced.
+    async fn note_inherited_pending(&self, pending: u64) {
+        const MAX_INHERITED: u64 = 64;
+        let Ok(mined) = self.provider.get_transaction_count(self.address).await else {
+            return;
+        };
+        for n in mined..pending.min(mined.saturating_add(MAX_INHERITED)) {
+            tracing::warn!("nonce {n} was left pending by a previous run — displaced if it stays stuck");
+            self.nonce_mgr.note_unresolved(n);
+        }
     }
 
     /// Reserve a DISTINCT nonce for one tx operation. Each concurrent lifecycle task gets
@@ -351,6 +552,7 @@ impl ChainClient {
                 .await
                 .context("Failed to fetch nonce")?;
             if let Some(n) = self.nonce_mgr.anchor_if_unsynced(chain) {
+                self.note_inherited_pending(chain).await;
                 return Ok(n);
             }
             if let Some(n) = self.nonce_mgr.try_reserve() {
@@ -712,7 +914,7 @@ impl ChainClient {
     /// timeout does not abort them. Such a nonce looks exactly like a hole.
     ///
     /// Filling it is not a harmless no-op — it is destructive. Heal bids >= 4x base, while
-    /// the release ladder tops out at `attempt + FULFILL_ESCALATION_HEADROOM` = 10, i.e.
+    /// the (pre-ceiling) release ladder topped out at attempt 10, i.e.
     /// 1.15^9 ~= 3.52x base. HISTORICALLY the release path called `escalated_fees` directly
     /// without `fees_over_floor`, so it could never lift over the heal's recorded fee: all 5
     /// attempts were rejected "replacement underpriced" and the releaseJob never reached the
@@ -910,7 +1112,9 @@ impl ChainClient {
         let mut ceiling_reached = false;
         let (tip, max_fee) = match self.nonce_mgr.fee_floor_state(hole) {
             Some(st) => {
-                let ceiling = over(over(st.cap));
+                // The fulfil and release ladders climb to the key-wide fee ceiling, so a heal must be
+                // able to out-bid a resident up there too.
+                let ceiling = over(over(st.cap.max(self.fee_ceiling)));
                 let (bt, bm) = st.broadcast;
                 let want_max = max_fee.max(over(bm)).min(ceiling).max(max_fee);
                 let want_tip = tip.max(over(bt)).min(ceiling).max(tip).min(want_max);
@@ -1119,6 +1323,14 @@ impl ChainClient {
             .remove(&job_id)
     }
 
+    /// Whether a fulfil nonce is stashed for `job_id` (without taking it).
+    pub fn has_abandoned_nonce(&self, job_id: alloy::primitives::B256) -> bool {
+        self.abandoned_fulfill_nonces
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&job_id)
+    }
+
     /// Base EIP-1559 fees used to SEED per-attempt fee escalation on tx re-broadcasts.
     /// Returns `(base_priority_fee, base_max_fee)` in wei.
     ///
@@ -1131,32 +1343,88 @@ impl ChainClient {
     ///
     /// NEVER returns `(0, 0)` from estimation failure: a zero base
     /// disables every `base_max_fee > 0` escalation gate, so a stuck tx could never clear a
-    /// node's replacement threshold. The fallback floors at `max(eth_gasPrice, 1 gwei)`.
+    /// node's replacement threshold. The fallback is the last header's base fee, else
+    /// `eth_gasPrice`; `hemi_fees` keeps the tip at >= 0.01 gwei either way.
     /// (A configured `gas_price` of 0 would still short-circuit to `(0, 0)`; config
     /// validation rejects that.)
     pub async fn base_fees(&self) -> (u128, u128) {
-        if let Some(gp) = self.gas_price {
-            return (gp, gp);
+        let (tip, max_fee, from_header) = self.base_fees_uncached().await;
+        // Only a quote from a real header: the claim gate reads this figure, and a fallback quote (a
+        // failed header read) must not be what it keeps closing on.
+        if from_header {
+            self.last_max_fee
+                .store(max_fee.min(u64::MAX as u128) as u64, Ordering::Relaxed);
         }
-        match self.provider.estimate_eip1559_fees().await {
-            Ok(est) if est.max_fee_per_gas > 0 => {
-                (est.max_priority_fee_per_gas, est.max_fee_per_gas)
+        (tip, max_fee)
+    }
+
+    /// The `maxFeePerGas` the last [`Self::base_fees`] quoted (0 before the first quote).
+    pub fn last_max_fee(&self) -> u128 {
+        self.last_max_fee.load(Ordering::Relaxed) as u128
+    }
+
+    async fn base_fees_uncached(&self) -> (u128, u128, bool) {
+        // The latest block's base fee (fallback: the last header's, else eth_gasPrice — see below).
+        let mut from_header = true;
+        let base = match self
+            .provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .await
+        {
+            Ok(Some(b)) => {
+                note_chain_time(b.header.timestamp);
+                let base = b.header.base_fee_per_gas.map(u128::from).unwrap_or(0);
+                self.last_base_fee
+                    .store(base.min(u64::MAX as u128) as u64, Ordering::Relaxed);
+                base
             }
             other => {
-                // NEVER return (0,0). Fee escalation is gated on `base_max_fee > 0`,
-                // so a zero base disables ALL escalation → a re-broadcast can never clear a
-                // node's +12.5% replacement floor → a stuck tx (fulfill/release/claim) loops
-                // "replacement underpriced" forever and strands. Seed a nonzero floor from
-                // the live eth_gasPrice (or a hard 1 gwei minimum) so escalation always works.
                 if let Err(e) = &other {
-                    tracing::debug!(
-                        "EIP-1559 fee estimate failed: {e:#}; falling back to eth_gasPrice"
-                    );
+                    tracing::debug!("latest block read for fees failed: {e:#}; falling back to eth_gasPrice");
                 }
-                let gp = self.provider.get_gas_price().await.unwrap_or(0);
-                let floor = (gp).max(1_000_000_000u128); // >= 1 gwei
-                (floor, floor)
+                from_header = false;
+                // The last header's base fee, else eth_gasPrice as quoted. Never a fixed 1-gwei floor:
+                // that is ~1e6 x Hemi's live base fee, and a maxFee seeded from it froze the fulfil
+                // ladder. `hemi_fees` keeps the pair non-zero (tip >= 0.01 gwei).
+                match self.last_base_fee.load(Ordering::Relaxed) {
+                    0 => self.provider.get_gas_price().await.unwrap_or(0),
+                    b => b as u128,
+                }
             }
+        };
+        if let Some(gp) = self.gas_price {
+            // A configured fixed price is honoured, but never below the Hemi floors.
+            let (tip, max_fee) = hemi_fees(base, 0);
+            let tip = gp.max(tip);
+            return (
+                tip,
+                gp.max(max_fee).max(base.saturating_mul(2).saturating_add(tip)),
+                from_header,
+            );
+        }
+        let suggested = match self.provider.get_max_priority_fee_per_gas().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("eth_maxPriorityFeePerGas failed: {e:#}; using the tip floor");
+                0
+            }
+        };
+        // The suggestion is 1.1 x the median tip of the last block once it is near capacity, so a
+        // block-filler can set it (up to op-geth's 500 gwei): never let it push the start price past
+        // the key-wide ceiling.
+        let (tip, max_fee) = hemi_fees(base, suggested.min(self.fee_ceiling / 2));
+        (tip, max_fee, from_header)
+    }
+
+    /// Read the latest block header and record its timestamp (see [`chain_now`]). Best-effort: a
+    /// failed read keeps the previous skew.
+    pub async fn refresh_chain_time(&self) {
+        if let Ok(Some(b)) = self
+            .provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .await
+        {
+            note_chain_time(b.header.timestamp);
         }
     }
 
@@ -1282,6 +1550,8 @@ impl ChainClient {
                 unstake_amount: s.unstakeAmount,
                 unstake_request_time: s.unstakeRequestTime.to::<u64>(),
                 deposit_block: s.depositBlock.to::<u64>(),
+                // aggregate3 runs every sub-call at one block, the head read beside them.
+                read_block: head,
             }),
             _ => None,
         };
@@ -1301,5 +1571,54 @@ impl ChainClient {
             stake,
             stats,
         })
+    }
+}
+
+#[cfg(test)]
+mod fee_rule_tests {
+    use super::{hemi_fees, MIN_PRIORITY_FEE_WEI};
+
+    #[test]
+    fn tip_never_drops_below_the_hemi_floor() {
+        // A quiet chain suggests a 1-wei (or zero) tip, which is accepted but never mined.
+        assert_eq!(hemi_fees(254, 0).0, MIN_PRIORITY_FEE_WEI);
+        assert_eq!(hemi_fees(254, 1).0, MIN_PRIORITY_FEE_WEI);
+        // Above the floor, twice the node's suggestion.
+        assert_eq!(hemi_fees(254, 1_000_000_000).0, 2_000_000_000);
+    }
+
+    #[test]
+    fn max_fee_covers_two_base_fees_plus_the_tip() {
+        let (tip, max_fee) = hemi_fees(254, 1_000_000);
+        assert_eq!(max_fee, 2 * 254 + tip);
+        assert!(max_fee >= tip, "maxFee >= tip, or the node refuses the tx");
+        // Saturates instead of overflowing on absurd inputs.
+        let (t, m) = hemi_fees(u128::MAX, u128::MAX);
+        assert_eq!((t, m), (u128::MAX, u128::MAX));
+    }
+}
+
+#[cfg(test)]
+mod chain_clock_tests {
+    use super::*;
+
+    /// One test owns the process-wide clock (tests run concurrently; splitting this would race).
+    #[test]
+    fn a_lagging_header_never_moves_the_chain_clock_back() {
+        let wall = wall_now();
+        // A fresh header 3 s "ahead" of this host (a host clock running slow).
+        note_chain_time(wall + 3);
+        let after_fresh = chain_now();
+        assert!(after_fresh >= wall + 3, "the upper estimate follows a header ahead of the wall clock");
+        assert!(chain_now_floor() <= wall_now(), "the lower estimate never exceeds the wall clock");
+        // A lagging replica's header, 300 s behind: ignored.
+        note_chain_time(wall.saturating_sub(300));
+        assert!(
+            chain_now() >= after_fresh,
+            "a stale header must not pull the deadline guards' clock back"
+        );
+        // The upper estimate is never below the wall clock.
+        assert!(chain_now() >= wall_now().min(chain_now()));
+        assert!(chain_now() >= wall);
     }
 }

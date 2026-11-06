@@ -6,12 +6,16 @@
 use std::io::{self, BufReader, BufWriter};
 use std::time::Instant;
 
+mod groth16_component;
+
 use anyhow::{Context, Result};
+use risc0_zkvm::Prover as _;
 use zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV;
 use zkminer_prover_protocol::{
     is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
     WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, PROTOCOL_VERSION,
+    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
+    PROTOCOL_VERSION, RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN,
 };
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
@@ -34,7 +38,31 @@ fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::i
     Ok(new)
 }
 
+/// The release's Intel worker ships Intel's Level Zero driver beside it (`zkminer-intel/lib`, from
+/// `Dockerfile.build`'s intel-gpu-runtime). The Level Zero loader (shipped there too) would also open
+/// any other driver it finds on the host by its usual names, such as a distribution's
+/// `libze_intel_gpu_legacy1.so.1`, which adds its devices to the ones `ZE_AFFINITY_MASK` indexes;
+/// `ZE_ENABLE_ALT_DRIVERS` makes the shipped driver the only one. An operator's own setting wins.
+#[cfg(feature = "intel")]
+fn use_shipped_level_zero_driver() {
+    if std::env::var_os("ZE_ENABLE_ALT_DRIVERS").is_some() {
+        return;
+    }
+    let Some(driver) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("zkminer-intel/lib/libze_intel_gpu.so.1")))
+        .filter(|driver| driver.is_file())
+    else {
+        return;
+    };
+    // Before anything starts a thread or initialises Level Zero.
+    std::env::set_var("ZE_ENABLE_ALT_DRIVERS", driver);
+}
+
 fn main() {
+    #[cfg(feature = "intel")]
+    use_shipped_level_zero_driver();
+
     // Direct benchmark mode runs the operator's own guests and prints a human table to the REAL
     // stdout, so it must come before the fd-1 redirect below. It speaks no IPC.
     if std::env::args().any(|a| a == "--benchmark") {
@@ -52,6 +80,36 @@ fn main() {
                 r.program_name, r.cycles, r.duration_secs, r.throughput, r.weight, r.precompile,
             );
         }
+        return;
+    }
+
+    // `--export-guest <name> <path>`: write one of the embedded guests to `path` and print its image
+    // id, which is the `programId` of a job for it. For harnesses that submit jobs this worker can
+    // serve (crates/zkminer-cli/tests/localnet.rs). Speaks no IPC.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--export-guest") {
+        let (Some(name), Some(path)) = (args.get(i + 1), args.get(i + 2)) else {
+            eprintln!("usage: --export-guest fibonacci <path>");
+            std::process::exit(2);
+        };
+        let elf = match name.as_str() {
+            "fibonacci" => FIBONACCI_ELF,
+            other => {
+                eprintln!("unknown guest {other:?} (known: fibonacci)");
+                std::process::exit(2);
+            }
+        };
+        let image_id = risc0_zkvm::compute_image_id(elf).expect("compute_image_id");
+        if let Err(e) = std::fs::write(path, elf) {
+            eprintln!("write {path}: {e}");
+            std::process::exit(1);
+        }
+        let hex: String = image_id
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        println!("0x{hex}");
         return;
     }
 
@@ -78,6 +136,10 @@ fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // Load (or create) the `sys_rand` key now, outside any job: a failure inside a job's panic
+    // containment would be blamed on that job's program.
+    sys_rand_key();
 
     if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
@@ -170,7 +232,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // adversarial-but-executable program). Without containment the worker dies on a CLAIMED
                 // job, the dispatcher charges a healthy slot, the retry loop re-dispatches the same job
                 // to every GPU crashing each, and the program is never classed bad — so it is cheaply
-                // repeatable and drives a release-penalty/slash. Treat a prove-time panic as InvalidInput.
+                // repeatable and drives a release-penalty/slash. Contain it here and answer with an
+                // error (typed by what panicked, below) instead of dying.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_proof(&elf, &input_data, po2, program_id)
                 }));
@@ -185,12 +248,25 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(_panic) => {
+                    Err(panic) => {
+                        // A prove-path panic is usually OURS: risc0's CUDA HAL panics on a failed
+                        // allocation or GPU call (`.unwrap()` / `panic!` in hal/cuda.rs). It does not
+                        // say the job is bad, so it must never be typed InvalidInput. OOM routes to a
+                        // bigger card; anything else is a sick worker to replace.
+                        let detail = panic
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("");
+                        let kind = if is_gpu_oom(detail) || detail.contains("allocation failed") {
+                            ErrorKind::ResourceExhausted
+                        } else {
+                            ErrorKind::Internal
+                        };
                         let resp = WorkerResponse::Error {
                             request_id,
-                            kind: ErrorKind::InvalidInput,
-                            message: "risc0 prover panicked on this ELF (malformed or hostile program)"
-                                .to_string(),
+                            kind,
+                            message: format!("risc0 prover panicked: {detail}"),
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -205,7 +281,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         // prevent. A guest that faults in the prove-only path is a BAD JOB, not a sick
                         // worker: classify InvalidInput and never let its text reach is_gpu_oom.
                         // (Session-/cycle-limit are too-heavy bad jobs; their text is host-generated.)
+                        // "Unknown syscall: <name>" quotes a GUEST-chosen string (and has no panic
+                        // prefix), so it is matched here, before any classifier reads the text.
                         let kind = if lower.contains("guest panicked")
+                            || lower.starts_with("unknown syscall")
+                            || lower.contains(": unknown syscall")
                             || lower.contains("session limit")
                             || lower.contains("exceeded cycle")
                             || lower.contains("non-zero exit code")
@@ -244,8 +324,12 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 elf,
                 input_data,
                 program_id,
+                po2,
             } => {
-                tracing::info!("Execute request {request_id} ({} bytes ELF)", elf.len());
+                tracing::info!(
+                    "Execute request {request_id} ({} bytes ELF, po2={po2:?})",
+                    elf.len()
+                );
                 // The ELF bytes are fully attacker-controlled and reach risc0's ELF
                 // parser / image-id computation / executor UNCLAIMED on this pre-claim measurement
                 // path. Those SDK calls CAN PANIC on a malformed registered ELF rather than returning
@@ -256,18 +340,25 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // sustained liveness DoS. Contain it here: a caught panic is a property of the job
                 // (InvalidInput), exactly like an execution Err.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_execute(&elf, &input_data, program_id)
+                    run_execute(&elf, &input_data, program_id, po2)
                 }));
                 match outcome {
-                    Ok(Ok((cycles, journal_len, duration_secs))) => {
+                    Ok(Ok((cycles, journal, duration_secs))) => {
                         tracing::info!(
                             "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
                         );
+                        let journal_len = journal.len() as u64;
                         let resp = WorkerResponse::ExecuteResult {
                             request_id,
                             cycles,
                             duration_secs,
                             journal_len,
+                            // The host checks the job's journal binding against these bytes. One no
+                            // fulfil could carry is reported by its length alone, and so is one a
+                            // proof on another worker may not reproduce (a process-only seed key).
+                            journal: (journal.len() <= EXECUTE_JOURNAL_MAX_BYTES
+                                && sys_rand_key_is_shared())
+                            .then_some(journal),
                             // risc0 is bounded by its own in-process RSS self-guard + the ledger charge
                             // (finding H4), not by the SP1-only prove-stacking claim gate (H1), so it
                             // reports no peak: 0 = "unknown", which leaves `sp1_execute_provable_beside_
@@ -313,11 +404,17 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::Warmup { request_id } => {
-                // Nothing to set up before a first proof.
-                let resp = WorkerResponse::WarmupDone {
-                    request_id,
-                    summary: "nothing to warm up".to_string(),
-                    groth16_helper: false,
+                let resp = match warm_up() {
+                    Ok(summary) => WorkerResponse::WarmupDone {
+                        request_id,
+                        summary,
+                        groth16_helper: false,
+                    },
+                    Err(e) => WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::Internal,
+                        message: format!("warm-up failed: {e:#}"),
+                    },
                 };
                 write_message(&mut stdout, &resp)?;
             }
@@ -388,6 +485,39 @@ fn detect_gpu() -> (bool, Option<String>) {
             return (true, Some("AMD GPU".to_string()));
         }
     }
+    #[cfg(feature = "intel")]
+    {
+        // The host pins this worker to one card through ZE_AFFINITY_MASK, which sysfs does not see;
+        // name the card only when the box has exactly one Intel GPU, so the name is never another
+        // card's. The host names its slots from its own discovery either way.
+        let names: Vec<String> = std::fs::read_dir("/sys/class/drm")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with("card") && !n.contains('-')
+            })
+            .filter_map(|e| {
+                let dev = e.path().join("device");
+                let vendor = std::fs::read_to_string(dev.join("vendor")).ok()?;
+                (vendor.trim().eq_ignore_ascii_case("0x8086") && dev.join("tile0").is_dir()).then(
+                    || {
+                        std::fs::read_to_string(dev.join("label"))
+                            .ok()
+                            .map(|l| l.trim().to_string())
+                            .filter(|l| !l.is_empty())
+                            .unwrap_or_else(|| "Intel GPU".to_string())
+                    },
+                )
+            })
+            .collect();
+        match names.as_slice() {
+            [] => {}
+            [one] => return (true, Some(one.clone())),
+            _ => return (true, Some("Intel GPU".to_string())),
+        }
+    }
     (false, None)
 }
 
@@ -402,14 +532,14 @@ fn detect_gpu() -> (bool, Option<String>) {
 /// contend for the GPU that the proofs it sizes are running on.
 /// True when `image_id` (a risc0 guest image id, 32 bytes) corresponds to the on-chain `program_id`.
 ///
-/// The byte order the registry stores a risc0 programId in — vs risc0's native word layout from
-/// `Digest::as_bytes` — is deployment-defined and not knowable from this repo, so we accept EITHER
-/// order. A legitimately matching ELF matches under whichever order the chain used; an ELF that is a
-/// *different* program matches under neither (a 256-bit collision is infeasible). Accepting both
-/// orders is what guarantees the binding check can never false-reject a genuine job.
+/// NATIVE byte order only (`Digest::as_bytes`). The deployed HemiProve v2 risc0 adapter passes the
+/// job's programId VERBATIM as the image id to the risc0-ethereum verifier
+/// (`verify(seal, programId, sha256(journal))`, RiscZeroGroth16VerifierAdapter), and zkminer pins that
+/// adapter's code at startup — so only the native order can ever verify. Accepting the byte-reversed
+/// order too (as the v1 binding did) let a submitter register `reverse(imageId)` and have us claim,
+/// prove and publish a proof the adapter must reject (`VerifierCallFailed`), releasing at a penalty.
 fn image_id_matches(image_id: &[u8], program_id: &[u8; 32]) -> bool {
     image_id == program_id.as_slice()
-        || image_id.iter().rev().copied().eq(program_id.iter().copied())
 }
 
 /// Set `ZKMINER_RISC0_SKIP_PROGRAM_ID_CHECK=1` to disable the image-id↔programId binding (only for a
@@ -423,21 +553,23 @@ fn program_id_check_disabled() -> bool {
     )
 }
 
-/// Refuse to run an ELF whose computed risc0 image id does not match the job's on-chain `programId`.
-/// No-op when the host did not supply a programId (benchmark/calibration/mock) or the check is
-/// disabled. Catches a submitter who registers programId X but serves an ELF for a different program,
+/// Refuse to run an ELF whose computed risc0 image id does not match the job's on-chain `programId`,
+/// and return that image id (the guest's `sys_rand` seed is derived from it). The match is skipped
+/// when the host did not supply a programId (benchmark/calibration/mock) or the check is disabled.
+/// Catches a submitter who registers programId X but serves an ELF for a different program,
 /// *before* a full Groth16 proof (or a sizing execute) is spent on a proof the chain will reject.
-fn verify_program_id(elf: &[u8], program_id: Option<[u8; 32]>) -> anyhow::Result<()> {
-    let Some(pid) = program_id else {
-        return Ok(());
-    };
-    if program_id_check_disabled() {
-        return Ok(());
-    }
+fn verify_program_id(elf: &[u8], program_id: Option<[u8; 32]>) -> anyhow::Result<[u8; 32]> {
     let image_id =
         risc0_zkvm::compute_image_id(elf).context("compute_image_id for programId binding")?;
-    if image_id_matches(image_id.as_bytes(), &pid) {
-        Ok(())
+    let image_bytes: [u8; 32] = image_id
+        .as_bytes()
+        .try_into()
+        .expect("a digest is 32 bytes");
+    let Some(pid) = program_id else {
+        return Ok(image_bytes);
+    };
+    if program_id_check_disabled() || image_id_matches(image_id.as_bytes(), &pid) {
+        Ok(image_bytes)
     } else {
         anyhow::bail!(
             "ELF image id {image_id} does not match job programId {} (served ELF is not the \
@@ -578,31 +710,207 @@ fn with_rss_self_guard<T>(limit_bytes: Option<u64>, f: impl FnOnce() -> T) -> T 
     out
 }
 
+/// The seed for the guest's `sys_rand` on one (program, input).
+///
+/// Unseeded, risc0 answers `sys_rand` with fresh host entropy on every execution, so a guest can
+/// branch on its random bytes: measure clean before the claim and fail the proof after it, which
+/// costs us the release penalty. The pre-claim measurement and every proving attempt use this seed
+/// instead, so they run the guest identically, even in different workers. It is keyed with this
+/// host's secret key, so the bytes stay unpredictable to everyone else, as the guest's randomness
+/// should be: risc0 also draws the entropy that keeps a receipt's post-state digest from revealing
+/// private inputs from it. It hashes the program's IMAGE ID, not its ELF bytes: two ELFs with one
+/// image id (one stripped, say) are the same program, and a lock re-driven after a restart may fetch
+/// the other one.
+fn sys_rand_seed(key: &[u8; 32], image_id: &[u8; 32], input_data: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(b"zkminer/risc0/sys_rand/v2");
+    mac.update(image_id);
+    mac.update(&Sha256::digest(input_data));
+    mac.finalize().into_bytes().into()
+}
+
+/// This host's `sys_rand` key, loaded once per process: the one the miner passed in
+/// [`SYS_RAND_KEY_ENV`] (it hands the same key to every risc0 worker it spawns), else
+/// `~/.zkminer/risc0-sys-rand.key` (created there on first use) for a worker started on its own.
+///
+/// If neither can be used, the worker keys its seeds for this process alone: its measurements and
+/// proofs still agree with each other, but a job measured by another worker can diverge again, so its
+/// measurements then report no journal (see [`sys_rand_key_is_shared`]).
+fn sys_rand_key() -> [u8; 32] {
+    sys_rand_key_state().0
+}
+
+/// Whether the seed key is the host's lasting key (its file's, read here or passed by the miner)
+/// rather than one for this process or this miner run alone.
+fn sys_rand_key_is_shared() -> bool {
+    sys_rand_key_state().1
+}
+
+fn sys_rand_key_state() -> &'static ([u8; 32], bool) {
+    use zkminer_prover_protocol::sys_rand;
+    static KEY: std::sync::OnceLock<([u8; 32], bool)> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        if let Ok(v) = std::env::var(sys_rand::SYS_RAND_KEY_ENV) {
+            // Out of this process's environment once read, so nothing it starts (nvidia-smi,
+            // rocm-smi, docker) inherits it. `main` reads the key before any other thread exists.
+            std::env::remove_var(sys_rand::SYS_RAND_KEY_ENV);
+            let ephemeral =
+                std::env::var(sys_rand::SYS_RAND_KEY_EPHEMERAL_ENV).is_ok_and(|v| v == "1");
+            match sys_rand::decode_key(v.trim()) {
+                // A key for the miner's run alone keeps this run's workers in step, but a lock
+                // re-proved after a restart would not be: report no journal, as for a
+                // process-only key.
+                Some(key) => return (key, !ephemeral),
+                None => tracing::warn!(
+                    "{} is not 64 hex digits — ignoring it",
+                    sys_rand::SYS_RAND_KEY_ENV
+                ),
+            }
+        }
+        let loaded = match dirs::home_dir() {
+            Some(home) => sys_rand::load_or_create_key(&sys_rand::key_path(&home))
+                .map_err(anyhow::Error::from),
+            None => Err(anyhow::anyhow!("no home directory")),
+        };
+        match loaded {
+            Ok(key) => (key, true),
+            Err(e) => {
+                tracing::warn!(
+                    "sys_rand key unavailable ({e:#}): seeding with a key for this process only, so \
+                     a job measured here may be proved by another worker with other randomness; \
+                     measurements report no journal, and no journal-bound job is claimed on them"
+                );
+                let mut key = [0u8; 32];
+                getrandom::fill(&mut key).expect("no OS randomness for the sys_rand key");
+                (key, false)
+            }
+        }
+    })
+}
+
+/// What one keccak proof request at the default keccak po2 (17) is charged in a measurement (see
+/// `run_execute`): about a 2^20 segment's proving time on the cards this runs on. A larger keccak
+/// po2 (RISC0_KECCAK_PO2, up to 18) doubles it per step; a smaller one still pays for the lift and
+/// the join, so never less.
+const KECCAK_REQUEST_CYCLES: u64 = 1 << 20;
+
+/// The keccak proof requests a measured guest made, checked as the prover will check them.
+#[derive(Default)]
+struct KeccakAudit {
+    /// Each request's claim, as the guest's keccak root commits to it.
+    requests: Vec<risc0_zkvm::Assumption>,
+    /// What the requests are charged (see [`KECCAK_REQUEST_CYCLES`]).
+    cycles: u64,
+}
+
+impl risc0_zkvm::CoprocessorCallback for KeccakAudit {
+    fn prove_keccak(&mut self, request: risc0_zkvm::ProveKeccakRequest) -> anyhow::Result<()> {
+        use risc0_circuit_keccak::{compute_keccak_digest, KECCAK_CONTROL_ROOT};
+        // The prover proves the request's input and refuses a claim digest that isn't its output
+        // ("keccak claim digest mismatch"); the executor takes the guest's word for it. Ask now.
+        let input: Vec<u8> = request
+            .input
+            .iter()
+            .flat_map(|state| state.iter().flat_map(|w| w.to_ne_bytes()))
+            .collect();
+        anyhow::ensure!(
+            request.control_root == KECCAK_CONTROL_ROOT
+                && request.claim_digest == compute_keccak_digest(&input),
+            "a keccak proof request does not match its input — every proof would fail"
+        );
+        self.requests.push(risc0_zkvm::Assumption {
+            claim: request.claim_digest,
+            control_root: KECCAK_CONTROL_ROOT,
+        });
+        self.cycles = self
+            .cycles
+            .saturating_add(KECCAK_REQUEST_CYCLES << request.po2.saturating_sub(17).min(8));
+        Ok(())
+    }
+}
+
+impl KeccakAudit {
+    /// The root assumption a guest's keccak batcher verifies over these requests: risc0's
+    /// Merkle-mountain accumulator of them, a lone request standing for itself (`mmr.rs`).
+    fn root(&self) -> Option<risc0_zkvm::Assumption> {
+        use risc0_zkvm::sha::Digestible;
+        let merge = |a: &risc0_zkvm::Assumption, b: &risc0_zkvm::Assumption| {
+            let (x, y) = (a.digest(), b.digest());
+            let (left, right) = if x <= y { (x, y) } else { (y, x) };
+            risc0_zkvm::Assumption {
+                claim: risc0_zkvm::UnionClaim { left, right }.digest(),
+                control_root: risc0_zkvm::ALLOWED_CONTROL_ROOT,
+            }
+        };
+        let mut peaks: Vec<(risc0_zkvm::Assumption, u32)> = Vec::new();
+        for request in &self.requests {
+            let mut add = (request.clone(), 0);
+            while let Some(top) = peaks.last() {
+                if top.1 != add.1 {
+                    break;
+                }
+                let (top, height) = peaks.pop().expect("just seen");
+                add = (merge(&add.0, &top), height + 1);
+            }
+            peaks.push(add);
+        }
+        let mut peaks = peaks.into_iter().map(|(a, _)| a);
+        let first = peaks.next()?;
+        Some(peaks.fold(first, |acc, peak| merge(&acc, &peak)))
+    }
+}
+
+/// The segment size a job is executed or proven at: the host's, or [`RISC0_DEFAULT_JOB_PO2`]. One
+/// outside [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`] is refused (an InvalidInput, by its "po2
+/// value" text): the host measures and proves a job at sizes in that range only.
+fn job_segment_po2(po2: Option<u8>) -> anyhow::Result<u8> {
+    let po2 = po2.unwrap_or(RISC0_DEFAULT_JOB_PO2);
+    if !(RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX).contains(&po2) {
+        anyhow::bail!(
+            "po2 value {po2} is outside the job range {RISC0_JOB_PO2_MIN}..={RISC0_JOB_PO2_MAX}"
+        );
+    }
+    Ok(po2)
+}
+
 fn run_execute(
     elf: &[u8],
     input_data: &[u8],
     program_id: Option<[u8; 32]>,
-) -> anyhow::Result<(u64, u64, f64)> {
+    po2: Option<u8>,
+) -> anyhow::Result<(u64, Vec<u8>, f64)> {
     use std::time::Instant;
+    let po2 = job_segment_po2(po2)?;
     // Bind the ELF to the job's programId before spending any execution on it (the pre-claim
     // measurement path runs UNCLAIMED, submitter-controlled ELFs).
-    verify_program_id(elf, program_id)?;
+    let image_id = verify_program_id(elf, program_id)?;
     let started = Instant::now();
 
     let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
     if !input_data.is_empty() {
         env_builder.write_slice(input_data);
     }
+    env_builder.random_seed(sys_rand_seed(&sys_rand_key(), &image_id, input_data));
+    // At the size the job will be proven at, on the card the host asked for: the guest can tell (see
+    // `RISC0_DEFAULT_JOB_PO2`).
+    env_builder.segment_limit_po2(po2 as u32);
     if let Some(limit) = execute_session_cycle_limit() {
         env_builder.session_limit(Some(limit));
     }
+    // Here only, never on a prove: a callback takes the keccak requests the prover must prove.
+    let keccak = std::rc::Rc::new(std::cell::RefCell::new(KeccakAudit::default()));
+    env_builder.coprocessor_callback_ref(keccak.clone());
     let env = env_builder
         .build()
         .map_err(|e| anyhow::anyhow!("execute: env build failed: {e}"))?;
 
     // In-process RSS self-guard (finding H4): contain a ballooning guest before it OOMs the host.
     let session = with_rss_self_guard(execute_max_rss_bytes(), || {
-        risc0_zkvm::default_executor().execute(env, elf)
+        // The in-process executor, never one chosen by RISC0_EXECUTOR (an external r0vm).
+        risc0_zkvm::local_executor().execute(env, elf)
     })
     .map_err(|e| anyhow::anyhow!("execute: {e}"))?;
 
@@ -622,14 +930,57 @@ fn run_execute(
         }
     }
 
-    // `SessionInfo::cycles()` is the total cycle count, matching what proving reports.
-    let cycles = session.cycles();
+    // A guest that halts with no output (a zero output digest: `sys_halt` skipped `env::finalize`)
+    // executes cleanly and proves, but its receipt never verifies — a claim without an output is not
+    // what `receipt.verify(image_id)` or the chain accept. An honest guest always has one, if empty.
+    // (One that halts with a non-zero digest other than its output's, the pinned executor refuses
+    // itself, as it does a bigint2 witness its verify program rejects.)
+    let output = session
+        .receipt_claim
+        .as_ref()
+        .and_then(|c| c.output.as_value().ok())
+        .and_then(|o| o.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "execute: the guest halted without an output — no proof of this program+input can \
+                 verify"
+            )
+        })?;
+    // Everything the proof would assume must be something it also proves: the guest's keccak root.
+    // Anything else (an `env::verify_assumption2` of an arbitrary claim) executes cleanly here and
+    // fails every proof ("no receipt available for unresolved assumption").
+    let keccak = keccak.borrow();
+    let root = keccak.root();
+    let assumptions = output
+        .assumptions
+        .as_value()
+        .map_err(|_| anyhow::anyhow!("execute: the session's assumptions are pruned"))?;
+    for a in &assumptions.0 {
+        if a.as_value().ok() != root.as_ref() {
+            anyhow::bail!(
+                "execute: the guest assumes a claim no proof here resolves — every proof of this \
+                 program+input would fail"
+            );
+        }
+    }
+
+    // What proving costs, and reports as `total_cycles`: every segment padded to its power of two.
+    // `SessionInfo::cycles()` counts user cycles only — no paging, no padding — and a guest that
+    // pages heavily (each page-in costs hundreds of cycles) can make a proof 100x what it shows.
+    // Measured at `po2`, the size the job proves at on its card. Each keccak request is a further
+    // proof of its own (a 2^17-row keccak STARK, its lift and a join), priced here as a 2^20 segment.
+    let cycles: u64 = session.segments.iter().map(|s| 1u64 << s.po2).sum::<u64>() + keccak.cycles;
     // The journal the guest committed here is byte-identical to the one the later proof
-    // would carry (both are a deterministic function of (ELF, input), and the elf_hash gate makes
-    // measure-ELF == prove-ELF), so its length lets the host pre-screen a program whose journal alone
-    // would blow the fulfillJob payload cap — before committing collateral and a full proof to it.
-    let journal_len = session.journal.bytes.len() as u64;
-    Ok((cycles, journal_len, started.elapsed().as_secs_f64()))
+    // would carry at this segment size (both are a deterministic function of (ELF, input) at the size
+    // both run at, which a guest can tell — `sys_rand` included, via the shared seed — and the image-id
+    // check makes measure-ELF == prove-ELF). The host checks the job's journal binding against it,
+    // and screens a journal that would blow the fulfillJob payload cap, before committing
+    // collateral and a full proof to it.
+    Ok((
+        cycles,
+        session.journal.bytes,
+        started.elapsed().as_secs_f64(),
+    ))
 }
 
 /// Cards with less VRAM than this release the Groth16 SRS cache after every proof.
@@ -683,6 +1034,14 @@ fn release_groth16_cache_if_tight() {
     }
 }
 
+/// The in-process prover, never one `RISC0_PROVER` names (an external r0vm, or a remote service,
+/// which would also refuse our `sys_rand` seed). Every caller pairs it with options built with dev
+/// mode off, whatever `RISC0_DEV_MODE` says: a dev-mode receipt is fake, and claiming on one ends in a
+/// penalized release.
+fn local_prover() -> risc0_zkvm::LocalProver {
+    risc0_zkvm::LocalProver::new("local")
+}
+
 fn run_proof(
     elf: &[u8],
     input_data: &[u8],
@@ -690,7 +1049,14 @@ fn run_proof(
     program_id: Option<[u8; 32]>,
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
     // Bind the ELF to the job's programId ONCE, before the retry loop spends any GPU on it.
-    verify_program_id(elf, program_id)?;
+    let image_id = verify_program_id(elf, program_id)?;
+    // A job (bound to a programId) proves at a size the host measured it at, which is always in the
+    // job range; other sizes are for benchmarks and calibration.
+    if program_id.is_some() {
+        job_segment_po2(po2)?;
+    }
+    // The seed the pre-claim measurement used, so every attempt runs the guest exactly as it did.
+    let seed = sys_rand_seed(&sys_rand_key(), &image_id, input_data);
     // Retry-on-invalid mitigation for the rare (~1.5%) nondeterministic GPU
     // timing race on RTX 5090 / Blackwell (sm_120) — an intra-kernel race
     // produces an internally-invalid segment STARK, surfaced as
@@ -703,8 +1069,13 @@ fn run_proof(
     // surfaces instead of looping. Only the GPU-corruption error class is retried.
     const MAX_ATTEMPTS: usize = 4;
     let mut last_err: Option<anyhow::Error> = None;
+    // The segment the last invalid proof failed at. A race lands on a segment at random; the same
+    // one failing twice is a witness the circuit rejects (a guest the measurement missed) or a fault
+    // of this card's, and re-proving here would only spend it again. Reported as a failed proof, so
+    // the host tries another card.
+    let mut last_failed_segment: Option<u64> = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match run_proof_once(elf, input_data, po2) {
+        match run_proof_once(elf, input_data, po2, seed) {
             Ok(result) => {
                 if attempt > 1 {
                     tracing::warn!(
@@ -722,12 +1093,23 @@ fn run_proof(
                 // verification / receipt.verify), never wrapped as a guest panic.
                 let guest_fault = msg.contains("guest panicked")
                     || msg.contains("session limit")
-                    || msg.contains("non-zero exit code");
+                    || msg.contains("non-zero exit code")
+                    // A seal that VERIFIES but proves another claim than the host built (a guest that
+                    // halted with an output digest of its own): deterministic, not a GPU race.
+                    || msg.contains("claim digest does not match");
                 let recoverable = !guest_fault
                     && (msg.contains("verification indicates")
                         || msg.contains("verify segment")
                         || msg.contains("receipt is invalid")
                         || msg.contains("proof verification failed"));
+                let segment = failed_segment(&msg);
+                if recoverable && failed_twice(segment, last_failed_segment) {
+                    let index = segment.unwrap_or_default();
+                    return Err(e.context(format!(
+                        "segment {index} failed to verify twice: deterministic, not a GPU race"
+                    )));
+                }
+                last_failed_segment = segment;
                 if recoverable && attempt < MAX_ATTEMPTS {
                     tracing::warn!(
                         "Proof attempt {attempt}/{MAX_ATTEMPTS} produced an invalid proof (likely GPU race), re-proving: {e:#}"
@@ -742,10 +1124,25 @@ fn run_proof(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("proof failed after {MAX_ATTEMPTS} attempts")))
 }
 
+/// The index of the segment whose seal did not verify, from the prover's (host-generated) context
+/// "verify segment N" or "verify segment (last) N", in `msg` lowercased.
+fn failed_segment(msg: &str) -> Option<u64> {
+    let rest = msg.split("verify segment ").nth(1)?;
+    let rest = rest.strip_prefix("(last) ").unwrap_or(rest);
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Whether an invalid proof failed at the segment the one before it did (both known).
+fn failed_twice(segment: Option<u64>, last: Option<u64>) -> bool {
+    segment.is_some() && segment == last
+}
+
 fn run_proof_once(
     elf: &[u8],
     input_data: &[u8],
     po2: Option<u8>,
+    seed: [u8; 32],
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
     use risc0_zkvm::ProverOpts;
 
@@ -764,13 +1161,15 @@ fn run_proof_once(
 
     let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
     env_builder.write_slice(input_data);
-    if let Some(po2) = po2 {
-        if !(13..=24).contains(&po2) {
-            anyhow::bail!("po2 value {po2} out of valid range 13..=24");
-        }
-        tracing::info!("Setting segment_limit_po2 = {po2}");
-        env_builder.segment_limit_po2(po2 as u32);
+    env_builder.random_seed(seed);
+    // Never left to the SDK, which picks 21 on a 32 GB card: a job is measured at the size the host
+    // names here, and the guest can tell the size it runs at.
+    let po2 = po2.unwrap_or(RISC0_DEFAULT_JOB_PO2);
+    if !(13..=24).contains(&po2) {
+        anyhow::bail!("po2 value {po2} out of valid range 13..=24");
     }
+    tracing::info!("Setting segment_limit_po2 = {po2}");
+    env_builder.segment_limit_po2(po2 as u32);
     if let Some(limit) = prove_session_cycle_limit() {
         tracing::info!("Setting session_limit = {limit} cycles (operator override)");
         env_builder.session_limit(Some(limit));
@@ -781,8 +1180,8 @@ fn run_proof_once(
     // This performs STARK proving followed by Groth16 SNARK compression,
     // producing a constant-size proof (~256 bytes seal) that the on-chain
     // RiscZeroVerifierAdapter can verify.
-    let prover = risc0_zkvm::default_prover();
-    let opts = ProverOpts::groth16();
+    let prover = local_prover();
+    let opts = ProverOpts::groth16().with_dev_mode(false);
     let start = Instant::now();
     let proved = prover.prove_with_opts(env, elf, &opts);
     release_groth16_cache_if_tight();
@@ -1002,44 +1401,14 @@ fn benchmark_program(
     weight: f64,
     precompile: bool,
 ) -> Option<BenchmarkEntry> {
+    // At the size an uncalibrated card proves jobs at, so its throughput and host peak describe them.
+    // (Its first stage is a composite proof, for which the SDK never picks a size of its own, so this
+    // only says what the executor default already was.)
     let env = risc0_zkvm::ExecutorEnv::builder()
         .write_slice(input)
+        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32)
         .build()
         .ok()?;
-
-    // Quick HIP sanity check before proving
-    #[cfg(feature = "rocm")]
-    {
-        use std::ffi::c_void;
-        extern "C" {
-            fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
-            fn hipMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: i32) -> i32;
-            fn hipFree(ptr: *mut c_void) -> i32;
-            fn hipGetLastError() -> i32;
-            fn hipDeviceSynchronize() -> i32;
-        }
-        unsafe {
-            // Clear any pending errors
-            let last = hipGetLastError();
-            if last != 0 {
-                tracing::warn!("Pending HIP error before prove: {last}");
-            }
-            let sync = hipDeviceSynchronize();
-            if sync != 0 {
-                tracing::warn!("hipDeviceSynchronize before prove: {sync}");
-            }
-            // Test allocation + memcpy
-            let mut ptr: *mut c_void = std::ptr::null_mut();
-            let ret = hipMalloc(&mut ptr, 256);
-            tracing::info!("HIP test: hipMalloc(256) = {ret}, ptr = {ptr:?}");
-            if ret == 0 && !ptr.is_null() {
-                let data = [0xAAu8; 256];
-                let ret2 = hipMemcpy(ptr, data.as_ptr() as *const c_void, 256, 1);
-                tracing::info!("HIP test: hipMemcpy H2D = {ret2}");
-                hipFree(ptr);
-            }
-        }
-    }
 
     // ONE proof, staged, so each stage is timed exactly rather than inferred from two runs.
     //
@@ -1049,11 +1418,15 @@ fn benchmark_program(
     // benchmark measured neither the recursion that folds segments together — whose cost scales with
     // segment count, i.e. with po2 — nor the wrap. `compress` consumes the previous receipt, so the
     // three stages below add up to the same work `prove_with_opts(groth16)` does in one call.
-    let prover = risc0_zkvm::default_prover();
+    let prover = local_prover();
 
     // Stage 1: execution and the segment proofs.
     let started = Instant::now();
-    let prove_info = match prover.prove_with_opts(env, elf, &risc0_zkvm::ProverOpts::composite()) {
+    let prove_info = match prover.prove_with_opts(
+        env,
+        elf,
+        &risc0_zkvm::ProverOpts::composite().with_dev_mode(false),
+    ) {
         Ok(info) => info,
         Err(e) => {
             tracing::error!("{name}: prove failed: {e:#}");
@@ -1065,7 +1438,10 @@ fn benchmark_program(
     // Stage 2: lift every segment receipt and join them into one constant-size STARK. Scales with
     // segment count, so it is STARK proving and belongs on the variable side of the split.
     let started = Instant::now();
-    let succinct = match prover.compress(&risc0_zkvm::ProverOpts::succinct(), &prove_info.receipt) {
+    let succinct = match prover.compress(
+        &risc0_zkvm::ProverOpts::succinct().with_dev_mode(false),
+        &prove_info.receipt,
+    ) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("{name}: succinct recursion failed: {e:#}");
@@ -1078,7 +1454,10 @@ fn benchmark_program(
     // (`~/.risc0/extensions/*-risc0-groth16/stark_verify_final.zkey`), so it does not depend on the
     // program at all — which is the reason to report it apart from the stages above.
     let started = Instant::now();
-    let wrapped = prover.compress(&risc0_zkvm::ProverOpts::groth16(), &succinct);
+    let wrapped = prover.compress(
+        &risc0_zkvm::ProverOpts::groth16().with_dev_mode(false),
+        &succinct,
+    );
     let wrap_secs = started.elapsed().as_secs_f64();
     // Outside the stopwatch: the release is not part of the wrap, and on a card that releases, the NEXT
     // wrap pays the reload — which is that card's honest per-proof cost.
@@ -1141,9 +1520,8 @@ fn benchmark_program(
 /// MUST produce a workload spanning several segments at PO2_MAX (2^24 cycles), otherwise
 /// the sweep carries NO po2 signal: if the program fits in one segment at every po2 then
 /// the measured differences are just warm-up and timer noise, and
-/// `zkminer_prover::benchmark::calibration_is_usable` discards the whole sweep (host-side
-/// `optimal_po2_for_job` is argmax(throughput), so adopting noise would pick a segment
-/// size at random).
+/// `zkminer_prover::benchmark::calibration_is_usable` refuses to pick the fastest size from it
+/// (argmax(throughput) over noise would pick a card's job size at random).
 ///
 /// Sizing: the fibonacci guest costs a MEASURED ~10.4 cycles/iteration — stable for
 /// n >= 100_000 (at small n the reported `total_cycles` is the padded segment size, not
@@ -1160,6 +1538,41 @@ fn benchmark_program(
 /// why calibration is opt-in (`zkminer benchmark --calibrate`), never a default run.
 const CALIBRATION_ITERS: u32 = 6_000_000;
 
+/// The one-time setup before a first proof (`WorkerCommand::Warmup`), which the miner runs before it
+/// claims any risc0 job. Every backend: the `risc0-groth16` component every proof's Groth16 wrap
+/// needs, installed if it is missing (`groth16_component`). On Intel, also the kernels: SYCL compiles
+/// those shipped as SPIR-V (the zkp and Groth16 ones) for the device on first use, which took ~8
+/// minutes on an Arc B580, longer than a benchmark's whole budget; the driver caches the result on
+/// disk (`~/.cache/libsycl_cache`, `~/.cache/neo_compiler_cache`), so one small proof through the
+/// full Groth16 pipeline compiles everything once for every later process. It is verified, so a
+/// broken card fails here, not on a job.
+#[cfg(feature = "intel")]
+fn warm_up() -> Result<String> {
+    let component = groth16_component::ensure_installed()?;
+    let start = Instant::now();
+    let env = risc0_zkvm::ExecutorEnv::builder()
+        .write_slice(&1000u32.to_le_bytes())
+        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32)
+        .build()?;
+    let opts = risc0_zkvm::ProverOpts::groth16().with_dev_mode(false);
+    let proved = local_prover().prove_with_opts(env, FIBONACCI_ELF, &opts);
+    release_groth16_cache_if_tight();
+    proved?
+        .receipt
+        .verify(FIBONACCI_ID)
+        .context("the warm-up proof does not verify")?;
+    Ok(format!(
+        "{component}; compiled and cached the Intel GPU kernels with a verified Groth16 proof in \
+         {:.0} s",
+        start.elapsed().as_secs_f64()
+    ))
+}
+
+#[cfg(not(feature = "intel"))]
+fn warm_up() -> Result<String> {
+    groth16_component::ensure_installed()
+}
+
 /// Run a po2 calibration: prove fibonacci at the specified segment po2 and measure throughput.
 fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
     let input = CALIBRATION_ITERS.to_le_bytes();
@@ -1169,7 +1582,7 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
         .build()?;
 
     let start = std::time::Instant::now();
-    let prover = risc0_zkvm::default_prover();
+    let prover = local_prover();
     // Measure the SAME pipeline the miner actually runs (`run_proof_once` uses
     // ProverOpts::groth16()), NOT `prove()`'s default composite receipt.
     //
@@ -1186,7 +1599,7 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
     // where the real spread is 98%, leaving its argmax to be decided by noise. It also
     // under-reports MEMORY pressure: po2=21 completes composite-only but OOMs on the
     // real groth16 path, so a composite-derived max_feasible_po2 is too optimistic.
-    let opts = risc0_zkvm::ProverOpts::groth16();
+    let opts = risc0_zkvm::ProverOpts::groth16().with_dev_mode(false);
     let proved = prover.prove_with_opts(env, FIBONACCI_ELF, &opts);
     release_groth16_cache_if_tight();
     let prove_info = proved?;
@@ -1209,17 +1622,18 @@ mod program_id_tests {
     use super::*;
 
     #[test]
-    fn matches_forward_and_reverse_but_not_a_different_id() {
+    fn matches_native_order_only_and_not_a_different_id() {
         let mut img = [0u8; 32];
         for (i, b) in img.iter_mut().enumerate() {
             *b = i as u8;
         }
-        // Same bytes (forward order) matches.
+        // Same bytes (native order) matches.
         assert!(image_id_matches(&img, &img));
-        // The chain may store the reversed order — that must still match.
+        // The v2 adapter verifies against programId verbatim: the reversed order can never verify,
+        // so it must NOT match (else a reversed registration is claimed, proved and rejected).
         let mut rev = img;
         rev.reverse();
-        assert!(image_id_matches(&img, &rev));
+        assert!(!image_id_matches(&img, &rev));
         // A genuinely different program (one bit flipped) matches under neither order.
         let mut other = img;
         other[0] ^= 0x01;
@@ -1227,9 +1641,10 @@ mod program_id_tests {
     }
 
     #[test]
-    fn verify_accepts_none_and_respects_kill_switch() {
-        // No programId supplied (benchmark/calibration/mock) → always OK, regardless of ELF.
-        assert!(verify_program_id(&[0u8; 8], None).is_ok());
+    fn verify_computes_the_image_id_even_without_a_program_id() {
+        // No programId supplied (benchmark/calibration/mock): nothing to match, but the image id is
+        // still computed (it keys the `sys_rand` seed), so bytes that are no ELF are refused.
+        assert!(verify_program_id(&[0u8; 8], None).is_err());
     }
 
     // Guest-gated: only meaningful when real guests were compiled in (not RISC0_SKIP_BUILD).
@@ -1250,5 +1665,145 @@ mod program_id_tests {
         // A different programId (bit flipped) must be refused.
         pid[0] ^= 0x01;
         assert!(verify_program_id(FIBONACCI_ELF, Some(pid)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod keccak_audit_tests {
+    use super::*;
+    use risc0_zkvm::sha::Digestible;
+
+    fn request(b: u8) -> risc0_zkvm::Assumption {
+        risc0_zkvm::Assumption {
+            claim: risc0_zkvm::Digest::from([b as u32; 8]),
+            control_root: risc0_circuit_keccak::KECCAK_CONTROL_ROOT,
+        }
+    }
+
+    fn union(a: &risc0_zkvm::Assumption, b: &risc0_zkvm::Assumption) -> risc0_zkvm::Assumption {
+        let (x, y) = (a.digest(), b.digest());
+        let (left, right) = if x <= y { (x, y) } else { (y, x) };
+        risc0_zkvm::Assumption {
+            claim: risc0_zkvm::UnionClaim { left, right }.digest(),
+            control_root: risc0_zkvm::ALLOWED_CONTROL_ROOT,
+        }
+    }
+
+    #[test]
+    fn the_root_is_the_guest_batchers_mountain_range() {
+        let audit = |n: u8| KeccakAudit {
+            requests: (1..=n).map(request).collect(),
+            cycles: 0,
+        };
+        assert_eq!(audit(0).root(), None, "no requests, nothing to assume");
+        // A lone request stands for itself, under the keccak circuit's control root.
+        assert_eq!(audit(1).root(), Some(request(1)));
+        assert_eq!(audit(2).root(), Some(union(&request(1), &request(2))));
+        // Three: a height-1 peak over the first two, then the third, folded front to back.
+        let three = union(&union(&request(1), &request(2)), &request(3));
+        assert_eq!(audit(3).root(), Some(three));
+        // Four: one height-2 peak.
+        let four = union(
+            &union(&request(1), &request(2)),
+            &union(&request(3), &request(4)),
+        );
+        assert_eq!(audit(4).root(), Some(four));
+        // A union is unordered, so the root doesn't depend on the order within a pair.
+        let swapped = KeccakAudit {
+            requests: vec![request(2), request(1)],
+            cycles: 0,
+        };
+        assert_eq!(swapped.root(), audit(2).root());
+    }
+}
+
+#[cfg(test)]
+mod sys_rand_tests {
+    use super::*;
+
+    #[test]
+    fn seed_is_fixed_by_key_image_id_and_input() {
+        let key = [1u8; 32];
+        let image = [7u8; 32];
+        let seed = sys_rand_seed(&key, &image, b"input");
+        assert_eq!(sys_rand_seed(&key, &image, b"input"), seed);
+        assert_ne!(sys_rand_seed(&[2u8; 32], &image, b"input"), seed);
+        assert_ne!(sys_rand_seed(&key, &[8u8; 32], b"input"), seed);
+        assert_ne!(sys_rand_seed(&key, &image, b"input2"), seed);
+    }
+
+    #[test]
+    fn the_seed_follows_the_image_id_not_the_elf_bytes() {
+        // The same program (one image id) must seed alike whichever of its ELFs was fetched.
+        if FIBONACCI_ELF.is_empty() {
+            return; // stubbed guests; nothing to validate
+        }
+        let image = verify_program_id(FIBONACCI_ELF, None).unwrap();
+        assert_eq!(
+            image,
+            <[u8; 32]>::try_from(
+                risc0_zkvm::compute_image_id(FIBONACCI_ELF)
+                    .unwrap()
+                    .as_bytes()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            verify_program_id(FIBONACCI_ELF, Some(image)).unwrap(),
+            image
+        );
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn the_failed_segment_is_read_from_the_provers_context() {
+        let msg = "verify segment 3: verification indicates proof is invalid";
+        assert_eq!(failed_segment(msg), Some(3));
+        let msg = "verify segment (last) 17: verification indicates proof is invalid";
+        assert_eq!(failed_segment(msg), Some(17));
+        // No index (the test injection, a receipt check): no segment to compare.
+        let msg = "verify segment: verification indicates proof is invalid (test injected)";
+        assert_eq!(failed_segment(msg), None);
+        assert_eq!(failed_segment("receipt is invalid"), None);
+    }
+
+    #[test]
+    fn only_the_same_segment_failing_again_stops_the_retries() {
+        assert!(failed_twice(Some(3), Some(3)));
+        assert!(!failed_twice(Some(3), Some(4)));
+        assert!(!failed_twice(Some(3), None));
+        assert!(
+            !failed_twice(None, None),
+            "an unindexed failure is never the same segment"
+        );
+    }
+
+    #[test]
+    fn a_job_runs_only_at_a_size_in_the_job_range() {
+        assert_eq!(job_segment_po2(None).unwrap(), RISC0_DEFAULT_JOB_PO2);
+        for p in [RISC0_JOB_PO2_MIN, 19, RISC0_JOB_PO2_MAX] {
+            assert_eq!(job_segment_po2(Some(p)).unwrap(), p);
+        }
+        for p in [RISC0_JOB_PO2_MIN - 1, RISC0_JOB_PO2_MAX + 1] {
+            let err = job_segment_po2(Some(p)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(&format!("po2 value {p} is outside")),
+                "{err:#}"
+            );
+        }
+        if FIBONACCI_ELF.is_empty() {
+            return; // stubbed guests; nothing to validate
+        }
+        let image = verify_program_id(FIBONACCI_ELF, None).unwrap();
+        let po2 = RISC0_JOB_PO2_MIN - 1;
+        // Refused before any proving, executing or seeding: no GPU needed.
+        let err = run_proof(FIBONACCI_ELF, &[], Some(po2), Some(image)).unwrap_err();
+        assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
+        let err = run_execute(FIBONACCI_ELF, &[], Some(image), Some(po2)).unwrap_err();
+        assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
     }
 }

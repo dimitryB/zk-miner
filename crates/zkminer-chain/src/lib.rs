@@ -1,12 +1,15 @@
 pub mod adapter;
 pub mod auction;
+pub mod binding;
 pub mod client;
+pub mod deployment;
 pub mod descriptor;
-pub mod eip712;
+pub mod revert;
 pub mod jobs;
 pub mod monitor;
 pub mod nonce;
 pub mod programs;
 pub mod rpc_meter;
+pub mod send_guard;
 pub mod staking;
 pub mod tx;

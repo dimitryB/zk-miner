@@ -841,8 +841,8 @@ pub fn unmeasured_peak_for(backend: &str) -> u64 {
 ///   wrap. `zkminer-prove-risc0`'s own calibration comment says it plainly: *"It also under-reports
 ///   MEMORY pressure: po2=21 completes composite-only but OOMs on the real groth16 path, so a
 ///   composite-derived max_feasible_po2 is too optimistic."*
-/// * **Segment size.** The benchmark runs at the SDK default po2; production sets the resolved po2,
-///   and this project's own model has memory DOUBLING per po2 step.
+/// * **Segment size.** The benchmark runs at `BASELINE_PO2`; a card proves jobs at its own po2, and
+///   this project's own model has memory DOUBLING per po2 step.
 ///
 /// So a measured figure is a lower bound, and using it raw is worse than using no measurement at
 /// all: it REPLACES the conservative default and would license several times the real concurrency.
@@ -895,15 +895,16 @@ pub fn max_admissible_budget(total: u64) -> u64 {
 
 /// Baseline po2 that `unmeasured_peak_for` and a benchmark measurement are taken at.
 ///
-/// The SDK default segment size, which is what `benchmark_program` proves at. Production resolves its
-/// own po2, so any budget compared against a different po2 has to be scaled from here.
-pub const BASELINE_PO2: u8 = 21;
+/// `RISC0_DEFAULT_JOB_PO2`, which `benchmark_program` proves at (and always did: its composite first
+/// stage never let the SDK pick 21). A card proves jobs at its own po2, so any budget compared against
+/// a different po2 has to be scaled from here; below it nothing is credited.
+pub const BASELINE_PO2: u8 = zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2;
 
 /// Scale a host-memory figure measured at `BASELINE_PO2` to the cost at `po2`.
 ///
 /// Memory DOUBLES per po2 step in this project's own model (`estimate_po2_memory`), and every
 /// host-memory budget in this module is keyed on the backend alone — not the segment size. So an
-/// operator raising po2 from 21 to 24 in the TUI multiplies the real cost roughly eightfold while
+/// operator raising po2 from 20 to 22 in the TUI multiplies the real cost roughly fourfold while
 /// every admission figure stays identical, and the `Critical` log line even advises lowering po2 as
 /// the remedy for a number po2 does not affect.
 ///
@@ -1001,8 +1002,16 @@ impl Drop for MemoryReservation<'_> {
             std::sync::atomic::Ordering::Acquire,
             |v| Some(v.saturating_sub(self.bytes)),
         );
+        MEMORY_RELEASED.notify_waiters();
     }
 }
+
+/// Signalled whenever any reservation (host RAM or `/dev/shm`) is given back, so a proof waiting for
+/// memory can retry the moment some frees instead of on its next poll. A wake-up only: the waiter
+/// still has to win the reservation, and waits with a timeout, since a release between its refusal
+/// and its wait is not remembered.
+pub static MEMORY_RELEASED: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
 
 impl MemoryLedger {
     pub fn reserved_bytes(&self) -> u64 {

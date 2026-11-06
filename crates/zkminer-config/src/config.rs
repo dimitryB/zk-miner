@@ -36,12 +36,14 @@ pub struct ChainConfig {
     #[serde(default)]
     pub min_staking_age_secs: Option<u64>,
     /// How many blocks back to scan on startup for jobs this miner locked but
-    /// never fulfilled (crash/restart recovery). None = built-in default (50000).
+    /// never fulfilled (crash/restart recovery). None = built-in default (108,150: a lock can
+    /// live a 7-day window plus grace, a downtime extension and pause credit — keep it that long).
     #[serde(default)]
     pub recovery_lookback_blocks: Option<u64>,
     /// How many blocks to rewind the job monitor's start block, so it also claims
     /// jobs that were already Open when the miner started (not just newly-submitted
-    /// ones). None = built-in default (5000); 0 = forward-only.
+    /// ones). None = built-in default: back to `scan_from_block` (5000 on a chain with no known
+    /// deployment); 0 = forward-only.
     #[serde(default)]
     pub monitor_backfill_blocks: Option<u64>,
     /// Job monitor poll interval in seconds. Lower = jobs seen sooner (better in a
@@ -49,22 +51,39 @@ pub struct ChainConfig {
     /// on a rate-limited RPC). None = built-in default (10, ~chain block time).
     #[serde(default)]
     pub monitor_poll_secs: Option<u64>,
-    /// Explicit gas limit for `fulfillJob` txs. The router's settlement-gas
-    /// preflight (~4.6M) reverts `InsufficientGasForFullSettlement()` if the tx
-    /// is under-provisioned, and eth_estimateGas under-provisions it. None =
-    /// built-in default (5_000_000). Bump for verifier-heavy proof systems.
+    /// Minimum gas limit for `fulfillJob` txs. zkminer always sends at least the repo's formula
+    /// (`4.6M + callbackGasLimit + 250k + 16 x calldata + 8 x journal + 500k`, ~5.6M for a 1 KB
+    /// adapter job): the router refuses to start verifying below `4.6M + callbackGasLimit` and
+    /// reverts `InsufficientGasForFullSettlement()`. 5,000,000 is TOO LOW. None = built-in default
+    /// (10,000,000, above every valid job's formula).
     #[serde(default)]
     pub fulfill_gas_limit: Option<u64>,
-    /// Whether to claim jobs that carry a non-zero `expectedJournalHash`
-    /// (Phase-2 "journal predicate"). Fulfilling such a job with a proof whose
-    /// public values don't satisfy the predicate reverts `JournalMismatch`
-    /// AFTER the lock — risking a collateral slash on timeout — because zkminer
-    /// does not yet simulate the predicate before claiming. A submitter can set
-    /// an unsatisfiable predicate deliberately to bait a slash, so None = built-in
-    /// default (FALSE: skip them). Set `true` only on a deployment
-    /// where you accept the risk (e.g. testnet testing of the predicate feature).
+    /// Key-wide ceiling (gwei) for the fulfil and release fee ladders (handoff §10): an unmined
+    /// fulfil is re-published at the same nonce with both fees raised >= 12.5% up to this ceiling.
+    /// Size it from what the cheapest lock this key takes is worth: `(price + lockedCollateral) x
+    /// ETH-per-HEMI / ~643k gas` (about 3.6-4.7 gwei for 15-50 HEMI jobs at 50,000 HEMI/ETH). A low
+    /// ceiling makes holding our fulfil out of blocks cheap; fund the key for `fulfil gas limit x
+    /// ceiling` per pending fulfil. None = built-in default (4 gwei).
+    #[serde(default)]
+    pub fee_ceiling_gwei: Option<f64>,
+    /// First block of every HemiProve log scan (job discovery, lock recovery, descriptor
+    /// reconstruction): the deployment's `fromBlock`. None = the known deployment's value for this
+    /// chain (743111: 7095745), else no floor.
+    #[serde(default)]
+    pub scan_from_block: Option<u64>,
+    /// Whether to claim journal-bound jobs: a non-zero `expectedJournalHash` (FULL or FIELDS
+    /// binding), which is every open-market job. A fulfil whose journal does not satisfy the binding
+    /// reverts `JournalMismatch` after the lock, so such a job is claimed only when the journal its
+    /// (program, input) measured satisfies the binding, and the proof's journal is checked again
+    /// before the fulfil. None = built-in default (TRUE). `false` claims only NONE jobs assigned to
+    /// this prover.
     #[serde(default)]
     pub claim_predicate_jobs: Option<bool>,
+    /// Ceiling on JSON-RPC requests per second to `rpc_url`, so a burst cannot trip the endpoint's
+    /// per-IP rate limit. None = built-in default: 4, or 1 for `run --watch-only`, which shares the
+    /// limit with any miner on the same host and IP.
+    #[serde(default)]
+    pub max_requests_per_sec: Option<u32>,
 }
 
 fn default_rpc_url() -> String {
@@ -87,7 +106,10 @@ impl Default for ChainConfig {
             monitor_backfill_blocks: None,
             monitor_poll_secs: None,
             fulfill_gas_limit: None,
+            fee_ceiling_gwei: None,
+            scan_from_block: None,
             claim_predicate_jobs: None,
+            max_requests_per_sec: None,
         }
     }
 }
@@ -106,7 +128,8 @@ pub struct ContractAddresses {
     /// HEMI token (ERC20) address.
     #[serde(default)]
     pub hemi_token: String,
-    /// ProgramRegistry contract address (advisory ELF/program metadata).
+    /// ProgramRegistry contract address: where programs' ELF sources are read from. Unset: the known
+    /// deployment's for the chain. On a known chain it must be the live one.
     #[serde(default)]
     pub program_registry: String,
 }
@@ -214,6 +237,14 @@ pub struct ProverConfig {
     /// the risc0 version in use. Defaults to the risc0 v3.0.x value when unset.
     #[serde(default)]
     pub risc0_groth16_selector: Option<String>,
+    /// The segment size (po2) a card measures and proves risc0 jobs at, keyed by its benchmark device
+    /// id (`gpu0`, `gpu1`, … for NVIDIA cards, `gpu-rocm0`, … for AMD; the log lists them), e.g.
+    /// `{ gpu1 = 19 }`: for a card the default (20, or nothing under 14 GiB of VRAM) or its
+    /// calibration doesn't suit. Held to 16..=22. The Settings screen's Advanced rows override it for
+    /// the session. Not written when empty, so `zkminer init` leaves no empty table at the end of the
+    /// file for a later line to land in.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub risc0_job_po2: HashMap<String, u8>,
     /// If true, the brain will proceed with a synthetic conservative
     /// benchmark profile when no cached benchmark is available, rather
     /// than waiting for the user to run `[b]` on the Benchmark screen.
@@ -287,6 +318,7 @@ impl Default for ProverConfig {
             worker_search_paths: Vec::new(),
             worker_binaries: HashMap::new(),
             risc0_groth16_selector: None,
+            risc0_job_po2: HashMap::new(),
             skip_benchmark_gate: default_skip_benchmark_gate(),
         }
     }
@@ -370,6 +402,14 @@ impl ZkMinerConfig {
                      (got {g}, which rounds to {} wei); omit it to use automatic EIP-1559 \
                      estimation",
                     wei.max(0.0) as u128
+                );
+            }
+        }
+        if let Some(c) = self.chain.fee_ceiling_gwei {
+            if !c.is_finite() || !(0.01..=10_000.0).contains(&c) {
+                anyhow::bail!(
+                    "chain.fee_ceiling_gwei must be between 0.01 and 10000 gwei (got {c}); omit it \
+                     for the built-in default"
                 );
             }
         }

@@ -1,7 +1,7 @@
 //! Proving engine trait and CPU prover dispatch.
 //!
 //! Provides a trait-based interface for ZK proving that dispatches to
-//! whichever backend is compiled in (risc0, sp1, or openvm), or to
+//! whichever backend is compiled in (risc0 or sp1), or to
 //! subprocess workers discovered at runtime.
 
 use anyhow::Result;
@@ -40,7 +40,7 @@ pub struct ProofOutput {
 /// Trait for the proving engine, allowing mock implementations for testing.
 pub trait ProvingEngine: Send + Sync {
     /// Prove execution of the given ELF with the provided input data.
-    /// `po2` sets the risc0 segment_limit_po2; None = SDK default.
+    /// `po2` sets the risc0 segment_limit_po2; None = the worker's default, po2 20.
     fn prove(&self, elf: &[u8], input_data: &[u8], po2: Option<u8>) -> Result<ProofOutput>;
 
     /// Prove with a specific backend. Default impl delegates to prove().
@@ -53,45 +53,6 @@ pub trait ProvingEngine: Send + Sync {
     ) -> Result<ProofOutput> {
         self.prove(elf, input_data, po2)
     }
-}
-
-/// Resolve the po2 to use for a proof, applying the priority chain:
-///   1. Manual override from po2_overrides (if set for this device+backend)
-///   2. Dynamic selection via Po2Profile calibration data
-///   3. None (let the SDK use its default)
-///
-/// Returns None for non-risc0 backends (SP1/OpenVM ignore po2).
-pub fn resolve_po2(
-    device_id: &str,
-    backend: &str,
-    estimated_cycles: u64,
-    po2_overrides: &std::collections::HashMap<(String, String), u8>,
-    po2_profile: Option<&crate::benchmark::Po2Profile>,
-) -> Option<u8> {
-    if backend != "risc0" {
-        return None;
-    }
-
-    // Priority 1: Manual override
-    let key = (device_id.to_string(), backend.to_string());
-    if let Some(&po2) = po2_overrides.get(&key) {
-        return Some(po2);
-    }
-
-    // Priority 2: Dynamic selection from calibration data
-    if let Some(profile) = po2_profile {
-        if estimated_cycles > 0 {
-            // Only override the SDK when calibration shows a DECISIVE winner. A plain
-            // argmax would act on differences inside measurement noise, which measured
-            // 5% SLOWER than the default on a 4090 — see `confident_po2_for_job`.
-            if let Some(po2) = profile.confident_po2_for_job(estimated_cycles) {
-                return Some(po2);
-            }
-        }
-    }
-
-    // Priority 3: Let the SDK choose
-    None
 }
 
 /// How a backend is available.
@@ -114,9 +75,6 @@ pub fn enabled_backends() -> Vec<&'static str> {
     }
     if cfg!(feature = "sp1") {
         backends.push("sp1");
-    }
-    if cfg!(feature = "openvm") {
-        backends.push("openvm");
     }
     if backends.is_empty() {
         // Check subprocess workers
@@ -168,12 +126,9 @@ pub fn backend_sources() -> Vec<(&'static str, BackendSource)> {
     let mut sources = Vec::new();
 
     // Check compile-time features first
+    // OpenVM proves only through its worker (`zkminer-prove-openvm`, a workspace of its own).
     let all_backends = &["risc0", "sp1", "openvm"];
-    let features = [
-        cfg!(feature = "risc0"),
-        cfg!(feature = "sp1"),
-        cfg!(feature = "openvm"),
-    ];
+    let features = [cfg!(feature = "risc0"), cfg!(feature = "sp1"), false];
 
     let any_feature = features.iter().any(|&f| f);
 
@@ -204,7 +159,6 @@ pub fn backend_sources() -> Vec<(&'static str, BackendSource)> {
 ///
 /// When built with `--features risc0`, delegates to RISC Zero.
 /// When built with `--features sp1`, delegates to SP1.
-/// When built with `--features openvm`, delegates to OpenVM.
 /// When a subprocess worker is available, delegates to it.
 /// With no features and no workers, returns an error.
 pub struct CpuProver {
@@ -247,7 +201,7 @@ impl ProvingEngine for CpuProver {
             return self.prove_with_backend(backend, elf, input_data, po2);
         }
 
-        // Dispatch to the first enabled prover backend (priority: risc0 > sp1 > openvm).
+        // Dispatch to the first enabled prover backend (priority: risc0 > sp1).
         #[cfg(feature = "risc0")]
         {
             return crate::risc0::Risc0Prover.prove(elf, input_data, po2);
@@ -256,11 +210,6 @@ impl ProvingEngine for CpuProver {
         #[cfg(feature = "sp1")]
         {
             return crate::sp1::Sp1Prover::new().prove(elf, input_data, po2);
-        }
-
-        #[cfg(feature = "openvm")]
-        {
-            return crate::openvm::OpenVmProver.prove(elf, input_data, po2);
         }
 
         // Try subprocess workers
@@ -272,11 +221,11 @@ impl ProvingEngine for CpuProver {
         }
 
         // Fall-through when no in-process backend was compiled in and no
-        // subprocess worker is connected. With one of the risc0/sp1/openvm
-        // features enabled, the early returns above fire and this is dead —
+        // subprocess worker is connected. With the risc0 or sp1
+        // feature enabled, the early returns above fire and this is dead —
         // the `#[allow(unreachable_code)]` on the fn permits it.
         anyhow::bail!(
-            "No prover backend available. Build with --features risc0/sp1/openvm, \
+            "No prover backend available. Build with --features risc0/sp1, \
              or install a worker binary (zkminer-prove-risc0, etc.)"
         )
     }
@@ -294,8 +243,6 @@ impl ProvingEngine for CpuProver {
             "risc0" => return crate::risc0::Risc0Prover.prove(elf, input_data, po2),
             #[cfg(feature = "sp1")]
             "sp1" => return crate::sp1::Sp1Prover::new().prove(elf, input_data, po2),
-            #[cfg(feature = "openvm")]
-            "openvm" => return crate::openvm::OpenVmProver.prove(elf, input_data, po2),
             _ => {}
         }
 

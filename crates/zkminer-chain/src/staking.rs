@@ -21,6 +21,10 @@ pub struct StakeInfo {
     /// unix timestamp). Claim eligibility is `block.number > deposit_block`;
     /// there is no wall-clock staking-age gate.
     pub deposit_block: u64,
+    /// The block these figures were read at, when known (the refresh multicall reads its head in
+    /// the same call). `available_collateral` already nets out every lock mined by this block, which
+    /// is how the claim gate tells a reservation already counted on-chain from one that is not yet.
+    pub read_block: Option<u64>,
 }
 
 /// Prover performance statistics.
@@ -57,6 +61,8 @@ impl ChainClient {
             unstake_amount: stake.unstakeAmount,
             unstake_request_time: stake.unstakeRequestTime.to::<u64>(),
             deposit_block: stake.depositBlock.to::<u64>(),
+            // Two separate reads, at whatever blocks the node served them: unknown.
+            read_block: None,
         })
     }
 
@@ -112,7 +118,11 @@ impl ChainClient {
         // exists to prevent.
         let token = IERC20::new(self.hemi_token, &*self.provider);
         let nonce = self.reserve_nonce().await?;
-        let tx = token.approve(spender, amount).nonce(nonce);
+        // Both fee fields, with the Hemi floors (a 1-wei tip is accepted but never mined).
+        let (tip, max_fee) = self.base_fees().await;
+        let tx = token.approve(spender, amount).nonce(nonce)
+            .max_priority_fee_per_gas(tip)
+            .max_fee_per_gas(max_fee);
         let send_result = {
             let _guard = self.tx_lock.lock().await;
             tx.send().await
@@ -121,10 +131,13 @@ impl ChainClient {
             Ok(p) => {
                 // Retire any stale abort record: the node ACCEPTED this send, so the nonce
                 // is legitimately in use. These paths share the job allocator but cannot
-                // record a fee (alloy's filler owns the pair), so without this a nonce
+                // record an abort, so without this a nonce
                 // recycled by a job give-up and then taken by a stake keeps its record, and
                 // the ungated watchdog evicts the live stake with a >=4x self-transfer.
                 self.note_nonce_in_use(nonce);
+                // The fee pair is ours now (explicit), so record it: a later same-nonce
+                // replacement (incl. the watchdog's heal) must lift over it.
+                self.note_broadcast_fee(nonce, tip, max_fee, max_fee);
                 p
             }
             Err(e) => {
@@ -189,7 +202,11 @@ impl ChainClient {
     pub async fn stake(&self, amount: u128) -> Result<()> {
         let staking = IHemiProveStaking::new(self.hemi_prove_staking, &*self.provider);
         let nonce = self.reserve_nonce().await?; // explicit nonce via the shared allocator
-        let tx = staking.stake(self.address, amount).nonce(nonce);
+        // Both fee fields, with the Hemi floors (a 1-wei tip is accepted but never mined).
+        let (tip, max_fee) = self.base_fees().await;
+        let tx = staking.stake(self.address, amount).nonce(nonce)
+            .max_priority_fee_per_gas(tip)
+            .max_fee_per_gas(max_fee);
         let send_result = {
             let _guard = self.tx_lock.lock().await;
             tx.send().await
@@ -198,10 +215,13 @@ impl ChainClient {
             Ok(p) => {
                 // Retire any stale abort record: the node ACCEPTED this send, so the nonce
                 // is legitimately in use. These paths share the job allocator but cannot
-                // record a fee (alloy's filler owns the pair), so without this a nonce
+                // record an abort, so without this a nonce
                 // recycled by a job give-up and then taken by a stake keeps its record, and
                 // the ungated watchdog evicts the live stake with a >=4x self-transfer.
                 self.note_nonce_in_use(nonce);
+                // The fee pair is ours now (explicit), so record it: a later same-nonce
+                // replacement (incl. the watchdog's heal) must lift over it.
+                self.note_broadcast_fee(nonce, tip, max_fee, max_fee);
                 p
             }
             // abort→resync: see approve_hemi_token for rationale.
@@ -272,8 +292,26 @@ impl ChainClient {
             );
         }
         let token = ITestnetToken::new(self.hemi_token, &*self.provider);
+        // The 743111 tHEMI is OWNER-minted (`mint` is onlyOwner): simulate first so a prover never pays
+        // gas for a guaranteed `OwnableUnauthorizedAccount` revert, and say what to do instead.
+        if let Err(e) = token
+            .mint(self.address, U256::from(amount))
+            .from(self.address)
+            .call()
+            .await
+        {
+            anyhow::bail!(
+                "this deployment's tHEMI is not publicly mintable (owner-minted) — ask the HemiProve \
+                 team for tHEMI ({})",
+                crate::programs::sanitize_log(&format!("{e:#}"))
+            );
+        }
         let nonce = self.reserve_nonce().await?; // explicit nonce via the shared allocator
-        let tx = token.mint(self.address, U256::from(amount)).nonce(nonce);
+        // Both fee fields, with the Hemi floors (a 1-wei tip is accepted but never mined).
+        let (tip, max_fee) = self.base_fees().await;
+        let tx = token.mint(self.address, U256::from(amount)).nonce(nonce)
+            .max_priority_fee_per_gas(tip)
+            .max_fee_per_gas(max_fee);
         let send_result = {
             let _guard = self.tx_lock.lock().await;
             tx.send().await
@@ -282,10 +320,13 @@ impl ChainClient {
             Ok(p) => {
                 // Retire any stale abort record: the node ACCEPTED this send, so the nonce
                 // is legitimately in use. These paths share the job allocator but cannot
-                // record a fee (alloy's filler owns the pair), so without this a nonce
+                // record an abort, so without this a nonce
                 // recycled by a job give-up and then taken by a stake keeps its record, and
                 // the ungated watchdog evicts the live stake with a >=4x self-transfer.
                 self.note_nonce_in_use(nonce);
+                // The fee pair is ours now (explicit), so record it: a later same-nonce
+                // replacement (incl. the watchdog's heal) must lift over it.
+                self.note_broadcast_fee(nonce, tip, max_fee, max_fee);
                 p
             }
             // abort→resync: see approve_hemi_token for rationale.

@@ -256,6 +256,220 @@ fn crash_then_ensure_alive_respawns_successfully() {
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
 }
 
+/// What the dispatcher makes of an SP1 worker that lost its `sp1-gpu-server` and exited: a new worker,
+/// whose next proof succeeds, and a slot not retired however often it happens, as that can be one
+/// job's doing and the job is what the retry budget is for. Exit code 75 is told apart only for a host
+/// OOM, which `a_lost_server_after_a_host_oom_is_a_memory_shortage` covers.
+#[test]
+fn a_worker_that_lost_its_server_is_replaced_and_the_next_proof_succeeds() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    let mut env = mock_env("", "prove");
+    env.insert(
+        "MOCK_CRASH_CODE".to_string(),
+        zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST.to_string(),
+    );
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), env.clone())
+        .expect("failed to spawn mock worker");
+
+    for round in 0..3 {
+        let result = pool.prove("mock", &[], &[], None, Some(Duration::from_secs(30)), None);
+        let e = result.expect_err("this worker exits on every proof");
+        assert!(
+            e.downcast_ref::<zkminer_prover::worker::WorkerDied>()
+                .is_some(),
+            "round {round}: {e:#}"
+        );
+        // Never sent to a dead worker again: the handle is gone, and the PID with it.
+        assert_eq!(pool.test_has_handle("mock:generic"), Some(false));
+        assert_eq!(pool.test_pid("mock:generic"), Some(0));
+        // One failure: the respawn that follows clears it, so repeats cannot retire the slot.
+        assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(1));
+    }
+
+    pool.test_set_spawn_env("mock:generic", mock_env("", ""));
+    let output = pool
+        .prove("mock", &[], &[], None, Some(Duration::from_secs(30)), None)
+        .expect("the replacement proves");
+    assert_eq!(output.cycles, 1000);
+    assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+}
+
+/// What a preempted SP1 measurement staged goes with it. SIGKILL skips the executor's own cleanup, and
+/// the room is about to be given to the proof, so left there the two add up to a full tmpfs and a
+/// SIGBUS.
+#[test]
+fn preempting_an_sp1_measurement_unlinks_what_it_staged() {
+    let shm_name = format!("sp1_mocktest{}_t", std::process::id());
+    let shm_file = format!("/dev/shm/{shm_name}");
+    let mut env = mock_env("execute", "");
+    env.insert("MOCK_BACKEND".to_string(), "sp1".to_string());
+    env.insert("MOCK_HOLD_SHM".to_string(), shm_name);
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("sp1:measure:0", "sp1", mock_worker_path(), env)
+        .expect("failed to spawn mock worker");
+    let pool = Arc::new(pool);
+    let measurer = {
+        let pool = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            pool.execute_cycles("sp1", &[], &[], Some(Duration::from_secs(120)), None, None)
+        })
+    };
+    // The mock names the file only once it is mapped, which is how the kill will find it.
+    let started = Instant::now();
+    while !std::path::Path::new(&shm_file).exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the mock never staged"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    pool.test_preempt_all_inflight_measures();
+    let err = measurer.join().unwrap().expect_err("it was preempted");
+    assert!(
+        err.downcast_ref::<zkminer_prover_protocol::types::MeasurePreempted>()
+            .is_some(),
+        "{err:#}"
+    );
+    let leaked = std::path::Path::new(&shm_file).exists();
+    let _ = std::fs::remove_file(&shm_file);
+    assert!(
+        !leaked,
+        "preempting a measurement must not leave what it staged in /dev/shm"
+    );
+}
+
+/// The same preemption with a real SP1 worker and guest, for what they really leave in `/dev/shm`.
+///
+///   ZKMINER_TEST_SP1_WORKER=<zkminer-prove-sp1> cargo test -p zkminer-prover --features testing \\
+///     --test worker_lifecycle -- --ignored --test-threads=1 preempting_a_real_sp1_measurement
+#[test]
+#[ignore = "needs a real zkminer-prove-sp1, and no other SP1 execution on this host"]
+fn preempting_a_real_sp1_measurement_frees_its_dev_shm() {
+    /// What the tmpfs really has in use, which unlinked but still mapped pages count towards.
+    fn tmpfs_used() -> u64 {
+        let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statvfs(c"/dev/shm".as_ptr(), &mut fs) };
+        assert_eq!(rc, 0);
+        (fs.f_blocks - fs.f_bfree) as u64 * fs.f_frsize as u64
+    }
+    fn staged() -> u64 {
+        std::fs::read_dir("/dev/shm")
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("sp1_") || name.starts_with("sem.sp1_")
+            })
+            .map(|e| {
+                use std::os::unix::fs::MetadataExt;
+                e.metadata().map(|m| m.blocks() * 512).unwrap_or(0)
+            })
+            .sum()
+    }
+    let worker =
+        PathBuf::from(std::env::var("ZKMINER_TEST_SP1_WORKER").expect("the worker to run"));
+    let dir = std::env::temp_dir().join(format!("zkminer-preempt-shm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let elf_path = dir.join("guest.elf");
+    let exported = std::process::Command::new(&worker)
+        .args(["--export-guest", "sha256-chain"])
+        .arg(&elf_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(exported.success());
+    let elf = std::fs::read(&elf_path).unwrap();
+    assert_eq!(staged(), 0, "another SP1 execution is using /dev/shm");
+    let used_before = tmpfs_used();
+
+    let mut env = HashMap::new();
+    env.insert(
+        zkminer_prover_protocol::types::SP1_MEASURE_ONLY_ENV.to_string(),
+        "1".to_string(),
+    );
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("sp1:measure:0", "sp1", worker, env)
+        .expect("failed to spawn the SP1 worker");
+    let pool = Arc::new(pool);
+    let measurer = {
+        let pool = Arc::clone(&pool);
+        let input = 2_000_000u32.to_le_bytes().to_vec();
+        std::thread::spawn(move || {
+            pool.execute_cycles(
+                "sp1",
+                &elf,
+                &input,
+                Some(Duration::from_secs(300)),
+                None,
+                None,
+            )
+        })
+    };
+    let started = Instant::now();
+    while staged() < 500 * 1024 * 1024 {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "it never staged"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let before = staged();
+    pool.test_preempt_all_inflight_measures();
+    let err = measurer.join().unwrap().expect_err("it was preempted");
+    assert!(
+        err.downcast_ref::<zkminer_prover_protocol::types::MeasurePreempted>()
+            .is_some(),
+        "{err:#}"
+    );
+    let after = staged();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(after, 0, "{before} bytes staged, {after} left behind");
+    // Not just the names: the pages themselves came back.
+    let started = Instant::now();
+    while tmpfs_used() > used_before + 4 * 1024 * 1024 {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{} bytes still in use in /dev/shm, {used_before} before it staged",
+            tmpfs_used()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A host OOM kills the largest process, which for SP1 is the server and not the worker, and the
+/// worker then exits on its own account. That must still read as a memory shortage, or a healthy card
+/// is excluded for what the host did. Needs a real OOM kill, so a worker adopted into a memory-capped
+/// scope, whose limit the mock lowers before it allocates, and so a systemd user manager:
+///
+///   cargo test -p zkminer-prover --features testing --test worker_lifecycle -- --ignored \\
+///     a_lost_server_after_a_host_oom_is_a_memory_shortage
+#[test]
+#[ignore = "needs a systemd user manager to cap the worker's memory"]
+fn a_lost_server_after_a_host_oom_is_a_memory_shortage() {
+    let code = zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST;
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    let mut env = mock_env("", "prove");
+    env.insert("MOCK_CRASH_CODE".to_string(), code.to_string());
+    env.insert("MOCK_SERVER_OOM".to_string(), "1".to_string());
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), env)
+        .expect("failed to spawn mock worker");
+
+    let e = pool
+        .prove("mock", &[], &[], None, Some(Duration::from_secs(120)), None)
+        .expect_err("this worker exits on the proof");
+    let shortage = e
+        .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+        .unwrap_or_else(|| panic!("not read as a host OOM: {e:#}"));
+    assert!(shortage.attempted);
+    assert_eq!(
+        pool.test_consecutive_failures("mock:generic"),
+        Some(0),
+        "a host OOM is not charged to the slot"
+    );
+}
+
 // ---- Normal operation (no timeout, no crash) ----
 
 #[test]
@@ -397,10 +611,10 @@ fn cycle_measurement_skips_a_recycled_slot() {
             pool.has_idle_worker("mock"),
             "the other worker is idle and live"
         );
-        let (cycles, _journal_len, _peak) = pool
-            .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None)
+        let m = pool
+            .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None, None)
             .expect("measurement must move on to the live worker");
-        assert_eq!(cycles, 1000);
+        assert_eq!(m.cycles, 1000);
         // Bring it back for the next round.
         pool.prove(gone, &[], &[], None, Some(Duration::from_secs(10)), None)
             .expect("respawn");
@@ -511,7 +725,7 @@ fn a_committed_proof_preempts_an_inflight_measurement_end_to_end() {
         let pool = Arc::clone(&pool);
         std::thread::spawn(move || {
             // A generous watchdog budget that we never reach — the preemption kills it first.
-            pool.execute_cycles("mock", &[], &[], Some(Duration::from_secs(120)), None)
+            pool.execute_cycles("mock", &[], &[], Some(Duration::from_secs(120)), None, None)
         })
     };
 
@@ -561,6 +775,48 @@ fn a_committed_proof_preempts_an_inflight_measurement_end_to_end() {
     );
 }
 
+/// The segment size a job is measured at, and the size its slot proves it at, reach the worker.
+#[test]
+fn the_segment_size_reaches_the_worker() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    let m = pool
+        .execute_cycles(
+            "mock",
+            &[],
+            &[],
+            Some(Duration::from_secs(10)),
+            None,
+            Some(18),
+        )
+        .expect("measurement should succeed");
+    assert_eq!(m.cycles, 1018);
+    // A job's size on its slot wins over the caller's `po2`.
+    let size_on = |k: &str| (k == "mock:generic").then_some(19);
+    let mut used = None;
+    let out = pool
+        .prove_min_vram(
+            "mock",
+            &[],
+            &[],
+            Some(20),
+            Some(Duration::from_secs(10)),
+            None,
+            None,
+            &[],
+            &[],
+            &mut used,
+            None,
+            Some(&size_on),
+            None,
+            None,
+            0,
+        )
+        .expect("proof should succeed");
+    assert_eq!((out.cycles, used.as_deref()), (1019, Some("mock:generic")));
+}
+
 /// A measurement that completes NORMALLY deregisters itself and leaves its slot healthy — the
 /// preemptible window is exactly the in-flight duration, nothing lingers in the registry.
 #[test]
@@ -569,10 +825,12 @@ fn a_normal_measurement_leaves_no_inflight_registration() {
     pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
         .expect("failed to spawn mock worker");
 
-    let (cycles, _journal, _peak) = pool
-        .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None)
+    let m = pool
+        .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None, None)
         .expect("measurement should succeed");
-    assert_eq!(cycles, 1000);
+    assert_eq!(m.cycles, 1000);
+    // The mock commits nothing: an empty journal, reported whole.
+    assert_eq!(m.journal.as_deref(), Some(&[][..]));
     assert_eq!(
         pool.test_inflight_measure_count(),
         0,

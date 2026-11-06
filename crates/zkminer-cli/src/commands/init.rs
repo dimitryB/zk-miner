@@ -2,11 +2,9 @@ use anyhow::Result;
 use std::path::Path;
 use zkminer_config::ZkMinerConfig;
 
-/// Hemi Testnet contract addresses (from deployment-hemi-testnet.csv).
-const TESTNET_HEMI_PROVE: &str = "0x9c554334629e2f6674a12b5c39aaad41d3bdb86c";
-const TESTNET_STAKING: &str = "0x1cf94bb8e30e2afdbb03e1722348b02839e1b625";
-const TESTNET_REGISTRY: &str = "0xd6d460b525e61410c2beeb9a43dfcdac1b40da1b";
-const TESTNET_TOKEN: &str = "0xc87f3282eb13324dccefeb14369b929428d0e29a";
+/// The live Hemi testnet deployment (743111, 2026-10-29). Every older 743111 stack is abandoned;
+/// `zkminer run` claims nothing on a config that names one (and pages).
+use zkminer_chain::deployment::HEMI_TESTNET_743111 as TESTNET;
 const TESTNET_RPC: &str = "https://testnet.rpc.hemi.network/rpc";
 use zkminer_chain::staking::TESTNET_CHAIN_ID;
 const MAINNET_CHAIN_ID: u64 = 43111;
@@ -34,10 +32,12 @@ pub fn run(
         "testnet" => {
             config.chain.rpc_url = TESTNET_RPC.to_string();
             config.chain.chain_id = TESTNET_CHAIN_ID;
-            config.contracts.hemi_prove = TESTNET_HEMI_PROVE.to_string();
-            config.contracts.hemi_prove_staking = TESTNET_STAKING.to_string();
-            config.contracts.hemi_prove_registry = TESTNET_REGISTRY.to_string();
-            config.contracts.hemi_token = TESTNET_TOKEN.to_string();
+            config.contracts.hemi_prove = TESTNET.router.to_string();
+            config.contracts.hemi_prove_staking = TESTNET.staking.to_string();
+            config.contracts.hemi_prove_registry = TESTNET.registry.to_string();
+            config.contracts.hemi_token = TESTNET.token.to_string();
+            config.contracts.program_registry = TESTNET.program_registry.to_string();
+            config.chain.scan_from_block = Some(TESTNET.scan_from_block);
         }
         "mainnet" => {
             config.chain.rpc_url = MAINNET_RPC.to_string();
@@ -59,16 +59,16 @@ pub fn run(
     println!();
     println!("Pre-configured for Hemi Testnet (chain ID {TESTNET_CHAIN_ID})");
     println!("  RPC:     {TESTNET_RPC}");
-    println!("  Router:  {TESTNET_HEMI_PROVE}");
-    println!("  Token:   {TESTNET_TOKEN} (tHEMI — has public mint())");
+    println!("  Router:  {}", TESTNET.router);
+    println!("  Token:   {} (tHEMI — owner-minted)", TESTNET.token);
     println!();
     println!("Next steps:");
     println!("  1. Set your private key:");
     println!("     export ZKMINER_PRIVATE_KEY=0xYOUR_KEY");
-    println!("  2. Fund your wallet with testnet ETH (for gas)");
-    println!("  3. Mint testnet HEMI tokens (via the Wallet screen)");
-    println!("  4. Stake at least 100 HEMI (via the Wallet screen)");
-    println!("  5. Run: zkminer run");
+    println!("  2. Get testnet ETH (gas) and tHEMI from the HemiProve team — tHEMI is minted only");
+    println!("     by its owner; you need at least 100 tHEMI per lock you want to hold at once");
+    println!("  3. Stake it (via the Wallet screen); claims start one block after the first stake");
+    println!("  4. Run: zkminer run");
 
     Ok(())
 }

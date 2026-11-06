@@ -221,10 +221,13 @@ pub struct RuntimeSettings {
     pub disabled_backends: HashSet<String>,
     /// Per-(device, backend) overrides — disabled combos.
     pub disabled_device_backends: HashSet<(String, String)>,
-    /// Whether advanced mode (po2 overrides) is enabled.
+    /// Whether advanced mode (po2 overrides) is enabled. The overrides apply only while it is.
     pub advanced_mode: bool,
-    /// Per-(device, backend) po2 overrides.
+    /// Per-(device, backend) po2 overrides, for this session.
     pub po2_overrides: HashMap<(String, String), u8>,
+    /// Each card's risc0 job size from the config (`prover.risc0_job_po2`), by benchmark device id;
+    /// a session override wins over it.
+    pub risc0_job_po2_config: HashMap<String, u8>,
     // Tunables
     pub max_concurrent_proofs: usize,
     /// Seconds of work to keep queued ahead per GPU. 0 = look-ahead off (one job per GPU).
@@ -236,13 +239,9 @@ pub struct RuntimeSettings {
     pub deadline_safety_margin: f64,
     pub token_price_usd: f64,
     pub gas_cost_usd: f64,
-    /// Whether to claim jobs carrying a non-zero `expectedJournalHash` (Phase-2
-    /// journal predicate). Default FALSE (skip them). A submitter can set an
-    /// unsatisfiable `expectedJournalHash`; our proof then reverts `JournalMismatch`
-    /// at fulfill and risks a collateral slash on timeout, and zkminer does not yet
-    /// simulate the predicate before claiming (reproducing the on-chain
-    /// `JOURNAL_PREDICATE_DOMAIN_V1` predicate is required first). Opt in only on a
-    /// deployment where you accept that risk.
+    /// Whether to claim journal-bound jobs (a non-zero `expectedJournalHash`). Each is claimed only
+    /// when the journal its (program, input) measured satisfies its binding. Default TRUE; `false`
+    /// claims only NONE jobs assigned to this prover.
     pub claim_predicate_jobs: bool,
 }
 
@@ -254,6 +253,7 @@ impl Default for RuntimeSettings {
             disabled_device_backends: HashSet::new(),
             advanced_mode: false,
             po2_overrides: HashMap::new(),
+            risc0_job_po2_config: HashMap::new(),
             max_concurrent_proofs: 1,
             queue_horizon_secs: 0, // look-ahead off by default: one job per GPU
             min_profit_threshold: 10.0,
@@ -263,7 +263,7 @@ impl Default for RuntimeSettings {
             deadline_safety_margin: 1.5,
             token_price_usd: 0.80,
             gas_cost_usd: 0.01,
-            claim_predicate_jobs: false,
+            claim_predicate_jobs: true,
         }
     }
 }
@@ -396,6 +396,10 @@ pub struct MinerState {
 
     // Benchmark
     pub benchmark_results: Option<BenchmarkSuite>,
+    /// Each risc0 card's job segment size (po2), by benchmark device id, as the miner decided it
+    /// (`zkminer_prover::benchmark::risc0_job_po2`): `None` for a card that proves no risc0 job.
+    /// Published by the brain; empty until it runs.
+    pub risc0_job_po2s: Vec<(String, Option<u8>)>,
     pub benchmark_running: bool,
     /// Which device is selected in the benchmark screen (0 = CPU, 1+ = GPUs).
     pub benchmark_selected_device: usize,
@@ -695,6 +699,7 @@ impl Default for MinerState {
             selected_job_index: 0,
             selected_job_id: None,
             benchmark_results: None,
+            risc0_job_po2s: Vec::new(),
             benchmark_running: false,
             benchmark_selected_device: 0,
             benchmark_device_in_progress: None,

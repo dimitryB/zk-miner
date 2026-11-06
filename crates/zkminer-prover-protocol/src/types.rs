@@ -10,7 +10,45 @@ use serde::{Deserialize, Serialize};
 /// so `#[serde(default)]` does NOT give cross-version back-compat on the wire — it only lets a
 /// SAME-version co-built binary that happens not to set the field decode as 0. The bump makes the
 /// handshake reject a mismatched (old) worker at spawn rather than fail cryptically at first Execute.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// 7: `ExecuteResult` gained `journal`, the bytes the host checks a job's journal binding against
+/// before claiming it.
+/// 8: no new field, a new meaning: risc0 `ExecuteResult.cycles` is the padded proving total (plus
+/// the keccak proofs), the `sys_rand` seed hashes the image id and the key comes from the miner. A
+/// v7 risc0 worker would measure in other units and seed guests differently from a v8 one proving
+/// the same job, so the handshake refuses it.
+/// 9: no new field, a new meaning: a risc0 worker measures and proves a job at `RISC0_SEGMENT_PO2`,
+/// refuses a job proof at any other, and executes with risc0's refusals of guests no proof of which
+/// can verify. A v8 worker would measure such a guest clean, and a v9 one refuses the po2 a v8 host
+/// may send.
+/// 10: `Execute` gained `po2`: the host measures a risc0 job at the segment size of each card that
+/// may prove it, and a job proof runs at its card's size, within [`RISC0_JOB_PO2_MIN`]..=
+/// [`RISC0_JOB_PO2_MAX`]. A v9 worker would measure every job at 20 whatever the host asked.
+pub const PROTOCOL_VERSION: u32 = 10;
+
+/// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
+///
+/// A guest can tell the size it runs at: every split leaves the pc it suspended at in memory the guest
+/// can read (its own kernel, or a copy through the sha ecall). So a measurement at one size says
+/// nothing about a proof at another, where one that measured clean could exit, or commit, otherwise.
+/// The host therefore measures a job at the size of every card that may prove it, and a card proves it
+/// at its own size; neither side leaves the size to the SDK (which picks 21 on a 32 GB card).
+pub const RISC0_DEFAULT_JOB_PO2: u8 = 20;
+
+/// The smallest segment size a risc0 job is measured or proven at. Below 16 the executor's segments
+/// hold little but their own overhead: at 15 a segment must split 25,000 cycles early to leave room
+/// for the longest instruction (a bigint2 ecall), leaving ~11% of it for the guest, and at 14 an
+/// instruction over 2,000 cycles past ~14,400 fails the execution outright. A job measured there would
+/// size every job far heavier than its other cards prove it, or refuse honest ones.
+pub const RISC0_JOB_PO2_MIN: u8 = 16;
+
+/// The largest segment size a risc0 job is measured or proven at: risc0's `DEFAULT_MAX_PO2`. The
+/// Groth16 prover refuses a larger segment ("segment po2 exceeds max on ProverOpts") although the
+/// executor runs it, so a job measured above it would fail every proof after its claim.
+pub const RISC0_JOB_PO2_MAX: u8 = 22;
+
+/// The longest journal an `ExecuteResult` carries. The router refuses a longer one on every fulfil
+/// path (`MAX_JOURNAL_BYTES`, `JournalTooLarge`), so a longer journal is reported by its length alone.
+pub const EXECUTE_JOURNAL_MAX_BYTES: usize = 32 * 1024;
 
 /// Maximum frame size: 256 MB (accommodates large risc0 composite receipts).
 pub const MAX_FRAME_SIZE: u32 = 256 * 1024 * 1024;
@@ -42,7 +80,7 @@ pub enum WorkerCommand {
         request_id: u64,
         elf: Vec<u8>,
         input_data: Vec<u8>,
-        /// Segment limit as log2 of rows. None = use SDK default.
+        /// Segment limit as log2 of rows. None = [`RISC0_DEFAULT_JOB_PO2`].
         /// Only meaningful for risc0; other backends accept but ignore.
         po2: Option<u8>,
         /// The job's on-chain `programId` (32 bytes), if the host knows it. For risc0 this is the
@@ -72,6 +110,10 @@ pub enum WorkerCommand {
         /// to the program they registered. `None` preserves the prior behaviour.
         #[serde(default)]
         program_id: Option<[u8; 32]>,
+        /// The segment size to execute at (risc0; other backends ignore it), which must be the size
+        /// the proof will run at. `None` = [`RISC0_DEFAULT_JOB_PO2`].
+        #[serde(default)]
+        po2: Option<u8>,
     },
     /// Cancel an in-flight proof. Worker should abort and send Cancelled or Error.
     Cancel { request_id: u64 },
@@ -132,7 +174,8 @@ pub enum WorkerResponse {
     ExecuteResult {
         request_id: u64,
         /// Total cycles reported by the executor — the same quantity `ProofResult.cycles`
-        /// carries, obtained without proving.
+        /// carries, obtained without proving (risc0: each segment padded to its power of two, not
+        /// the guest's user cycles).
         cycles: u64,
         /// How long the execution itself took, so the caller can bound future ones.
         duration_secs: f64,
@@ -155,6 +198,13 @@ pub enum WorkerResponse {
         /// bump to 6 rejects a mismatched worker at the handshake instead.
         #[serde(default)]
         peak_host_bytes: u64,
+        /// The journal itself (the same bytes as `journal_len` counts), so the host can check the
+        /// job's `expectedJournalHash` / `journalFields` binding before claiming. `None` when the
+        /// journal is longer than [`EXECUTE_JOURNAL_MAX_BYTES`] (no fulfil could carry it) or the
+        /// worker cannot vouch that a proof would commit the same bytes; the host then claims no
+        /// journal-bound job on this measurement. `Some(vec![])` is a guest that committed nothing.
+        #[serde(default)]
+        journal: Option<Vec<u8>>,
     },
     /// Progress update during proving.
     Progress {
@@ -215,6 +265,15 @@ pub enum ErrorKind {
     /// Catch-all for internal errors.
     Internal,
 }
+/// The exit code of a worker whose proving server is gone, or whose connection to it is unusable.
+///
+/// The SP1 SDK keeps one connection to the `sp1-gpu-server` it starts and never reconnects, so a
+/// worker that loses it can prove nothing more, and it exits for the dispatcher to replace it. Its
+/// server may have been killed by the host running out of memory, which the worker cannot tell, so
+/// the dispatcher reads this code as it reads a worker's own SIGKILL (see
+/// `WorkerHandle::died_of_host_oom`). 75 is `EX_TEMPFAIL`: another worker may well succeed.
+pub const WORKER_EXIT_SERVER_LOST: i32 = 75;
+
 /// Bytes of HOST memory a worker is allowed to use, as the dispatcher sees it.
 ///
 /// A worker cannot work this out for itself: the ceiling is the host's RAM minus the slice reserved
@@ -826,7 +885,7 @@ impl std::fmt::Display for WorkerProofError {
 impl std::error::Error for WorkerProofError {}
 
 /// True if a worker error message indicates a GPU out-of-memory / device
-/// allocation failure (CUDA or HIP/ROCm). Workers use this to tag such errors as
+/// allocation failure (CUDA, HIP/ROCm or Level Zero/SYCL). Workers use this to tag such errors as
 /// [`ErrorKind::ResourceExhausted`] so the dispatcher kills + respawns the worker
 /// with a clean GPU context instead of reusing a wedged one. Match is
 /// case-insensitive and covers the phrasings seen from the risc0/sp1 GPU stacks
@@ -842,6 +901,10 @@ pub fn is_gpu_oom(message: &str) -> bool {
         || m.contains("hip_error_out_of_memory")
         || m.contains("cudamalloc")
         || m.contains("hsa_status_error_out_of_resources")
+        // Level Zero and SYCL's Unified Runtime: ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY,
+        // UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ("Native API returns: 39"), and SYCL's own wording.
+        || m.contains("out_of_device_memory")
+        || m.contains("out of device memory")
 }
 
 /// A single benchmark measurement from a worker.
@@ -1142,6 +1205,12 @@ mod tests {
         assert!(is_gpu_oom("CUDA_ERROR_OUT_OF_MEMORY"));
         assert!(is_gpu_oom("hipErrorOutOfMemory"));
         assert!(is_gpu_oom("cudaMalloc failed"));
+        assert!(is_gpu_oom(
+            "Native API failed. Native API returns: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)"
+        ));
+        assert!(is_gpu_oom(
+            "zeMemAllocDevice: ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY"
+        ));
         // Non-OOM proof failures must NOT be misclassified as ResourceExhausted.
         assert!(!is_gpu_oom(
             "Proof verification FAILED — SP1 proof is invalid"
@@ -1176,6 +1245,31 @@ mod tests {
                 assert_eq!(program_id, Some([7u8; 32]));
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn execute_carries_the_segment_size_to_measure_at() {
+        for po2 in [None, Some(RISC0_JOB_PO2_MIN), Some(19)] {
+            let cmd = WorkerCommand::Execute {
+                request_id: 7,
+                elf: vec![1],
+                input_data: vec![2],
+                program_id: Some([3u8; 32]),
+                po2,
+            };
+            let bytes = bincode::serialize(&cmd).unwrap();
+            match bincode::deserialize::<WorkerCommand>(&bytes).unwrap() {
+                WorkerCommand::Execute {
+                    po2: got,
+                    program_id,
+                    ..
+                } => {
+                    assert_eq!(got, po2);
+                    assert_eq!(program_id, Some([3u8; 32]));
+                }
+                _ => panic!("wrong variant"),
+            }
         }
     }
 

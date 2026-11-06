@@ -53,7 +53,7 @@ pub(crate) struct WarmupReport {
 /// Installs the Groth16 circuit artifacts if they are not installed, and builds the stripped
 /// circuit where the server supports it.
 pub(crate) fn warm_up() -> Result<WarmupReport> {
-    let dir = sp1_sdk::install::groth16_circuit_artifacts_dir()
+    let dir = sp1_prover::build::groth16_circuit_artifacts_dir()
         .context("cannot locate the Groth16 circuit artifacts directory")?;
     let started = Instant::now();
     let installed = ensure_installed(&dir, download)?;
@@ -87,7 +87,21 @@ pub(crate) fn server_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .ok_or_else(|| anyhow!("$HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".sp1/bin/sp1-gpu-server"))
+    Ok(PathBuf::from(home).join(".sp1/bin").join(server_name()))
+}
+
+/// The build of `sp1-gpu-server` this worker's SDK runs: `SP1_GPU_SERVER_NAME` (set by the dispatcher
+/// for an AMD or Intel card, hemilabs/sp1 #19), else the SDK's default, the CUDA build.
+pub(crate) fn server_name() -> String {
+    std::env::var("SP1_GPU_SERVER_NAME")
+        .ok()
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+        .unwrap_or_else(|| "sp1-gpu-server".to_string())
+}
+
+/// Whether this worker drives a CUDA card (the default server), rather than the HIP or SYCL build.
+pub(crate) fn drives_cuda() -> bool {
+    server_name() == "sp1-gpu-server"
 }
 
 /// How the artifacts came to be in place.

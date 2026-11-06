@@ -160,9 +160,30 @@
         "name": "prover",
         "type": "address",
         "internalType": "address"
+      },
+      {
+        "name": "priceFloor",
+        "type": "uint96",
+        "internalType": "uint96"
+      },
+      {
+        "name": "premiumFloor",
+        "type": "uint96",
+        "internalType": "uint96"
+      },
+      {
+        "name": "reservedOnly",
+        "type": "bool",
+        "internalType": "bool"
       }
     ],
-    "outputs": [],
+    "outputs": [
+      {
+        "name": "price",
+        "type": "uint96",
+        "internalType": "uint96"
+      }
+    ],
     "stateMutability": "nonpayable"
   },
   {
@@ -369,9 +390,54 @@
         "name": "jobId",
         "type": "bytes32",
         "internalType": "bytes32"
+      },
+      {
+        "name": "priceFloor",
+        "type": "uint96",
+        "internalType": "uint96"
+      },
+      {
+        "name": "premiumFloor",
+        "type": "uint96",
+        "internalType": "uint96"
       }
     ],
-    "outputs": [],
+    "outputs": [
+      {
+        "name": "price",
+        "type": "uint96",
+        "internalType": "uint96"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "claimJobBatch",
+    "inputs": [
+      {
+        "name": "jobIds",
+        "type": "bytes32[]",
+        "internalType": "bytes32[]"
+      },
+      {
+        "name": "priceFloors",
+        "type": "uint96[]",
+        "internalType": "uint96[]"
+      },
+      {
+        "name": "premiumFloors",
+        "type": "uint96[]",
+        "internalType": "uint96[]"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "results",
+        "type": "bool[]",
+        "internalType": "bool[]"
+      }
+    ],
     "stateMutability": "nonpayable"
   },
   {
@@ -387,9 +453,25 @@
         "name": "prover",
         "type": "address",
         "internalType": "address"
+      },
+      {
+        "name": "priceFloor",
+        "type": "uint96",
+        "internalType": "uint96"
+      },
+      {
+        "name": "premiumFloor",
+        "type": "uint96",
+        "internalType": "uint96"
       }
     ],
-    "outputs": [],
+    "outputs": [
+      {
+        "name": "price",
+        "type": "uint96",
+        "internalType": "uint96"
+      }
+    ],
     "stateMutability": "nonpayable"
   },
   {
@@ -487,49 +569,6 @@
         "name": "",
         "type": "bool",
         "internalType": "bool"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "eip712Domain",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "fields",
-        "type": "bytes1",
-        "internalType": "bytes1"
-      },
-      {
-        "name": "name",
-        "type": "string",
-        "internalType": "string"
-      },
-      {
-        "name": "version",
-        "type": "string",
-        "internalType": "string"
-      },
-      {
-        "name": "chainId",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "verifyingContract",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "salt",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "extensions",
-        "type": "uint256[]",
-        "internalType": "uint256[]"
       }
     ],
     "stateMutability": "view"
@@ -781,19 +820,6 @@
         "name": "excludeFromEwma",
         "type": "bool",
         "internalType": "bool"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "localPauseTimestamp",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "",
-        "type": "uint40",
-        "internalType": "uint40"
       }
     ],
     "stateMutability": "view"
@@ -1241,6 +1267,16 @@
             "name": "extraVerifierData",
             "type": "bytes",
             "internalType": "bytes"
+          },
+          {
+            "name": "expectedJournalHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "journalFields",
+            "type": "bytes32",
+            "internalType": "bytes32"
           }
         ]
       },
@@ -1443,6 +1479,16 @@
             "name": "extraVerifierData",
             "type": "bytes",
             "internalType": "bytes"
+          },
+          {
+            "name": "expectedJournalHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "journalFields",
+            "type": "bytes32",
+            "internalType": "bytes32"
           }
         ]
       },
@@ -1620,6 +1666,16 @@
         "name": "callbackContract",
         "type": "address",
         "internalType": "address"
+      },
+      {
+        "name": "expectedJournalHash",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "journalFields",
+        "type": "bytes32",
+        "internalType": "bytes32"
       }
     ],
     "outputs": [
@@ -1679,6 +1735,16 @@
             "name": "extraVerifierData",
             "type": "bytes",
             "internalType": "bytes"
+          },
+          {
+            "name": "expectedJournalHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "journalFields",
+            "type": "bytes32",
+            "internalType": "bytes32"
           }
         ]
       },
@@ -1934,37 +2000,6 @@
   },
   {
     "type": "event",
-    "name": "BidForfeited",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "bidder",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "forfeitedCollateral",
-        "type": "uint96",
-        "indexed": false,
-        "internalType": "uint96"
-      },
-      {
-        "name": "newBonusAmount",
-        "type": "uint96",
-        "indexed": false,
-        "internalType": "uint96"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
     "name": "BidInvalidated",
     "inputs": [
       {
@@ -2121,112 +2156,6 @@
   {
     "type": "event",
     "name": "CallbackFailed",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "callbackContract",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "reason",
-        "type": "bytes",
-        "indexed": false,
-        "internalType": "bytes"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "CallbackForceAccepted",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "callbackContract",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "totalRejections",
-        "type": "uint8",
-        "indexed": false,
-        "internalType": "uint8"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "CallbackForceAcceptedSplit",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "callbackContract",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "proverShare",
-        "type": "uint96",
-        "indexed": false,
-        "internalType": "uint96"
-      },
-      {
-        "name": "callerRefundExtra",
-        "type": "uint96",
-        "indexed": false,
-        "internalType": "uint96"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "CallbackRejected",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "callbackContract",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "rejectionCount",
-        "type": "uint8",
-        "indexed": false,
-        "internalType": "uint8"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "CallbackRevertAccepted",
     "inputs": [
       {
         "name": "jobId",
@@ -2574,37 +2503,6 @@
   },
   {
     "type": "event",
-    "name": "DeadlinesExtended",
-    "inputs": [
-      {
-        "name": "jobIds",
-        "type": "bytes32[]",
-        "indexed": false,
-        "internalType": "bytes32[]"
-      },
-      {
-        "name": "extension",
-        "type": "uint40",
-        "indexed": false,
-        "internalType": "uint40"
-      },
-      {
-        "name": "reason",
-        "type": "string",
-        "indexed": false,
-        "internalType": "string"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "EIP712DomainChanged",
-    "inputs": [],
-    "anonymous": false
-  },
-  {
-    "type": "event",
     "name": "EwmaExclusionUpdated",
     "inputs": [
       {
@@ -2643,6 +2541,38 @@
         "type": "uint16",
         "indexed": false,
         "internalType": "uint16"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "FirstPauseMarked",
+    "inputs": [
+      {
+        "name": "firstPauseA",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "firstPauseR",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "FormerBurnDestinationRegistered",
+    "inputs": [
+      {
+        "name": "burnDestination",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
       }
     ],
     "anonymous": false
@@ -2789,10 +2719,10 @@
         "internalType": "uint256"
       },
       {
-        "name": "bonusIncluded",
-        "type": "bool",
+        "name": "bonusBurned",
+        "type": "uint256",
         "indexed": false,
-        "internalType": "bool"
+        "internalType": "uint256"
       }
     ],
     "anonymous": false
@@ -3129,6 +3059,80 @@
   },
   {
     "type": "event",
+    "name": "KeyClockSet",
+    "inputs": [
+      {
+        "name": "key",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "active",
+        "type": "bool",
+        "indexed": false,
+        "internalType": "bool"
+      },
+      {
+        "name": "a",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "t",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "c",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "epoch",
+        "type": "uint24",
+        "indexed": false,
+        "internalType": "uint24"
+      },
+      {
+        "name": "prevEnd",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "KeyEpochCut",
+    "inputs": [
+      {
+        "name": "routerBase",
+        "type": "bool",
+        "indexed": false,
+        "internalType": "bool"
+      },
+      {
+        "name": "epoch",
+        "type": "uint24",
+        "indexed": false,
+        "internalType": "uint24"
+      },
+      {
+        "name": "firstPause",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "MaxEwmaBootstrapPriceUpdated",
     "inputs": [
       {
@@ -3388,6 +3392,25 @@
   },
   {
     "type": "event",
+    "name": "PauseClockSet",
+    "inputs": [
+      {
+        "name": "anchor",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "total",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "Paused",
     "inputs": [
       {
@@ -3621,31 +3644,6 @@
   },
   {
     "type": "event",
-    "name": "SlashClaimFulfillPartialRevert",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "prover",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "reason",
-        "type": "bytes",
-        "indexed": false,
-        "internalType": "bytes"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
     "name": "SlashExecutedCancelDeferred",
     "inputs": [
       {
@@ -3672,6 +3670,31 @@
         "type": "uint16",
         "indexed": false,
         "internalType": "uint16"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "UnionClockSet",
+    "inputs": [
+      {
+        "name": "anchor",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "total",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "registryPaused",
+        "type": "bool",
+        "indexed": false,
+        "internalType": "bool"
       }
     ],
     "anonymous": false
@@ -3772,6 +3795,37 @@
   },
   {
     "type": "error",
+    "name": "ClaimBelowFloor",
+    "inputs": [
+      {
+        "name": "jobId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "price",
+        "type": "uint96",
+        "internalType": "uint96"
+      },
+      {
+        "name": "priceFloor",
+        "type": "uint96",
+        "internalType": "uint96"
+      },
+      {
+        "name": "premiumCap",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "premiumFloor",
+        "type": "uint96",
+        "internalType": "uint96"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "CollateralOverflow",
     "inputs": [
       {
@@ -3789,6 +3843,28 @@
         "name": "jobId",
         "type": "bytes32",
         "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "CustomVerifierHasNoCode",
+    "inputs": [
+      {
+        "name": "verifier",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "CustomVerifierIsDelegated",
+    "inputs": [
+      {
+        "name": "verifier",
+        "type": "address",
+        "internalType": "address"
       }
     ]
   },
@@ -3875,6 +3951,22 @@
   },
   {
     "type": "error",
+    "name": "DescriptorTooLarge",
+    "inputs": [
+      {
+        "name": "size",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "max",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "EmptyBatch",
     "inputs": []
   },
@@ -3924,6 +4016,11 @@
         "internalType": "uint128"
       }
     ]
+  },
+  {
+    "type": "error",
+    "name": "InvalidBidConfig",
+    "inputs": []
   },
   {
     "type": "error",
@@ -3992,6 +4089,17 @@
   },
   {
     "type": "error",
+    "name": "InvalidJournalBinding",
+    "inputs": [
+      {
+        "name": "reason",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "InvalidRampUpConfig",
     "inputs": []
   },
@@ -4003,6 +4111,22 @@
         "name": "period",
         "type": "uint40",
         "internalType": "uint40"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "InvalidSpeedPremium",
+    "inputs": [
+      {
+        "name": "speedPremium",
+        "type": "uint96",
+        "internalType": "uint96"
+      },
+      {
+        "name": "maxPrice",
+        "type": "uint96",
+        "internalType": "uint96"
       }
     ]
   },
@@ -4131,6 +4255,17 @@
   },
   {
     "type": "error",
+    "name": "NotReserved",
+    "inputs": [
+      {
+        "name": "jobId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "NothingToWithdraw",
     "inputs": []
   },
@@ -4200,6 +4335,17 @@
   },
   {
     "type": "error",
+    "name": "RegistryPaused",
+    "inputs": [
+      {
+        "name": "jobId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "ReleaseCooldownActive",
     "inputs": [
       {
@@ -4232,7 +4378,12 @@
   },
   {
     "type": "error",
-    "name": "StakingAgeTooYoung",
+    "name": "SpeedPremiumOnCompetitiveJob",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "StakingBlockDelayNotMet",
     "inputs": [
       {
         "name": "prover",
@@ -4240,14 +4391,9 @@
         "internalType": "address"
       },
       {
-        "name": "depositTimestamp",
+        "name": "depositBlock",
         "type": "uint40",
         "internalType": "uint40"
-      },
-      {
-        "name": "minAge",
-        "type": "uint256",
-        "internalType": "uint256"
       }
     ]
   },

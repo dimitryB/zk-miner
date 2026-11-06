@@ -50,6 +50,9 @@ pub enum MonitorEvent {
     /// A job was cancelled by its submitter (terminal — prover stays ZERO, so a
     /// per-tick prover check alone never evicts it from the candidate set).
     JobCancelled { job_id: B256, caller: Address },
+    /// Every event up to the startup head has been delivered: events received BEFORE this one are
+    /// the startup backfill (HISTORY — mostly settled jobs), events after it are live. Sent once.
+    BackfillComplete,
     /// Monitor error (non-fatal).
     Error(String),
 }
@@ -67,7 +70,7 @@ static JOB_CLAIMED_TOPIC0: std::sync::LazyLock<B256> = std::sync::LazyLock::new(
     alloy::primitives::keccak256("JobClaimed(bytes32,address,address,uint96,uint96,uint40)")
 });
 static JOB_CANCELLED_TOPIC0: std::sync::LazyLock<B256> = std::sync::LazyLock::new(|| {
-    alloy::primitives::keccak256("JobCancelled(bytes32,address,uint256,bool)")
+    alloy::primitives::keccak256("JobCancelled(bytes32,address,uint256,uint256)")
 });
 
 /// Canonical topic0 for JobSubmitted.
@@ -152,7 +155,16 @@ impl JobMonitor {
             }
         };
         // Rewind so the first poll backfills jobs already Open at startup.
-        let mut last_block = head.saturating_sub(self.backfill_blocks);
+        // ...but never below the deployment's first block (no HemiProve log exists there). A
+        // "rewind to the deployment" default (u64::MAX) on a chain with NO known first block would mean
+        // scanning from genesis: cap it at a bounded window instead.
+        const UNKNOWN_DEPLOYMENT_BACKFILL: u64 = 5_000;
+        let backfill = if self.backfill_blocks == u64::MAX && self.client.scan_from_block == 0 {
+            UNKNOWN_DEPLOYMENT_BACKFILL
+        } else {
+            self.backfill_blocks
+        };
+        let mut last_block = scanned_through_at_start(head, backfill, self.client.scan_from_block);
         // The head at startup: JobClaimed events at or below this block
         // are HISTORICAL and must not prune (see the suppression in the log loop).
         let startup_head = head;
@@ -160,9 +172,9 @@ impl JobMonitor {
         tracing::info!(
             "Job monitor started, polling every {:?} from block {} (head {}, backfill {} blocks)",
             self.poll_interval,
-            last_block,
+            last_block + 1,
             head,
-            self.backfill_blocks,
+            head - last_block,
         );
 
         // Event signatures. The filter watches JobClaimed/JobCancelled too (one
@@ -181,8 +193,16 @@ impl JobMonitor {
         const MONITOR_RATE_LIMITED_POLL: Duration = Duration::from_secs(30);
         const MONITOR_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(30);
         let mut last_query = tokio::time::Instant::now();
+        let mut backfill_announced = false;
 
         loop {
+            // The backfill range is fully delivered once `last_block` reaches the startup head.
+            if !backfill_announced && last_block >= startup_head {
+                backfill_announced = true;
+                if tx.send(MonitorEvent::BackfillComplete).await.is_err() {
+                    return Ok(());
+                }
+            }
             poll_timer.tick().await;
 
             // Skip this tick's query only while STILL rate-limited AND we polled recently.
@@ -374,7 +394,7 @@ fn parse_job_claimed_log(log: &Log) -> Option<MonitorEvent> {
 
 /// Parse a JobCancelled log.
 /// `JobCancelled(bytes32 indexed jobId, address indexed caller, uint256 refundAmount,
-///               bool bonusIncluded)`
+///               uint256 bonusBurned)`
 fn parse_job_cancelled_log(log: &Log) -> Option<MonitorEvent> {
     let topics = log.topics();
     // topic0 + jobId + caller.
@@ -434,10 +454,30 @@ fn parse_job_submitted_log(log: &Log) -> Option<MonitorEvent> {
     })
 }
 
+/// The block the monitor treats as already scanned when it starts: each poll scans from the block
+/// after it. `backfill` blocks back from `head`, but never below `scan_from_block`, the first block
+/// to scan (the deployment's first block), and never above `head`.
+fn scanned_through_at_start(head: u64, backfill: u64, scan_from_block: u64) -> u64 {
+    head.saturating_sub(backfill)
+        .max(scan_from_block.saturating_sub(1).min(head))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::{keccak256, Bytes, LogData};
+
+    #[test]
+    fn the_first_block_scanned_is_scan_from_block_itself() {
+        // A long backfill stops at the deployment's first block, which is still scanned.
+        assert_eq!(scanned_through_at_start(10_000, u64::MAX, 7_000), 6_999);
+        // A short backfill starts above it.
+        assert_eq!(scanned_through_at_start(10_000, 500, 7_000), 9_500);
+        // No floor: the backfill alone.
+        assert_eq!(scanned_through_at_start(10_000, 500, 0), 9_500);
+        // A floor above the head (a node behind the deployment) scans nothing yet.
+        assert_eq!(scanned_through_at_start(5_000, 500, 7_000), 5_000);
+    }
 
     fn mk_log(topics: Vec<B256>, data: Vec<u8>) -> Log {
         Log {
