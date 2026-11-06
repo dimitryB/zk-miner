@@ -1,5 +1,27 @@
 # macOS proving handoff
 
+## Controlled final reading — 2026-11-06
+
+The updated Phase 2 brief SHA-256 is
+`c7cd2ab3cf8f6f67fb4deeabfd9ed86c28d24aa98c0e7c1a7b578640718d475d`.
+The sealed WP8-lite manifest SHA-256 is
+`c8d537ec642be3edc7d3baec9763084b3d492cb8fd3af7ffdaa8c7556dc39574`.
+On that unchanged checkpoint, a browser-closed run at the default 16 GiB
+reserve, po2 20, 18 Rayon/Go threads and the unchanged verifier gave five
+measured complete-proof medians of **48.458 s** arithmetic 10M,
+**49.511 s** hashing 10M and **165.835 s** arithmetic 46M. One complete
+warmup per fixture was excluded. All 18 proofs verified and all 54 tamper
+checks rejected. The maximum guard footprint was 19.24 GiB with normal
+pressure throughout. Thermal telemetry read nominal at the start and fair
+later; Codex, Claude and Colima remained present in all host snapshots.
+The minimum 55/55/220 s line is met; the desirable 45/45/180 s line is
+met only for 46M. See [validated evidence](evidence/phase2-controlled-final.json),
+[proof rows](evidence/phase2-controlled-final.csv) and
+[reproduction notes](BENCHMARKS.md).
+
+Next: WP6 cold start and WP7 admission, followed by the revised one-hour
+identity profile. WP8 needs an owner decision after the profile.
+
 ## WP8-lite native wrap overlap — 2026-11-06
 
 The revised brief SHA-256 is
@@ -27,8 +49,8 @@ The [validation record](evidence/phase2-wp8lite-validation.json) binds
 lifecycle/recovery proofs, 63 tamper rejections, a 17.86% idle-footprint
 decrease, no helper after cancellation during identity or wrap, input
 limits, five CPU-only tests and three offline Linux feature paths.
-WP8-lite is closed with a timing-gate miss. Next is the controlled final
-absolute-line reading at the default 16 GiB reserve, then WP6/WP7.
+WP8-lite is closed with a timing-gate miss. Its controlled final absolute
+reading is above; WP6/WP7 are next.
 
 ## WP1b evalfast hot slab and chain tails — 2026-11-06
 
@@ -62,9 +84,8 @@ verified with 108 tamper rejections, normal memory pressure, and a
 fallback, input limits, five CPU-only unit tests and three offline Linux
 feature paths. The 20-request lifecycle and recovery proof verified 21
 proofs with 63 tamper rejections; idle footprint decreased 7.06%.
-WP1b is closed and WP8-lite is next. The package-gate 10M medians are
-below 55 s, but the final absolute line still needs a controlled default
-16 GiB reserve reading.
+WP1b closed before WP8-lite. Its package-gate 10M medians were below
+55 s; the controlled default-reserve final reading is recorded above.
 
 ## WP4 recursion evaluator — 2026-11-06
 

@@ -1,5 +1,46 @@
 # macOS proving measurements
 
+## Controlled final absolute reading — 2026-11-06
+
+The revised brief SHA-256 is
+`c7cd2ab3cf8f6f67fb4deeabfd9ed86c28d24aa98c0e7c1a7b578640718d475d`.
+The WP8-lite checkpoint was sealed with manifest SHA-256
+`c8d537ec642be3edc7d3baec9763084b3d492cb8fd3af7ffdaa8c7556dc39574`.
+The source-bound worker, unchanged external verifier and active helper bundle
+were fixed. Each fixture ran one excluded complete warmup and five measured
+complete proofs at po2 20 with segment pipelining and 18 Rayon/Go threads.
+The default 16 GiB host reserve was used without an override. Brave was
+absent at every fixture boundary. Thermal telemetry reported nominal at
+campaign start and fair at later boundaries; its nominal reading may also
+mean unknown, as the recorder flags. Codex, Claude and Colima were present
+at every snapshot.
+
+| Median of five complete proofs | Reading | Minimum | Desirable |
+| --- | ---: | ---: | ---: |
+| Arithmetic 10M | 48.458 s | ≤55 s, met | ≤45 s, missed |
+| Hashing 10M | 49.511 s | ≤55 s, met | ≤45 s, missed |
+| Arithmetic 46M | 165.835 s | ≤220 s, met | ≤180 s, met |
+
+All 18 complete proofs passed the unchanged verifier and all 54 tamper
+checks rejected. The largest owned worker/helper guard footprint was
+19.24 GiB, below the 32 GiB ceiling, and memory pressure stayed normal on
+every proof. The 10M median stage times were 25.279/26.639 s for execution
+plus segments, 5.796/5.753 s for recursion, and 17.224/17.003 s for
+identity plus wrap (arithmetic/hashing). Full ranges, per-proof stage and
+GPU timings, host observations, source hashes and memory readings are in
+[the validated campaign](evidence/phase2-controlled-final.json) and
+[all proof rows](evidence/phase2-controlled-final.csv). The
+[WP8-lite validation](evidence/phase2-wp8lite-validation.json) binds the
+same worker to the earlier differential, lifecycle, input-limit and Linux
+feature checks.
+
+To reproduce on the sealed checkpoint, run
+`python3 scripts/macos/phase2-run-controlled-final.py`, then
+`python3 scripts/macos/phase2-collect-controlled-final.py <campaign-directory>`
+from the miner repository. The driver rejects a changed worker, verifier or
+helper manifest, a checkpoint with a different recorded spec digest, or a
+browser-open preflight.
+
 ## WP8-lite native wrap overlap — 2026-11-06
 
 The revised brief SHA-256 is
@@ -38,8 +79,8 @@ The [validation record](evidence/phase2-wp8lite-validation.json) binds
 exact real-witness CPU checks at po2 14/18/20 (22/1/1 checks), 21 verified
 lifecycle/recovery proofs and 63 tamper rejections, a 17.86% idle-footprint
 decrease, helper cleanup during identity and wrap, input limits, five
-CPU-only unit tests and three offline Linux feature paths. The final
-absolute-line reading still requires the controlled default 16 GiB reserve.
+CPU-only unit tests and three offline Linux feature paths. The controlled
+default-reserve absolute reading is recorded above.
 
 ## WP1b evalfast hot slab and chain tails — 2026-11-06
 
@@ -80,8 +121,7 @@ covers exact real-witness CPU checks at po2 14/18/20, the verified
 20-request lifecycle and recovery proof, a 7.06% idle-footprint decrease,
 the tail-split fallback, input limits, five CPU-only unit tests and three
 offline Linux feature paths. These package-gate measurements used an 8 GiB
-reserve; the final absolute-line reading requires the spec's controlled
-default 16 GiB reserve.
+reserve; the controlled final reading at the default 16 GiB reserve is above.
 
 ## WP4 recursion evaluator — 2026-11-06
 

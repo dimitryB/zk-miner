@@ -1,5 +1,34 @@
 # Phase 2: Metal proving performance on macOS
 
+## Controlled final reading — revised brief, 2026-11-06
+
+The latest re-export SHA-256 is
+`c7cd2ab3cf8f6f67fb4deeabfd9ed86c28d24aa98c0e7c1a7b578640718d475d`.
+The unchanged WP8-lite worker is sealed at
+`target/macos/phase2/wp8lite-checkpoint/` (manifest SHA-256
+`c8d537ec642be3edc7d3baec9763084b3d492cb8fd3af7ffdaa8c7556dc39574`).
+The absolute reading uses the default 16 GiB reserve, a closed browser,
+nominal thermal state at the start, po2 20 with segment pipelining, 18
+Rayon/Go threads, and the same unchanged verifier. Each of the arithmetic
+10M, hashing 10M and arithmetic 46M fixtures gets one excluded complete
+warmup and five measured complete proofs. The minimum lines are 55 s at
+10M and 220 s at 46M; the desirable lines are 45 s and 180 s. The WP8-lite
+validation record binds the final worker to its lifecycle, differential and
+input-limit checks.
+
+The sealed checkpoint campaign passed all 18 complete proofs and 54 tamper
+rejections. Five measured medians were **48.458 s** arithmetic 10M,
+**49.511 s** hashing 10M and **165.835 s** arithmetic 46M. All three meet
+the minimum line; the 46M stretch meets its desirable line, while both 10M
+fixtures miss the 45 s desirable line. The maximum guard footprint was
+19.24 GiB under the 32 GiB ceiling, with normal memory pressure on every
+proof. The browser was absent at every fixture boundary; thermal state was
+reported nominal at the start and fair thereafter. Codex, Claude and Colima
+were present throughout and are recorded in the host snapshots. See
+`evidence/phase2-controlled-final.json` and `.csv`. WP6/WP7 precede the
+new one-hour identity profile; WP8 requires an owner decision after that
+profile.
+
 ## WP8-lite scope — native wrap overlap, 2026-11-06
 
 The revised brief SHA-256 is
@@ -38,7 +67,7 @@ Cancellation during identity and wrap left no owned helper, and separate
 real-helper parent-death probes during key loading and proving exited
 without a proof. See `evidence/phase2-wp8lite-validation.json`.
 The controlled final absolute-line reading at the default 16 GiB reserve
-is next, followed by WP6/WP7.
+is recorded above; WP6/WP7 are next.
 
 ## WP1b scope — remaining evalfast passes, 2026-11-06
 
