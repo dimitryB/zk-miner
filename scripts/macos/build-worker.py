@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build a source-bound CPU or Metal Mac worker; preserve the root Git-source lock."""
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -83,7 +84,7 @@ def main():
         metadata_feature = "zkminer-prove-risc0/" + feature
     if args.mode == "native-rv32im-metal":
         feature = "macos-rv32im-metal,risc0-zkvm/metal-rv32im,risc0-zkvm/metal-recursion,risc0-groth16/native-groth16"
-        metadata_feature = "zkminer-prove-risc0/" + feature
+        metadata_feature = "zkminer-prove-risc0/macos-rv32im-metal,risc0-zkvm/metal-rv32im,risc0-zkvm/metal-recursion,risc0-groth16/native-groth16"
     snapshot(args.mode, engine, config, env)
     try:
         subprocess.run(["cargo", "+1.93.0", "build", "-p", "zkminer-prove-risc0", "--bin", "zkminer-prove-risc0",
@@ -112,7 +113,42 @@ def main():
         lock.write_bytes(original)
         print("root Git-source lock restored; local worker lock and metadata retained")
     # Source snapshot compares the restored original lock, not its temporary path-source form.
-    seal(args.mode, engine, config, env)
+    manifest = seal(args.mode, engine, config, env)
+    if args.mode == "native-rv32im-metal":
+        # Compile and run the freshly built Metal worker once before shipping it.
+        # The acceptance harness independently verifies the complete proof and
+        # three tamper rejections; its setup time is separate from proof time.
+        command = ["python3", str(root / "scripts/macos/test-native-worker.py"),
+                   "--engine", str(engine), "--worker-kind", args.mode,
+                   "--segment-hal", "metal", "--recursion-hal", "metal",
+                   "--workload", "segment-boundary", "--iterations", "1",
+                   "--po2", "14", "--repeat", "1", "--proof-only",
+                   "--rayon-threads", "18", "--go-threads", "18",
+                   "--timeout-seconds", "1800"]
+        try:
+            run = subprocess.run(command, cwd=root, env=env, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 timeout=2400)
+        except BaseException:
+            artifacts["manifest"].unlink(missing_ok=True)
+            raise
+        if run.returncode != 0:
+            artifacts["manifest"].unlink()
+            raise RuntimeError(f"build-time proof failed ({run.returncode}): {run.stdout[-4000:]}")
+        run_dir = Path(run.stdout.splitlines()[0])
+        result = json.loads((run_dir / "result.json").read_text())
+        timing = json.loads((run_dir / "acceptance/proof-0/timing.json").read_text())
+        if result["status"] != "passed" or result["results"]["verified_proofs"] != 1:
+            raise RuntimeError("build-time po2-14 warm-up did not complete and verify")
+        manifest["first_proof_warmup"] = {
+            "run_dir": str(run_dir), "workload": "segment-boundary",
+            "po2": 14, "complete_proofs": 1, "tamper_rejections": 3,
+            "prove_call_ms": timing["prove_call_ms"],
+            "request_to_first_completed_gpu_dispatch_ms": timing["request_to_first_completed_gpu_dispatch_ms"],
+            "external_verifier_ms": timing["external_verifier_ms"],
+        }
+        artifacts["manifest"].write_text(json.dumps(manifest, indent=2) + "\n")
+        print(f"build-time po2-14 Metal proof verified in {timing['prove_call_ms'] / 1000:.3f}s")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,35 @@
 # macOS proving handoff
 
+## WP6b warm gates and correctness — 2026-11-06
+
+WP6b engine `7816a0002642bf97bbcdd82bd55ebaa22d84ad80` starts native
+bundle manifest hashing during worker preflight and joins before witness or
+helper use. Its `sha2/asm-aarch64` path is present in the source-bound
+dependency tree; size, mtime, inode and device identities are checked before
+trusting the result. A cloned bundle with a corrupted `prover` byte still
+handshook, then failed the proof with the existing hash-mismatch message
+before a helper spawned. The WP6 archive PR remains draft and unmerged, with
+the [miss diagnosis comment](https://github.com/dimitryB/risc0/pull/1#issuecomment-6697430623).
+
+The final worker SHA-256 is
+`f65ff7a374e4471404d9bc52dab57d010e12cb5af4d0f5197053b0f8107060ab`.
+With browsers closed and the default 8 GiB reserve, sealed pre-WP6b
+spawn-to-handshake was 4.619 s median of three, versus 0.107 s for WP6b.
+The mandatory build-time po2-14 proof took 29.164 s and verified. Its first
+post-build direct proof reached a completed GPU dispatch 57.1 ms after the
+request; the unchanged verifier and three tamper checks passed. The exact
+final worker also passed 21 lifecycle/recovery proofs and 63 tamper checks,
+po2-14/18/20 segment and recursion CPU differentials, nine limit controls,
+and a macOS CPU-only build. Idle RSS rose 1.03% from request 1 to 20.
+Thermal was nominal during validation and fair afterward. The Linux CPU-only
+check was not repeated because both Colima profiles reported Broken.
+See [WP6b evidence](evidence/phase2-wp6b-validation.json).
+
+The true cold driver reading is pending under the newly created `zkmac`
+account. Once its three spans are recorded and the WP6b evidence finalized,
+the next step is the one-hour `identity_p254` profile from the revised spec;
+it requires the owner's go-ahead. WP8 remains unstarted.
+
 ## WP7 admission estimator — 2026-11-06
 
 The revised Phase 2 spec SHA-256 is
@@ -30,10 +60,8 @@ real-witness CPU differentials, nine limit controls, six macOS policy tests,
 twelve ledger tests, and CPU-only builds on macOS and offline Linux passed.
 See [WP7 evidence](evidence/phase2-wp7-validation.json) and [setup](SETUP.md).
 
-Next: WP6b on new miner and engine branches. WP6's archive PR remains draft
-and unmerged after a 0.16 s measured gain missed its cold-start gate. After
-WP6b, the one-hour identity_p254 profile requires the owner's go-ahead; WP8
-does not start without the subsequent owner decision.
+Next from this WP7 checkpoint: WP6b as documented above. WP6's archive PR
+remains draft and unmerged after a 0.16 s measured gain missed its gate.
 
 ## Controlled final reading — 2026-11-06
 

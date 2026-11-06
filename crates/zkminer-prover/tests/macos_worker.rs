@@ -12,12 +12,130 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use zkminer_prover::{dispatcher::WorkerPool, worker::WorkerHandle};
 use zkminer_prover_protocol::{WorkerCommand, WorkerResponse, PROTOCOL_VERSION};
 
 const KEY: &str = "risc0:generic";
+
+#[test]
+#[ignore = "source-bound native worker process-launch handshake timing"]
+fn native_worker_handshake_timing() {
+    let binary = required("ZKMINER_MACOS_WORKER");
+    let evidence = required("ZKMINER_MACOS_EVIDENCE_DIR");
+    fs::create_dir_all(&evidence).unwrap();
+    let mut rows = Vec::new();
+    for index in 0..3 {
+        let started = Instant::now();
+        let worker = WorkerHandle::spawn("risc0", &binary, &HashMap::new()).unwrap();
+        let pid = worker.pid();
+        rows.push(json!({"index":index,"worker_pid":pid,
+            "spawn_to_handshake_ms":worker.spawn_to_handshake_ms,
+            "pool_call_ms":started.elapsed().as_secs_f64()*1000.0}));
+        drop(worker);
+        assert_group_gone(pid);
+    }
+    assert!(helpers().is_empty());
+    fs::write(evidence.join("complete.json"), serde_json::to_vec_pretty(&json!({
+        "status":"handshake_timing_passed","rows":rows,
+        "span":"Command::spawn start through HelloAck, including parent supervision setup",
+    })).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "fresh-user Metal driver cache reading with one complete verified proof"]
+fn native_worker_cold_timing() {
+    let binary = required("ZKMINER_MACOS_WORKER");
+    let program = required("ZKMINER_MACOS_PROGRAM");
+    let input = required("ZKMINER_MACOS_INPUT");
+    let verifier = required("ZKMINER_MACOS_VERIFIER");
+    let evidence = required("ZKMINER_MACOS_EVIDENCE_DIR");
+    fs::create_dir_all(&evidence).unwrap();
+    assert!(helpers().is_empty());
+    let elf = fs::read(&program).unwrap();
+    let workload = Workload::from_environment(&elf);
+    assert_eq!(fs::read(&input).unwrap(), workload.input);
+    let before = sidecar_paths();
+    let mut worker = WorkerHandle::spawn("risc0", &binary, &HashMap::new()).unwrap();
+    let pid = worker.pid();
+    let spawn_to_handshake_ms = worker.spawn_to_handshake_ms;
+    let handshake = Instant::now();
+    let request_epoch_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let handshake_to_request_ms = elapsed_ms(handshake);
+    worker.send(&WorkerCommand::Prove {
+        request_id: 1, elf, input_data: workload.input.clone(), po2: Some(workload.po2),
+    }).unwrap();
+    let response = worker.recv_proof(1, &None).unwrap();
+    let proof = match response {
+        WorkerResponse::ProofResult { request_id: 1, journal, seal, duration_secs, cycles } =>
+            zkminer_prover::engine::ProofOutput {
+                journal, seal, duration: Duration::from_secs_f64(duration_secs), cycles,
+            },
+        other => panic!("cold-reading proof failed: {other:?}"),
+    };
+    let (_, record) = require_sidecar(&before);
+    let dispatch_epoch_ns = record["observed_stages"]["rv32im_metal"]
+        ["first_completed_gpu_dispatch_epoch_ns"].as_u64().unwrap();
+    assert!(dispatch_epoch_ns >= request_epoch_ns);
+    let request_to_first_completed_gpu_dispatch_ms =
+        (dispatch_epoch_ns - request_epoch_ns) as f64 / 1_000_000.0;
+    let external_verifier_ms = verify(&verifier, &program, &input,
+        &evidence.join("proof-0"), proof, &record, &workload);
+    drop(worker);
+    assert_group_gone(pid);
+    assert!(helpers().is_empty());
+    fs::write(evidence.join("complete.json"), serde_json::to_vec_pretty(&json!({
+        "status":"cold_timing_verified", "worker_pid":pid,
+        "spawn_to_handshake_ms":spawn_to_handshake_ms,
+        "handshake_to_request_ms":handshake_to_request_ms,
+        "request_to_first_completed_gpu_dispatch_ms":request_to_first_completed_gpu_dispatch_ms,
+        "request_epoch_ns":request_epoch_ns,"dispatch_epoch_ns":dispatch_epoch_ns,
+        "external_verifier_ms":external_verifier_ms,"tamper_rejections":3,
+        "scope":"one WorkerHandle launch and one direct proof request; no discovery spawn, execute validation, or harness warmup in the three spans",
+    })).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "corrupt native bundle must fail after handshake and before helper spawn"]
+fn native_bundle_corrupt_hash_rejected() {
+    let binary = required("ZKMINER_MACOS_WORKER");
+    let evidence = required("ZKMINER_MACOS_EVIDENCE_DIR");
+    fs::create_dir_all(&evidence).unwrap();
+    let source = required("ZKMINER_RISC0_NATIVE_DIR");
+    let corrupt = evidence.join("corrupt-bundle");
+    fs::create_dir(&corrupt).unwrap();
+    for name in ["prover", "stark_verify.cs", "stark_verify_final.pk.dmp", "stark_verify_graph.bin"] {
+        assert!(Command::new("cp").arg("-c").arg(source.join(name))
+            .arg(corrupt.join(name)).status().unwrap().success());
+    }
+    fs::copy(source.join("manifest.json"), corrupt.join("manifest.json")).unwrap();
+    let mut bytes = fs::read(corrupt.join("prover")).unwrap();
+    bytes[8] ^= 1; // Preserve the Mach-O header so the asynchronous hash catches the change.
+    fs::write(corrupt.join("prover"), bytes).unwrap();
+    let overrides = HashMap::from([("ZKMINER_RISC0_NATIVE_DIR".into(),
+        corrupt.to_string_lossy().into_owned())]);
+    let mut worker = WorkerHandle::spawn("risc0", &binary, &overrides).unwrap();
+    let pid = worker.pid();
+    worker.send(&WorkerCommand::Prove { request_id: 1,
+        elf: fs::read(required("ZKMINER_MACOS_PROGRAM")).unwrap(),
+        input_data: fs::read(required("ZKMINER_MACOS_INPUT")).unwrap(),
+        po2: Some(14),
+    }).unwrap();
+    let response = worker.recv_proof(1, &None).unwrap();
+    let error = match response {
+        WorkerResponse::Error { request_id: 1, message, .. } => message,
+        other => panic!("corrupt bundle was not refused: {other:?}"),
+    };
+    assert!(error.contains("native artifact hash mismatch: prover"), "{error}");
+    drop(worker);
+    assert_group_gone(pid);
+    assert!(helpers().is_empty());
+    fs::write(evidence.join("complete.json"), serde_json::to_vec_pretty(&json!({
+        "status":"corrupt_bundle_rejected","error":error,"worker_pid":pid,
+        "handshake_succeeded":true,"proof_failed_before_helper":true,
+    })).unwrap()).unwrap();
+}
 
 #[test]
 #[ignore = "child process for the opt-in held-memory admission case"]
@@ -648,7 +766,7 @@ fn measured_prove(
         "before_prove_call",
     );
     let done = Arc::new(AtomicBool::new(false));
-    let (result, mut observations, prove_call_ms) = std::thread::scope(|scope| {
+    let (result, mut observations, prove_call_ms, request_epoch_ns) = std::thread::scope(|scope| {
         let stop = done.clone();
         let observer = scope.spawn(move || {
             let mut samples = Vec::new();
@@ -670,6 +788,7 @@ fn measured_prove(
             samples
         });
         let prove_started = Instant::now();
+        let request_epoch_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
         let result = pool.prove(
             "risc0",
             elf,
@@ -680,7 +799,7 @@ fn measured_prove(
         );
         let prove_call_ms = elapsed_ms(prove_started);
         done.store(true, Ordering::Release);
-        (result, observer.join().unwrap(), prove_call_ms)
+        (result, observer.join().unwrap(), prove_call_ms, request_epoch_ns)
     });
     observations.insert(0, baseline.clone());
     observations.push(rss_observation(
@@ -697,7 +816,7 @@ fn measured_prove(
         "observation_window":"immediately before WorkerPool::prove through its return; post-verification idle observation is separate",
         "host_memory_method":"production Darwin available-memory estimate (free pages plus conservative reclaim credit); includes all host pressure and is not added to worker RSS or treated as an allocation guarantee",
         "sampling_interval_ms":1000,"request_elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
-        "prove_call_ms":prove_call_ms,
+        "prove_call_ms":prove_call_ms,"proof_request_epoch_ns":request_epoch_ns,
         "prove_call_scope":"immediately around WorkerPool::prove; includes admission, any policy-driven worker replacement, IPC and completed proof response; excludes RSS baseline and sampler join",
         "baseline_before_prove_call":baseline,"observations":observations}),
     )
@@ -1116,6 +1235,15 @@ fn save_proof_timing(
         "external_verifier_scope":"external unchanged verifier Command::output, including process startup, positive verification and all three negative checks; excludes evidence file writes",
         "worker_pid":record["worker_pid"],"worker_start_time_us":resources["worker_start_time_us"],
         "request_id":record["request_id"],
+        "proof_request_epoch_ns":resources["proof_request_epoch_ns"],
+        "first_completed_gpu_dispatch_epoch_ns":record["observed_stages"]["rv32im_metal"]["first_completed_gpu_dispatch_epoch_ns"],
+        "request_to_first_completed_gpu_dispatch_ms":match (
+            resources["proof_request_epoch_ns"].as_u64(),
+            record["observed_stages"]["rv32im_metal"]["first_completed_gpu_dispatch_epoch_ns"].as_u64(),
+        ) {
+            (Some(request), Some(dispatch)) if dispatch >= request => json!((dispatch-request) as f64 / 1_000_000.0),
+            _ => Value::Null,
+        },
         "worker_pid_before_prove":resources["baseline_before_prove_call"]["worker_pid"],
         "worker_start_time_us_before_prove":resources["baseline_before_prove_call"]["worker_start_time_us"],
         "same_worker_as_before_prove":resources["baseline_matches_request_worker"],

@@ -48,6 +48,8 @@ def main():
                         help="hold incompressible sibling memory through one proof; requires a 20..30 GiB normal-pressure admission estimate")
     parser.add_argument("--calibration", type=Path, help="load a measured DeviceBenchmark for native host-memory admission")
     parser.add_argument("--limit-controls", action="store_true", help="run input rejection controls without completing a proof")
+    parser.add_argument("--handshake-only", action="store_true", help="time three process launch to HelloAck spans without proving")
+    parser.add_argument("--invalid-bundle", action="store_true", help="clone and corrupt the native bundle; require proof failure before helper spawn")
     parser.add_argument("--thread-cases", help="comparison settings, e.g. 6:6,12:6,18:6")
     parser.add_argument("--samples", type=int, choices=range(1,6), default=3)
     parser.add_argument("--iterations", type=int, help="guest loop/hash count; boundary uses units of 1024 additions")
@@ -201,7 +203,7 @@ def main():
     try:
         binary, build = acceptance.build_acceptance(directory, env)
         with (directory / "test.log").open("w") as log:
-            test = "native_workload_limit_controls" if args.limit_controls else "native_thread_comparison" if args.thread_cases else "native_worker_proofs_failure_restart_and_shutdown"
+            test = "native_bundle_corrupt_hash_rejected" if args.invalid_bundle else "native_worker_handshake_timing" if args.handshake_only else "native_workload_limit_controls" if args.limit_controls else "native_thread_comparison" if args.thread_cases else "native_worker_proofs_failure_restart_and_shutdown"
             subprocess.run([str(binary), test, "--exact", "--ignored", "--nocapture"],
                            env=env, stdout=log, stderr=subprocess.STDOUT, check=True,
                            timeout=suite_timeout)

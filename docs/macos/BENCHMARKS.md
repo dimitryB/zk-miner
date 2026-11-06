@@ -1,5 +1,36 @@
 # macOS proving measurements
 
+## WP6b startup reading — 2026-11-06
+
+The source-bound WP6b worker from engine `7816a0002` has SHA-256
+`f65ff7a374e4471404d9bc52dab57d010e12cb5af4d0f5197053b0f8107060ab`.
+The sealed WP8-lite baseline remained byte-identical at `625589c35f6583b…`.
+Browsers were closed, the default 8 GiB host reserve was used, and 18
+Rayon/Go threads were selected. The Foundation thermal reading was nominal
+during validation and fair afterward; its nominal category can also mean
+unknown. No OS cold boot or GPU energy measurement is claimed.
+
+| Startup span or check | Baseline | WP6b |
+| --- | ---: | ---: |
+| Spawn → HelloAck, three launches (median) | 4.619 s | 0.107 s |
+| Build-time po2-14 verified proof | Not required | 29.164 s |
+| First post-build request → first completed GPU dispatch | — | 0.057 s |
+
+The baseline launch samples were 6.055, 4.613 and 4.619 s; WP6b samples
+were 0.106, 0.107 and 0.212 s. The first post-build proof used a direct
+worker handle with no discovery spawn, execute validation or harness warmup
+inside the measured spans. It verified with the unchanged external verifier
+and three tamper rejections. The build-time proof warmed a driver cache that
+was already warm for these sources; a fresh-user true cold reading is pending.
+The cross-process request-to-dispatch span uses UNIX epoch nanosecond markers
+on one host; the launch and handshake spans use monotonic `Instant` timers.
+
+The final worker passed 21 lifecycle/recovery proofs and 63 tamper checks,
+po2-14/18/20 exact segment and recursion CPU differentials, nine limit
+controls, and a corrupt-asset proof refusal before helper spawn. Full source
+hashes, the three raw launch samples, proof paths, helper and verifier SHAs,
+and host conditions are in [WP6b validation](evidence/phase2-wp6b-validation.json).
+
 ## WP7 desktop admission validation — 2026-11-06
 
 The [WP7 validation record](evidence/phase2-wp7-validation.json) uses the
