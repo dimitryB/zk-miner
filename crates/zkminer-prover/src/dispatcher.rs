@@ -13,6 +13,26 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+fn host_memory_shortage_error(
+    shortage: zkminer_prover_protocol::types::HostMemoryShortage,
+) -> anyhow::Error {
+    #[cfg(target_os = "macos")]
+    if !shortage.attempted {
+        let level = crate::macos::pressure_level();
+        let name = match level {
+            Some(2) => Some("warning"),
+            Some(4) => Some("critical"),
+            _ => None,
+        };
+        if let (Some(level), Some(name)) = (level, name) {
+            return anyhow::Error::new(shortage).context(format!(
+                "kernel memory pressure is {name} (level {level}); refused before dispatch"
+            ));
+        }
+    }
+    anyhow::Error::new(shortage)
+}
+
 /// Benchmark results for a single worker slot, with device metadata.
 #[derive(Debug, Clone)]
 pub struct SlotBenchmarkResult {
@@ -1974,7 +1994,7 @@ impl WorkerPool {
             match self.reserve_host_memory(want, key) {
                 Some(r) => r,
                 None => {
-                    return Err(anyhow::Error::new(
+                    return Err(host_memory_shortage_error(
                         zkminer_prover_protocol::types::HostMemoryShortage {
                             attempted: false,
                             slot_key: key.to_string(),
@@ -2127,7 +2147,7 @@ impl WorkerPool {
             match self.reserve_host_memory(want, key) {
                 Some(r) => Some(r),
                 None => {
-                    return Err(anyhow::Error::new(
+                    return Err(host_memory_shortage_error(
                         zkminer_prover_protocol::types::HostMemoryShortage {
                             attempted: false,
                             slot_key: key.to_string(),
@@ -2258,7 +2278,7 @@ impl WorkerPool {
             match self.reserve_host_memory(want, key) {
                 Some(r) => r,
                 None => {
-                    return Err(anyhow::Error::new(
+                    return Err(host_memory_shortage_error(
                         zkminer_prover_protocol::types::HostMemoryShortage {
                             attempted: false,
                             slot_key: key.to_string(),
@@ -2646,7 +2666,7 @@ impl WorkerPool {
             match self.reserve_host_memory(want, key) {
                 Some(r) => r,
                 None => {
-                    return Err(anyhow::Error::new(
+                    return Err(host_memory_shortage_error(
                         zkminer_prover_protocol::types::HostMemoryShortage {
                             attempted: false,
                             slot_key: key.to_string(),
@@ -4859,7 +4879,7 @@ impl WorkerPool {
                     None => {
                         // A TYPED error, so the caller cannot mistake it for worker ill-health and
                         // no guest-supplied text can forge it. See `HostMemoryShortage`.
-                        return Err(anyhow::Error::new(
+                        return Err(host_memory_shortage_error(
                             zkminer_prover_protocol::types::HostMemoryShortage {
                                 attempted: false,
                                 slot_key: key.to_string(),
@@ -5025,7 +5045,7 @@ impl WorkerPool {
             // Report it to the CALLER as a memory shortage, not as a prover failure, so the retry
             // loop waits for the host instead of excluding a healthy slot and releasing the job.
             if host_oom {
-                return Err(anyhow::Error::new(
+                return Err(host_memory_shortage_error(
                     zkminer_prover_protocol::types::HostMemoryShortage {
                         attempted: true,
                         slot_key: key.to_string(),

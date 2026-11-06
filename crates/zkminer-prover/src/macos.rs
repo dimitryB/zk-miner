@@ -251,9 +251,12 @@ pub fn group_memory(pid: u32) -> Option<GroupMemory> {
 }
 
 pub fn observation(pid: u32) -> serde_json::Value {
+    let guard = guard_samples(pid);
     serde_json::json!({"pressure_level":pressure_level(), "estimated_available_bytes":available_bytes(),
         "admission_available_bytes":admission_available_bytes(), "reserve_bytes":reserve_bytes(),
         "group":group_memory(pid), "guard_peak_footprint_bytes":peak_bytes(pid),
+        "guard_min_estimated_available_bytes":guard.as_ref().and_then(|s| s.minimum_available),
+        "guard_pressure_levels_seen":guard.map(|s| s.pressure_levels),
         "footprint_method":"proc_pid_rusage RUSAGE_INFO_V4"})
 }
 
@@ -290,12 +293,11 @@ pub fn admission_headroom(
 
 fn safe_to_continue(
     footprint: Option<u64>,
-    available: Option<u64>,
+    _available: Option<u64>,
     pressure: Option<u32>,
     limit: u64,
 ) -> bool {
     footprint.is_some_and(|n| n <= limit)
-        && available.is_some_and(|n| n >= 8 * 1024u64.pow(3))
         && matches!(pressure, Some(1 | 2))
 }
 
@@ -331,17 +333,44 @@ pub fn available_bytes() -> Option<u64> {
     Some((stats.free_count as u64 + reclaim_estimate) * page_size as u64)
 }
 
-type PeakRegistry = std::sync::Mutex<HashMap<u32, (u64, Arc<AtomicU64>)>>;
+struct GuardSamples {
+    peak: AtomicU64,
+    minimum_available: AtomicU64,
+    pressure_mask: AtomicU64,
+}
+
+type PeakRegistry = std::sync::Mutex<HashMap<u32, (u64, Arc<GuardSamples>)>>;
 fn peaks() -> &'static PeakRegistry {
     static PEAKS: std::sync::OnceLock<PeakRegistry> = std::sync::OnceLock::new();
     PEAKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 pub fn peak_bytes(pid: u32) -> Option<u64> {
-    let (start, peak) = peaks().lock().ok()?.get(&pid)?.clone();
+    let (start, samples) = peaks().lock().ok()?.get(&pid)?.clone();
     owned_group(pid, Some(start))
-        .then(|| peak.load(Ordering::Acquire))
+        .then(|| samples.peak.load(Ordering::Acquire))
         .filter(|n| *n > 0)
+}
+
+struct GuardObservation {
+    minimum_available: Option<u64>,
+    pressure_levels: Vec<u32>,
+}
+
+fn guard_samples(pid: u32) -> Option<GuardObservation> {
+    let (start, samples) = peaks().lock().ok()?.get(&pid)?.clone();
+    if !owned_group(pid, Some(start)) {
+        return None;
+    }
+    let minimum = samples.minimum_available.load(Ordering::Acquire);
+    let mask = samples.pressure_mask.load(Ordering::Acquire);
+    Some(GuardObservation {
+        minimum_available: (minimum != u64::MAX).then_some(minimum),
+        pressure_levels: [1u32, 2, 4]
+            .into_iter()
+            .filter(|level| mask & (*level as u64) != 0)
+            .collect(),
+    })
 }
 
 pub struct MemoryGuard {
@@ -368,8 +397,12 @@ impl MemoryGuard {
         );
         let stop = Arc::new(AtomicBool::new(false));
         let cancel = stop.clone();
-        let peak = Arc::new(AtomicU64::new(0));
-        let tracked_peak = peak.clone();
+        let samples = Arc::new(GuardSamples {
+            peak: AtomicU64::new(0),
+            minimum_available: AtomicU64::new(u64::MAX),
+            pressure_mask: AtomicU64::new(0),
+        });
+        let tracked = samples.clone();
         let thread = std::thread::Builder::new().name("macos-memory-watch".into()).spawn(move || {
             while !cancel.load(Ordering::Acquire) {
                 if !owned_group(pid, Some(started)) { return; }
@@ -378,19 +411,21 @@ impl MemoryGuard {
                 if bsd_info(pid).is_some_and(|info| info.pbi_status == libc::SZOMB as u32) { return; }
                 let group = group_memory(pid);
                 let footprint = group.as_ref().and_then(|g| g.worker.footprint_bytes.checked_add(g.helper_footprint_bytes));
-                if let Some(bytes) = footprint { tracked_peak.fetch_max(bytes, Ordering::AcqRel); }
+                if let Some(bytes) = footprint { tracked.peak.fetch_max(bytes, Ordering::AcqRel); }
                 let available = available_bytes();
                 let pressure = pressure_level();
+                if let Some(bytes) = available { tracked.minimum_available.fetch_min(bytes, Ordering::AcqRel); }
+                if let Some(level) = pressure { tracked.pressure_mask.fetch_or(level as u64, Ordering::AcqRel); }
                 let safe = safe_to_continue(footprint, available, pressure, limit);
                 if !safe {
-                    tracing::error!("macOS worker {pid}: group={group:?}, available={available:?}, pressure={pressure:?}; resource observation unavailable or limit reached");
+                    tracing::error!("macOS worker {pid}: group={group:?}, available={available:?}, pressure={pressure:?}; critical pressure, unreadable safety signal, or footprint limit reached");
                     if owned_group(pid, Some(started)) { unsafe { libc::kill(-(pid as i32), libc::SIGKILL); } }
                     return;
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
         })?;
-        peaks().lock().unwrap().insert(pid, (started, peak));
+        peaks().lock().unwrap().insert(pid, (started, samples));
         Ok(Self {
             pid,
             started,
@@ -563,12 +598,17 @@ mod tests {
             Some(1),
             32 * gib
         ));
-        assert!(!safe_to_continue(
+        assert!(safe_to_continue(
             Some(gib),
             Some(7 * gib),
             Some(1),
             32 * gib
         ));
+        // A proof admitted at 16 GiB estimated must keep running if that
+        // estimate falls to 3 GiB while owned memory and pressure stay safe.
+        assert!(safe_to_continue(Some(20 * gib), Some(3 * gib), Some(1), 32 * gib));
+        assert!(safe_to_continue(Some(20 * gib), None, Some(2), 32 * gib));
+        assert!(!safe_to_continue(None, Some(20 * gib), Some(1), 32 * gib));
     }
 
     #[test]

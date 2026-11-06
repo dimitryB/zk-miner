@@ -4,23 +4,36 @@
 
 The [WP7 validation record](evidence/phase2-wp7-validation.json) uses the
 unchanged WP8-lite Metal worker and verifier, po2 20, 18 Rayon/Go threads and
-the new default 8 GiB host reserve. Brave, Zed and the default Colima VM were
-running. Before the 10M arithmetic proof, the conservative VM estimate was
-64.87 GiB and `memory_pressure -Q` reported 80% system-wide free. The complete
-proof verified and all three tamper checks rejected. `WorkerPool::prove` took
-58.535 s; the worker reported 58.041 s. Their 0.494 s gap includes IPC and
-host handling, so any admission wait was below the 5 s gate. This is an
-admission check under desktop load, not a controlled latency comparison.
+the new default 8 GiB host reserve. The revised spec SHA-256 is
+`ecd565ffba5582c00c1191d8a427cd5bb48d90440b21b8d0423735e9e7847031`.
+Brave, Zed and the default Colima VM were running; the 10M arithmetic proof
+verified and all three tamper checks rejected. The 0.212 s gap between
+`WorkerPool::prove` and worker-reported time includes IPC and host handling,
+so any admission wait was below the 5 s gate. This is an admission check
+under desktop load, not a controlled latency comparison.
+
+The opt-in `--held-memory-gib 64` case wrote every page of a 64 GiB
+incompressible sibling allocation and held it through verification. Admission
+was at 20.17 GiB estimated and kernel level 1. The proof verified with three
+tamper rejections; the guard sampled a minimum of 8.04 GiB estimated, levels
+1 and 2, and a 14.84 GiB peak owned footprint. At 60 GiB held, admission
+was 24.40 GiB with normal pressure and the proof also verified. The 80 GiB
+calibration attempt reached warning before admission and stopped without a
+proof; it released its sibling. The unit case explicitly covers a 16 → 3 GiB
+estimate fall at normal pressure.
 
 The opt-in `--kernel-pressure` acceptance case ran macOS
 `memory_pressure -l warn -s 30`. At kernel warning level 2, the production
-gate returned a typed host shortage in 0.5 ms before any worker request or
-helper started. Pressure returned to normal 32 ms after allocator exit, then
-a Metal proof verified with three tamper rejections. The separate
+gate returned a typed host shortage naming warning level 2 and carrying the
+raw VM estimate before any worker request or helper started. After pressure
+returned to normal, a Metal proof verified with three tamper rejections. The separate
 `--admission-pressure` logical reservation case also refused and recovered.
-The record includes host snapshots, source and binary hashes, raw run paths,
-and six macOS policy plus twelve memory ledger unit test results. CPU-only
-builds passed on macOS and in the offline Colima Linux VM.
+The 20-request lifecycle plus restart verified 21 proofs and 63 tamper
+rejections, with 16.25% lower idle RSS. The real-witness po2-14/18/20
+differentials made 22/1/1 exact comparisons; nine limit controls, six macOS
+policy and twelve ledger tests passed. CPU-only builds passed on macOS and
+offline Colima Linux. The record includes source and binary hashes, raw run
+paths, guard samples and host snapshots.
 
 ## Controlled final absolute reading — 2026-11-06
 

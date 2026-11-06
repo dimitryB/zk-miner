@@ -90,7 +90,7 @@ pub fn mem_total_bytes() -> Option<u64> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn mem_available_bytes() -> Option<u64> { crate::macos::admission_available_bytes() }
+pub fn mem_available_bytes() -> Option<u64> { crate::macos::available_bytes() }
 
 pub fn host_reserve_bytes() -> u64 {
     #[cfg(target_os = "macos")]

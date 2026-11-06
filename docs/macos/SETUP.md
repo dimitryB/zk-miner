@@ -53,8 +53,12 @@ normal kernel memory pressure and accounts for the measured resident worker and
 helper footprint. As a secondary check, the conservative VM estimate must cover
 the reserve plus at most 8 GiB of projected additional owned footprint. For a
 fresh worker with a 24 GiB budget, that floor is 16 GiB of estimated headroom.
-The ledger still bounds total commitments and the worker guard enforces the
-32 GiB owned-footprint ceiling. Installed RAM alone does not establish admission.
+The ledger still bounds total commitments. After admission, the worker guard
+continues at normal or warning kernel pressure while owned footprint is
+readable and within 32 GiB. Critical pressure, an unreadable pressure or
+footprint signal, or excess owned footprint stops the worker. The conservative
+VM estimate is logged with a per-second minimum, not used as an in-proof kill
+rule. Installed RAM alone does not establish admission.
 
 The original campaign's largest worker/helper footprint was 16.305 GiB; the
 review's warmed proof groups reached 19.783 GiB. These observations exclude
@@ -64,11 +68,13 @@ the earlier controlled final reading used the then-default 16 GiB reserve.
 A smaller-machine po2-18 profile has not been validated. Lowering the segment
 cap alone is not documented as establishing support for a 32 GiB Mac.
 
-The [WP7 desktop validation](evidence/phase2-wp7-validation.json) used the new
-default reserve with Brave, Zed and Colima running. A 10M arithmetic proof
-verified with 64.87 GiB conservatively estimated available at preflight. A
-real warning-pressure allocation caused a typed refusal before worker dispatch;
-the next proof verified after pressure returned to normal. The earlier
+The [WP7 validation](evidence/phase2-wp7-validation.json) used the new default
+reserve with Brave, Zed and Colima running. A 10M arithmetic proof verified
+with an admission-wait upper bound of 0.212 s. With 64 GiB of sibling memory
+held, another 10M proof admitted at 20.17 GiB estimated, reached 8.04 GiB
+minimum during proving, and verified. A real warning-pressure allocation
+caused a typed refusal naming level 2 and preserving the raw estimate before
+worker dispatch; the next proof verified after pressure returned to normal. The earlier
 [12 GiB override spot check](evidence/rv32im-desktop-admission-spot-check.json)
 belongs to the pre-WP7 policy.
 
