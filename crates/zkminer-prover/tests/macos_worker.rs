@@ -5,9 +5,9 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
     fs::{self, OpenOptions},
-    io::Write,
+    io::{BufRead, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -18,6 +18,35 @@ use zkminer_prover::{dispatcher::WorkerPool, worker::WorkerHandle};
 use zkminer_prover_protocol::{WorkerCommand, WorkerResponse, PROTOCOL_VERSION};
 
 const KEY: &str = "risc0:generic";
+
+#[test]
+#[ignore = "child process for the opt-in held-memory admission case"]
+fn held_memory_child() {
+    unsafe extern "C" {
+        fn arc4random_buf(buf: *mut libc::c_void, n: libc::size_t);
+    }
+    let gib: usize = std::env::var("ZKMINER_MACOS_HELD_MEMORY_GIB")
+        .unwrap().parse().unwrap();
+    assert!((1..=100).contains(&gib));
+    const SLAB: usize = 256 * 1024 * 1024;
+    let mut slabs = Vec::with_capacity(gib * 4);
+    for _ in 0..gib * 4 {
+        let mut bytes = vec![0u8; SLAB];
+        // Fill every page with incompressible data so the requested amount is
+        // actually held by this sibling rather than collapsed by VM compression.
+        unsafe { arc4random_buf(bytes.as_mut_ptr().cast(), bytes.len()); }
+        slabs.push(bytes);
+    }
+    let ready = required("ZKMINER_MACOS_HELD_READY_PATH");
+    fs::write(&ready, serde_json::to_vec_pretty(&json!({
+        "pid":std::process::id(), "held_gib":gib, "slabs":slabs.len(),
+        "bytes_written":gib as u64 * 1024u64.pow(3),
+    })).unwrap()).unwrap();
+    let mut release = String::new();
+    std::io::stdin().lock().read_line(&mut release).unwrap();
+    assert_eq!(release.trim(), "release");
+    std::hint::black_box(&slabs);
+}
 
 #[test]
 #[ignore = "real native worker workload-limit controls; no proof success is claimed"]
@@ -854,6 +883,160 @@ fn admission_pressure(pool: &WorkerPool, elf: &[u8], workload: &Workload, eviden
     // independently verify a genuine full proof after releasing the guards.
 }
 
+fn kernel_pressure_level() -> Option<u32> {
+    let output = Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.memorystatus_vm_pressure_level"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+        .flatten()
+}
+
+struct HeldMemory {
+    child: Child,
+    ready: Value,
+    ready_ms: f64,
+}
+
+impl Drop for HeldMemory {
+    fn drop(&mut self) {
+        if let Some(mut input) = self.child.stdin.take() {
+            let _ = input.write_all(b"release\n");
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_held_memory(evidence: &Path, gib: usize) -> HeldMemory {
+    let ready = evidence.join("held-memory-ready.json");
+    let log = fs::File::create(evidence.join("held-memory-child.log")).unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["held_memory_child", "--exact", "--ignored", "--nocapture"])
+        .env("ZKMINER_MACOS_HELD_READY_PATH", &ready)
+        .env("ZKMINER_MACOS_HELD_MEMORY_GIB", gib.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("cannot start held-memory sibling");
+    let mut held = HeldMemory { child, ready: Value::Null, ready_ms: 0.0 };
+    let started = Instant::now();
+    while !ready.exists() {
+        assert!(started.elapsed() < Duration::from_secs(180),
+            "held-memory sibling did not finish writing every page within 180 seconds");
+        assert!(held.child.try_wait().unwrap().is_none(),
+            "held-memory sibling exited before signaling readiness");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    held.ready_ms = started.elapsed().as_secs_f64() * 1000.0;
+    held.ready = serde_json::from_slice(&fs::read(ready).unwrap()).unwrap();
+    assert_eq!(held.ready["held_gib"], gib);
+    assert_eq!(held.ready["pid"], held.child.id());
+    held
+}
+
+fn kernel_pressure(pool: &WorkerPool, elf: &[u8], workload: &Workload, evidence: &Path) {
+    struct PressureChild(Child);
+    impl Drop for PressureChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    assert_eq!(kernel_pressure_level(), Some(1));
+    let before = sidecar_paths();
+    assert!(helpers().is_empty());
+    let log = fs::File::create(evidence.join("kernel-pressure.log")).unwrap();
+    let child = Command::new("/usr/bin/memory_pressure")
+        .args(["-l", "warn", "-s", "30"])
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("cannot start real memory-pressure allocator");
+    let mut allocator = PressureChild(child);
+    let started = Instant::now();
+    let warned = loop {
+        let pressure = kernel_pressure_level();
+        if matches!(pressure, Some(2 | 4)) {
+            break pressure.unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "real allocator did not raise kernel pressure within 60 seconds"
+        );
+        assert!(
+            allocator.0.try_wait().unwrap().is_none(),
+            "real allocator exited before kernel pressure changed"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let warning_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let needed = pool.expected_host_peak_at_po2("risc0", Some(workload.po2));
+    let refused_at = Instant::now();
+    let refusal = pool
+        .prove(
+            "risc0",
+            elf,
+            &workload.input,
+            Some(workload.po2),
+            Some(Duration::from_secs(30)),
+            None,
+        )
+        .expect_err("proof dispatched under warning or critical kernel pressure");
+    let refusal_ms = refused_at.elapsed().as_secs_f64() * 1000.0;
+    let shortage = refusal
+        .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+        .expect("kernel pressure did not return typed HostMemoryShortage");
+    assert!(!shortage.attempted, "pressure refusal attempted a proof");
+    assert_eq!(shortage.slot_key, KEY);
+    assert_eq!(shortage.needed, needed);
+    assert!(shortage.available > 0, "typed shortage lost the raw VM estimate");
+    let label = if warned == 2 { "warning" } else { "critical" };
+    assert!(format!("{refusal:#}").contains(&format!(
+        "kernel memory pressure is {label} (level {warned}); refused before dispatch"
+    )));
+    assert_eq!(sidecar_paths(), before, "pressure refusal started a worker request");
+    assert!(helpers().is_empty(), "pressure refusal started a helper");
+    drop(allocator);
+    let release_started = Instant::now();
+    while kernel_pressure_level() != Some(1) {
+        assert!(
+            release_started.elapsed() < Duration::from_secs(30),
+            "kernel pressure did not recover after allocator exit"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let report = json!({
+        "kind":"real_allocation_kernel_pressure", "allocator_command":"memory_pressure -l warn -s 30",
+        "warning_level":warned, "time_to_warning_ms":warning_ms,
+        "refusal_ms":refusal_ms, "attempted":shortage.attempted,
+        "host_reserve_bytes":zkminer_prover::memory::host_reserve_bytes(),
+        "sidecar_count_before":before.len(), "sidecar_count_after":sidecar_paths().len(),
+        "helper_count_after":helpers().len(), "recovered_level":1,
+        "recovery_ms":release_started.elapsed().as_secs_f64()*1000.0,
+        "error":format!("{refusal:#}"),
+    });
+    fs::write(
+        evidence.join("kernel-pressure.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    ledger(evidence, &json!({"case":"kernel-pressure","status":"refused_then_recovered","pressure":report}));
+    // The normal proof loop then proves and independently verifies recovery.
+}
+
 fn verify(
     verifier: &Path,
     program: &Path,
@@ -1170,9 +1353,17 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         "1" => true,
         _ => panic!("admission pressure must be 0 or 1"),
     };
+    let real_pressure = match std::env::var("ZKMINER_MACOS_KERNEL_PRESSURE")
+        .as_deref()
+        .unwrap_or("0")
+    {
+        "0" => false,
+        "1" => true,
+        _ => panic!("kernel pressure must be 0 or 1"),
+    };
     assert!(
-        !pressure || !lifecycle,
-        "logical admission pressure requires proof-only acceptance"
+        !(pressure || real_pressure) || !lifecycle,
+        "admission pressure cases require proof-only acceptance"
     );
     if let Some(path) = std::env::var_os("ZKMINER_MACOS_CALIBRATION") {
         use zkminer_prover::benchmark::{BenchmarkSuite, DeviceBenchmark};
@@ -1197,6 +1388,16 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
     if pressure {
         admission_pressure(&pool, &elf, &workload, &evidence);
     }
+    if real_pressure {
+        kernel_pressure(&pool, &elf, &workload, &evidence);
+    }
+    let held_gib = std::env::var("ZKMINER_MACOS_HELD_MEMORY_GIB")
+        .ok().map(|value| value.parse::<usize>().unwrap());
+    if let Some(gib) = held_gib {
+        assert!((1..=100).contains(&gib) && !lifecycle && repeats == 1,
+            "held-memory case requires 1..100 GiB and one proof-only request");
+    }
+    let held = held_gib.map(|gib| start_held_memory(&evidence, gib));
     let mut request_identities = BTreeSet::new();
     let warmups: usize = std::env::var("ZKMINER_MACOS_WARMUP_COUNT")
         .unwrap_or_else(|_| "0".into()).parse().unwrap();
@@ -1207,6 +1408,21 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             &evidence,
             &json!({"case":format!("proof-{index}"),"status":"started"}),
         );
+        let held_admission = held.as_ref().map(|sibling| {
+            let estimate = zkminer_prover::memory::mem_available_bytes().unwrap();
+            let level = kernel_pressure_level();
+            let report = json!({"held_gib":sibling.ready["held_gib"],
+                "sibling_pid":sibling.ready["pid"],"bytes_written":sibling.ready["bytes_written"],
+                "time_to_ready_ms":sibling.ready_ms,
+                "estimated_available_bytes_at_admission":estimate,
+                "pressure_level_at_admission":level});
+            fs::write(evidence.join("held-memory-admission.json"),
+                serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            assert_eq!(level, Some(1), "held-memory admission requires normal kernel pressure");
+            assert!((20 * 1024u64.pow(3)..=30 * 1024u64.pow(3)).contains(&estimate),
+                "held-memory admission estimate must be 20..30 GiB; adjust --held-memory-gib");
+            report
+        });
         let (result, mut resources) = measured_prove(&pool, &elf, &workload);
         fs::write(
             evidence.join(format!("proof-{index}-resource-observations.json")),
@@ -1246,6 +1462,26 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             &record,
             &mut resources,
         );
+        if let Some(admission) = held_admission {
+            let worker_pid = record["worker_pid"].as_u64().unwrap() as u32;
+            let guard = zkminer_prover::memory::native_memory_observation(worker_pid);
+            let periodic: Vec<&Value> = resources["observations"].as_array().unwrap().iter()
+                .filter(|sample| sample["phase"] == "periodic_during_prove_call")
+                .collect();
+            let minimum_periodic_estimate = periodic.iter()
+                .filter_map(|sample| sample["native_memory"]["estimated_available_bytes"].as_u64())
+                .min().expect("no periodic VM estimate during held-memory proof");
+            let report = json!({"admission":admission,
+                "minimum_periodic_estimated_available_bytes":minimum_periodic_estimate,
+                "guard_min_estimated_available_bytes":guard["guard_min_estimated_available_bytes"],
+                "guard_pressure_levels_seen":guard["guard_pressure_levels_seen"],
+                "worker_peak_footprint_bytes":guard["guard_peak_footprint_bytes"],
+                "worker_pid":worker_pid,"proof_verified":true,"tamper_rejections":3,
+                "sibling_held_through_verification":true});
+            assert!(report["worker_peak_footprint_bytes"].as_u64().unwrap() > 0);
+            fs::write(evidence.join("held-memory.json"),
+                serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
         let timings = save_proof_timing(
             &evidence.join(format!("proof-{index}")),
             &record,
@@ -1258,6 +1494,7 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         );
         assert!(helpers().is_empty(), "helper survived a successful proof");
     }
+    drop(held);
     let pipeline_cancel = std::env::var("ZKMINER_MACOS_PIPELINE_CANCEL").as_deref() == Ok("1");
     if pipeline_cancel {
         assert!(!lifecycle && workload.po2 == 20 && observed_mode() == "metal");
@@ -1513,6 +1750,6 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         "verified_proofs":repeats + usize::from(lifecycle), "helper_cancel":lifecycle,"helper_timeout":lifecycle && worker_kind() != "native","worker_timeout":lifecycle,
         "restart":lifecycle,"shutdown":true,"pipeline_cancel":pipeline_cancel,"workload":workload.name,"po2":workload.po2,
         "min_segments":workload.min_segments,"expected_journal_hex":workload.expected_hex,
-        "admission_pressure":pressure,"unique_completed_requests":request_identities.len(),
+        "admission_pressure":pressure,"kernel_pressure":real_pressure,"held_memory_gib":held_gib,"unique_completed_requests":request_identities.len(),
     })).unwrap()).unwrap();
 }

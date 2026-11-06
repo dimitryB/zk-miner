@@ -1,8 +1,47 @@
 # Phase 2: Metal proving performance on macOS
 
+## WP7 admission estimator — 2026-11-06
+
+The revised spec export SHA-256 is
+`ecd565ffba5582c00c1191d8a427cd5bb48d90440b21b8d0423735e9e7847031`.
+WP7 admission uses normal kernel pressure plus measured owned worker/helper
+footprint, with the conservative VM estimate as a secondary admission floor.
+The reserve default is 8 GiB (range 8..64 GiB). The in-proof guard now follows
+pressure and the 32 GiB owned-footprint ceiling: normal or warning continues;
+critical, unreadable pressure/footprint, or an exceeded ceiling stops the group.
+The VM estimate is sampled and logged, not used to kill a running proof.
+
+The held-memory integration used a sibling process writing 64 GiB of
+incompressible pages. Admission was at 20.17 GiB estimated and normal pressure;
+the proof verified with a guard minimum of 8.04 GiB, pressure levels 1 and 2,
+and a 14.84 GiB peak owned footprint. A 60 GiB case also passed at 24.40 GiB
+admission headroom. The explicit unit case at 16 → 3 GiB estimated and normal
+pressure continues. Under Brave, Zed and Colima, a 10M proof verified with an
+admission-wait upper bound of 0.212 s. A real warning-pressure refusal named
+level 2, preserved the raw estimate, and started no request or helper; logical
+reservation refusal and recovery also passed. The 20-request lifecycle plus
+recovery verified 21 proofs with 63 tamper rejections and 16.25% lower idle
+RSS; po2-14/18/20 differentials, nine limit controls, macOS/Linux CPU-only
+builds, and unit tests passed. The sealed WP8-lite worker SHA-256 stayed
+`625589c35f6583bfaf4510a00d6f98dceb781b004064500ce38b44b42d659be7`.
+See `evidence/phase2-wp7-validation.json`. WP7 passed all three merge
+conditions and is merged into the Phase 2 miner branch.
+
+## WP6b startup off the critical path — 2026-11-06
+
+WP6 closed on a timing miss: the source-keyed binary archive saved about
+0.16 s with the driver shader cache already warm. Its engine draft PR remains
+open and unmerged. WP6b moves full bundle hashing off worker startup while
+joining it before helper use, runs one po2-14 proof during every Metal worker
+build to warm the driver cache, and records one true cold reading. Its gate is
+warm-driver spawn → handshake at most 1.0 s (three-run median), then first
+request → first GPU dispatch at most 5 s after build-time warm-up, with
+lifecycle, differential, limit controls, tamper checks, and unchanged assets
+green. Evidence will be under `evidence/phase2-wp6b-*.json`.
+
 ## Controlled final reading — revised brief, 2026-11-06
 
-The latest re-export SHA-256 is
+The spec export used for this controlled reading had SHA-256
 `c7cd2ab3cf8f6f67fb4deeabfd9ed86c28d24aa98c0e7c1a7b578640718d475d`.
 The unchanged WP8-lite worker is sealed at
 `target/macos/phase2/wp8lite-checkpoint/` (manifest SHA-256
@@ -470,8 +509,9 @@ brief remains the detailed technical and acceptance specification.
 | WP4 recursion evaluator | At most 7 s lift/join at 10M, exact differential | Closed: 5.609/5.489 s recursion medians, 19/19 CPU differentials on both 10M witnesses, 36 paired proofs and 21-proof lifecycle passed; split plus lazy REDC is default. |
 | WP1b remaining evalfast passes | Evaluator at most 1.2 s per segment and at least 3 s saved at 10M | Closed: 1.043/1.001 s evaluator GPU medians, 6.846/7.022 s complete savings, exact differentials and lifecycle passed. |
 | WP8-lite native wrap overlap | At least 1.5 s saved at 10M; cancellation during identity and wrap leaves no helper; lifecycle green | Closed, timing gate missed: 0.018/0.034 s saved at 10M and 0.988 s at 46M; 36 paired proofs, 21 lifecycle proofs, cancellation and platform checks passed. Best correct variant retained. |
-| WP6 pipeline cache | Warm process first dispatch at most 5 s, stale archive rebuilds | Pending |
-| WP7 admission | No refusal under specified desktop load with at least 40 GiB truly free; pressure refusal still works | Pending |
+| WP6 pipeline cache | Warm process first dispatch at most 5 s, stale archive rebuilds | Closed on a miss; re-scoped to WP6b. Archive PR remains draft and unmerged. |
+| WP7 admission | No refusal under specified desktop load with at least 40 GiB truly free; pressure refusal still works | Passed and merged after held-memory proof, guard-floor reconciliation and pressure-level refusal text. |
+| WP6b startup | Warm-driver spawn → handshake at most 1.0 s; first request → first dispatch at most 5 s after build-time warm-up | In progress after WP7 merge. |
 | WP8 identity_p254 on Metal | Exact differential and verified identity receipts | Optional; requires owner approval before starting |
 
 The mid-point decision after WP3 targets both 10M warm medians at most 60 s.

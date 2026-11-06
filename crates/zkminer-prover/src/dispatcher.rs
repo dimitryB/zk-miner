@@ -13,6 +13,26 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+fn host_memory_shortage_error(
+    shortage: zkminer_prover_protocol::types::HostMemoryShortage,
+) -> anyhow::Error {
+    #[cfg(target_os = "macos")]
+    if !shortage.attempted {
+        let level = crate::macos::pressure_level();
+        let name = match level {
+            Some(2) => Some("warning"),
+            Some(4) => Some("critical"),
+            _ => None,
+        };
+        if let (Some(level), Some(name)) = (level, name) {
+            return anyhow::Error::new(shortage).context(format!(
+                "kernel memory pressure is {name} (level {level}); refused before dispatch"
+            ));
+        }
+    }
+    anyhow::Error::new(shortage)
+}
+
 /// Benchmark results for a single worker slot, with device metadata.
 #[derive(Debug, Clone)]
 pub struct SlotBenchmarkResult {
@@ -1974,7 +1994,7 @@ impl WorkerPool {
             match self.reserve_host_memory(want, key) {
                 Some(r) => r,
                 None => {
-                    return Err(anyhow::Error::new(
+                    return Err(host_memory_shortage_error(
                         zkminer_prover_protocol::types::HostMemoryShortage {
                             attempted: false,
                             slot_key: key.to_string(),
@@ -2127,7 +2147,7 @@ impl WorkerPool {
             match self.reserve_host_memory(want, key) {
                 Some(r) => Some(r),
                 None => {
-                    return Err(anyhow::Error::new(
+                    return Err(host_memory_shortage_error(
                         zkminer_prover_protocol::types::HostMemoryShortage {
                             attempted: false,
                             slot_key: key.to_string(),
@@ -2258,7 +2278,7 @@ impl WorkerPool {
             match self.reserve_host_memory(want, key) {
                 Some(r) => r,
                 None => {
-                    return Err(anyhow::Error::new(
+                    return Err(host_memory_shortage_error(
                         zkminer_prover_protocol::types::HostMemoryShortage {
                             attempted: false,
                             slot_key: key.to_string(),
@@ -2646,7 +2666,7 @@ impl WorkerPool {
             match self.reserve_host_memory(want, key) {
                 Some(r) => r,
                 None => {
-                    return Err(anyhow::Error::new(
+                    return Err(host_memory_shortage_error(
                         zkminer_prover_protocol::types::HostMemoryShortage {
                             attempted: false,
                             slot_key: key.to_string(),
@@ -3553,12 +3573,9 @@ impl WorkerPool {
         expected_peak: u64,
         slot_key: &str,
     ) -> Option<crate::memory::MemoryReservation<'_>> {
-        // Both gates share ONE policy for "the host's memory is unreadable": fail OPEN, and keep
-        // accounting. They previously disagreed — the claim gate returned `true` while this returned
-        // `None` — so an unreadable `/proc/meminfo` let every job pass the claim gate and then fail
-        // at dispatch: a penalised release per job, indefinitely. Failing open is the right half to
-        // keep, since the per-worker ceiling and `oom_score_adj` still stand behind it, whereas
-        // refusing all work over a missing file stops the miner dead.
+        // Linux claim and dispatch gates fail open together when /proc/meminfo
+        // is unreadable; the per-worker ceiling remains active. macOS requires
+        // a readable VM estimate and kernel pressure signal before admission.
         let (available, total) = match (
             crate::memory::mem_available_bytes(),
             crate::memory::mem_total_bytes(),
@@ -3579,12 +3596,15 @@ impl WorkerPool {
         // the full peak on top would count the same pages twice — see `can_admit`'s `resident`.
         // Zero when unreadable, which is the conservative reading.
         let resident = self.current_host_bytes_for_slot(slot_key).unwrap_or(0);
+        let reserve = crate::memory::host_reserve_bytes();
+        #[cfg(target_os = "macos")]
+        let available = crate::macos::admission_headroom(available, expected_peak, resident)?;
         self.memory_ledger.try_reserve(
             expected_peak,
             resident,
             available,
             total,
-            crate::memory::host_reserve_bytes(),
+            reserve,
         )
     }
 
@@ -3734,6 +3754,10 @@ impl WorkerPool {
         want: u64,
         abort_at: Option<Instant>,
     ) -> Option<crate::memory::MemoryReservation<'_>> {
+        #[cfg(target_os = "macos")]
+        if crate::macos::pressure_level() != Some(1) {
+            return None;
+        }
         let backend = key.split(':').next().unwrap_or(key);
         let (Some(available), Some(total)) = (
             crate::memory::mem_available_bytes(),
@@ -3742,6 +3766,8 @@ impl WorkerPool {
             return None;
         };
         let resident = self.current_host_bytes_for_slot(key).unwrap_or(0);
+        #[cfg(target_os = "macos")]
+        let available = crate::macos::admission_headroom(available, want, resident)?;
         let plan = crate::memory::plan_host_room(
             want,
             resident,
@@ -3824,6 +3850,10 @@ impl WorkerPool {
             self.resident_host_bytes_for_backend(backend)
         } else {
             0
+        };
+        #[cfg(target_os = "macos")]
+        let Some(available) = crate::macos::admission_headroom(available, expected_peak, resident) else {
+            return false;
         };
         let reserved = self.reserved_host_memory();
         if crate::memory::can_admit(expected_peak, resident, reserved, available, total, reserve) {
@@ -4849,7 +4879,7 @@ impl WorkerPool {
                     None => {
                         // A TYPED error, so the caller cannot mistake it for worker ill-health and
                         // no guest-supplied text can forge it. See `HostMemoryShortage`.
-                        return Err(anyhow::Error::new(
+                        return Err(host_memory_shortage_error(
                             zkminer_prover_protocol::types::HostMemoryShortage {
                                 attempted: false,
                                 slot_key: key.to_string(),
@@ -5015,7 +5045,7 @@ impl WorkerPool {
             // Report it to the CALLER as a memory shortage, not as a prover failure, so the retry
             // loop waits for the host instead of excluding a healthy slot and releasing the job.
             if host_oom {
-                return Err(anyhow::Error::new(
+                return Err(host_memory_shortage_error(
                     zkminer_prover_protocol::types::HostMemoryShortage {
                         attempted: true,
                         slot_key: key.to_string(),

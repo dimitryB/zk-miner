@@ -1,5 +1,40 @@
 # macOS proving handoff
 
+## WP7 admission estimator — 2026-11-06
+
+The revised Phase 2 spec SHA-256 is
+`ecd565ffba5582c00c1191d8a427cd5bb48d90440b21b8d0423735e9e7847031`.
+The WP7 miner branch `codex/hemi-macos-metal-wp7` passed its three merge
+conditions and is merged into the Phase 2 branch. Its Metal worker is the
+unchanged WP8-lite binary
+`625589c35f6583bfaf4510a00d6f98dceb781b004064500ce38b44b42d659be7`
+from engine `6521f87c2`. The default host reserve changes from 16 to 8 GiB;
+normal kernel pressure and measured owned footprint drive admission, with the
+conservative VM estimate retained as a floor. The 8..64 GiB override range and
+32 GiB worker/helper ceiling remain. The guard now continues at normal or
+warning pressure while owned footprint is readable and below the ceiling;
+critical or unreadable safety signals stop the worker. Its per-second minimum
+VM estimate and pressure levels are exposed in resource observations.
+
+With 64 GiB of incompressible sibling memory held, the 10M proof admitted at
+20.17 GiB estimated and normal pressure, verified, and saw 8.04 GiB minimum
+in guard samples, levels 1/2 and 14.84 GiB peak owned footprint. At 60 GiB
+held, admission was 24.40 GiB and the proof also verified. With Brave, Zed
+and default Colima running, the separate 10M proof verified with a 0.212 s
+admission-wait upper bound. A real warning-pressure allocation returned a
+typed refusal naming level 2 and preserving the raw VM estimate, before any
+request or helper; the next proof verified. The logical reservation case
+still refused and recovered. The 20-request lifecycle plus restart verified
+21 proofs and 63 tamper rejections, with idle RSS down 16.25%. Po2-14/18/20
+real-witness CPU differentials, nine limit controls, six macOS policy tests,
+twelve ledger tests, and CPU-only builds on macOS and offline Linux passed.
+See [WP7 evidence](evidence/phase2-wp7-validation.json) and [setup](SETUP.md).
+
+Next: WP6b on new miner and engine branches. WP6's archive PR remains draft
+and unmerged after a 0.16 s measured gain missed its cold-start gate. After
+WP6b, the one-hour identity_p254 profile requires the owner's go-ahead; WP8
+does not start without the subsequent owner decision.
+
 ## Controlled final reading — 2026-11-06
 
 The updated Phase 2 brief SHA-256 is
