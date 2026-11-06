@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "warm_gates_and_correctness_passed_cold_user_pending",
+  "status": "passed",
   "scope": "WP6b source-bound warm-driver startup and final-worker correctness; true cold-driver reading collected separately under zkmac",
   "spec_sha256": "ecd565ffba5582c00c1191d8a427cd5bb48d90440b21b8d0423735e9e7847031",
   "wp7_merge_commit": "12a88f3f0a7123f419b0177dd7dbdac1b0edf224",
@@ -18,7 +18,7 @@
     "crates/zkminer-prover/tests/macos_worker.rs": "9c3fd16cc40916ecd8874d3245a2f6c10a3fb77afe033c9c49bd3bbfe2c9e001",
     "scripts/macos/build-worker.py": "fb0b19f95a7e50a7c3d600fdb996d4788e7f897e72b892ef82c0fd3eea9bfcdc",
     "scripts/macos/test-native-worker.py": "eb8842cac913b0e4f752d45bda005c00e98b42f7e455bb8991c159a88c78caf2",
-    "scripts/macos/phase2-wp6b-fresh-user.py": "9a5a75fa08b0b2f694525b323fcbbb26ea068420e1ff3ae6d50a264139f89982"
+    "scripts/macos/phase2-wp6b-fresh-user.py": "e285b221f7bb7aaea73776925ddb44d09568621e00efe2afcdf0f1f32ac96208"
   },
   "acceptance_build": {
     "path": "target/macos/native-wrap/worker-runs/6144257da32d40a18d119eedf85cec4f/acceptance-build.json",
@@ -174,5 +174,19 @@
     "reason": "Colima default and hemi-macos-cpu profiles reported Broken during WP6b; WP7 source-bound Linux CPU-only check passed, and WP6b changes are Mac native-feature gated"
   },
   "archive_pr_comment": "https://github.com/dimitryB/risc0/pull/1#issuecomment-6697430623",
-  "engine_wp6b_pr": "https://github.com/dimitryB/risc0/pull/2"
+  "engine_wp6b_pr": "https://github.com/dimitryB/risc0/pull/2",
+  "true_cold": {
+    "evidence_path": "docs/macos/evidence/phase2-wp6b-cold.json",
+    "evidence_sha256": "4410bc66a24add1d0aad08f7bb9159bb441ede1608c137771068ff36ff19ee0d",
+    "raw_run_dir": "/Users/Shared/wp6b-cold-reading-826dbf2840994069b10a5878e71a6840",
+    "raw_result_sha256": "cf725000dcf59e40e499b25a1b4ba69c09ff2958de43e85422925269a281a00a",
+    "spans_ms": {
+      "spawn_to_handshake": 106.36541700000001,
+      "handshake_to_first_proof_request": 0.000709,
+      "request_to_first_completed_gpu_dispatch": 25128.991
+    },
+    "complete_proof_ms": 62467.201417,
+    "tamper_rejections": 3,
+    "status": "passed"
+  }
 }

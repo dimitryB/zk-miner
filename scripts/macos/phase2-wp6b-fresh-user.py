@@ -72,7 +72,7 @@ def main():
               "verifier_build": verifier, "acceptance_build": acceptance_build,
               "script_sha256": sha(SCRIPT), "guest_sha256": sha(guest), "input_sha256": sha(run / "input.bin"),
               "assets_manifest_sha256": sha(assets / "manifest.json")}
-    cache_base = Path(os.environ.get("TMPDIR", "/private/tmp")).resolve().parent.parent / "C/com.apple.gpuarchiver"
+    cache_base = Path(os.environ.get("TMPDIR", "/private/tmp")).resolve().parent / "C/com.apple.gpuarchiver"
     report["driver_cache_directory"] = str(cache_base)
     report["driver_cache_entries_before"] = len(list(cache_base.iterdir())) if cache_base.is_dir() else 0
     print(run, flush=True)

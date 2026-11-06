@@ -15,6 +15,7 @@ unknown. No OS cold boot or GPU energy measurement is claimed.
 | Spawn → HelloAck, three launches (median) | 4.619 s | 0.107 s |
 | Build-time po2-14 verified proof | Not required | 29.164 s |
 | First post-build request → first completed GPU dispatch | — | 0.057 s |
+| Fresh-user cold request → first completed GPU dispatch | — | 25.129 s |
 
 The baseline launch samples were 6.055, 4.613 and 4.619 s; WP6b samples
 were 0.106, 0.107 and 0.212 s. The first post-build proof used a direct
@@ -24,6 +25,15 @@ and three tamper rejections. The build-time proof warmed a driver cache that
 was already warm for these sources; a fresh-user true cold reading is pending.
 The cross-process request-to-dispatch span uses UNIX epoch nanosecond markers
 on one host; the launch and handshake spans use monotonic `Instant` timers.
+Under the newly created `zkmac` account, the three cold spans were 0.106 s
+launch → handshake, 0.0007 ms handshake → request, and 25.129 s request →
+first completed GPU dispatch. Its complete po2-14 proof took 62.467 s and
+passed the unchanged verifier and three tamper rejections. Browser processes
+were closed and Foundation thermal stayed nominal. No driver cache was
+deleted. The raw script reported an invalid cache-directory count because
+it derived the path one level too high; the result relies on the first login
+to a fresh account and the observed dispatch delay, not that count. See
+[cold evidence](evidence/phase2-wp6b-cold.json).
 
 The final worker passed 21 lifecycle/recovery proofs and 63 tamper checks,
 po2-14/18/20 exact segment and recursion CPU differentials, nine limit

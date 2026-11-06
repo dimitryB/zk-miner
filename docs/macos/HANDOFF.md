@@ -25,10 +25,16 @@ Thermal was nominal during validation and fair afterward. The Linux CPU-only
 check was not repeated because both Colima profiles reported Broken.
 See [WP6b evidence](evidence/phase2-wp6b-validation.json).
 
-The true cold driver reading is pending under the newly created `zkmac`
-account. Once its three spans are recorded and the WP6b evidence finalized,
-the next step is the one-hour `identity_p254` profile from the revised spec;
-it requires the owner's go-ahead. WP8 remains unstarted.
+The newly created `zkmac` account made one true cold-driver reading on its
+first login, with no cache deletion: 0.106 s spawn → handshake, 0.0007 ms
+handshake → request, and 25.129 s request → first completed GPU dispatch.
+The complete po2-14 proof took 62.467 s and passed the unchanged verifier
+and three tamper rejections. Browser processes were closed and thermal was
+nominal before and after. The raw script's optional cache-directory count
+used a path one level too high; the count is excluded from the cold claim,
+and the script is corrected. See [cold evidence](evidence/phase2-wp6b-cold.json).
+WP6b is closed. Next is the one-hour `identity_p254` profile from the revised
+spec; it requires the owner's go-ahead. WP8 remains unstarted.
 
 ## WP7 admission estimator — 2026-11-06
 

@@ -12,7 +12,8 @@ measurements below retain their original commit references; the
 
 WP6b builds of `native-rv32im-metal` always run one complete po2-14 proof
 after sealing, even without `--tests`. The build record stores its proof time
-and first completed GPU dispatch time; a failed warm-up removes the seal.
+and first completed GPU dispatch time; a nonzero or timed-out warm-up removes
+the seal.
 Engine `7816a0002642bf97bbcdd82bd55ebaa22d84ad80` begins native bundle
 hashing during worker startup and joins it before witness or helper use.
 The existing verifier and assets remain unchanged. Build with the exact
@@ -36,7 +37,9 @@ the complete proof with all three tamper checks and writes its result under
 `/Users/Shared/wp6b-cold-reading-*/result.json`. The fresh account must have
 read access to the `dbur` repositories and sealed assets; the standard
 `staff` group has it on this host. The [WP6b validation record](evidence/phase2-wp6b-validation.json)
-contains the warm-driver gates and correctness runs.
+contains the warm-driver gates and correctness runs. The one fresh-user run
+is in [WP6b cold evidence](evidence/phase2-wp6b-cold.json); its first GPU
+completion came 25.129 s after request, versus 0.057 s on the warm account.
 
 Build with `build-worker.py --mode native-rv32im-metal` and the exact reviewed
 engine SHA. Select the stages with `RISC0_SEGMENT_HAL=metal` and
