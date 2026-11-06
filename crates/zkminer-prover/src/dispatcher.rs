@@ -3553,12 +3553,9 @@ impl WorkerPool {
         expected_peak: u64,
         slot_key: &str,
     ) -> Option<crate::memory::MemoryReservation<'_>> {
-        // Both gates share ONE policy for "the host's memory is unreadable": fail OPEN, and keep
-        // accounting. They previously disagreed — the claim gate returned `true` while this returned
-        // `None` — so an unreadable `/proc/meminfo` let every job pass the claim gate and then fail
-        // at dispatch: a penalised release per job, indefinitely. Failing open is the right half to
-        // keep, since the per-worker ceiling and `oom_score_adj` still stand behind it, whereas
-        // refusing all work over a missing file stops the miner dead.
+        // Linux claim and dispatch gates fail open together when /proc/meminfo
+        // is unreadable; the per-worker ceiling remains active. macOS requires
+        // a readable VM estimate and kernel pressure signal before admission.
         let (available, total) = match (
             crate::memory::mem_available_bytes(),
             crate::memory::mem_total_bytes(),

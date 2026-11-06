@@ -1,5 +1,27 @@
 # macOS proving measurements
 
+## WP7 desktop admission validation — 2026-11-06
+
+The [WP7 validation record](evidence/phase2-wp7-validation.json) uses the
+unchanged WP8-lite Metal worker and verifier, po2 20, 18 Rayon/Go threads and
+the new default 8 GiB host reserve. Brave, Zed and the default Colima VM were
+running. Before the 10M arithmetic proof, the conservative VM estimate was
+64.87 GiB and `memory_pressure -Q` reported 80% system-wide free. The complete
+proof verified and all three tamper checks rejected. `WorkerPool::prove` took
+58.535 s; the worker reported 58.041 s. Their 0.494 s gap includes IPC and
+host handling, so any admission wait was below the 5 s gate. This is an
+admission check under desktop load, not a controlled latency comparison.
+
+The opt-in `--kernel-pressure` acceptance case ran macOS
+`memory_pressure -l warn -s 30`. At kernel warning level 2, the production
+gate returned a typed host shortage in 0.5 ms before any worker request or
+helper started. Pressure returned to normal 32 ms after allocator exit, then
+a Metal proof verified with three tamper rejections. The separate
+`--admission-pressure` logical reservation case also refused and recovered.
+The record includes host snapshots, source and binary hashes, raw run paths,
+and six macOS policy plus twelve memory ledger unit test results. CPU-only
+builds passed on macOS and in the offline Colima Linux VM.
+
 ## Controlled final absolute reading — 2026-11-06
 
 The revised brief SHA-256 is

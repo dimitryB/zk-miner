@@ -24,10 +24,14 @@ def main():
                                                   counters["Pages inactive"]) / 2) * page_size
     thermal = json.loads(subprocess.check_output(
         [str(ROOT / "target/macos/benchmark-tools/thermal")], text=True))
+    pressure = subprocess.check_output(["memory_pressure", "-Q"], text=True)
+    free_percent = int(re.search(r"System-wide memory free percentage: (\d+)%", pressure).group(1))
     report = {
         "observed_utc": datetime.now(timezone.utc).isoformat(),
         "estimated_available_bytes": int(available),
         "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+        "kernel_memory_free_percent": free_percent,
+        "kernel_memory_free_percent_method": "memory_pressure -Q; a pressure metric, not free physical pages",
         "thermal": thermal,
         "background_process_present": {
             "brave": "Brave Browser" in processes,
@@ -36,6 +40,7 @@ def main():
             "colima": ".colima/" in processes,
             "vscode": "/Visual Studio Code.app/" in processes,
             "xcode": "/Xcode.app/" in processes,
+            "zed": "/Zed.app/" in processes,
         },
         "scope": "instantaneous host observation; process changes are recorded by the campaign driver",
     }

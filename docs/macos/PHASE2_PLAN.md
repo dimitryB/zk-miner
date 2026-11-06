@@ -1,5 +1,23 @@
 # Phase 2: Metal proving performance on macOS
 
+## WP7 admission estimator — 2026-11-06
+
+On the separate `codex/hemi-macos-metal-wp7` miner branch, admission now uses
+normal kernel pressure plus the measured worker/helper footprint as its primary
+signal. The conservative VM estimate remains a secondary floor. The default
+reserve is 8 GiB, with the configured 8..64 GiB range unchanged. The ledger's
+total-commitment limit and the 32 GiB owned-footprint guard remain active.
+
+With Brave, Zed and the default Colima VM running, the 10M arithmetic proof
+verified at 64.87 GiB of conservative preflight headroom. The entire caller
+time beyond the worker's reported proof time was 0.494 s, an upper bound on
+admission wait. A real allocation raised kernel pressure to warning; the gate
+refused in 0.5 ms before any worker request or helper, returned to normal after
+the allocator exited, and the next Metal proof verified. The logical reservation
+case also refused and recovered. See
+`evidence/phase2-wp7-validation.json`. WP7's specified admission gates passed;
+review is pending in its own PR.
+
 ## Controlled final reading — revised brief, 2026-11-06
 
 The latest re-export SHA-256 is
@@ -471,7 +489,7 @@ brief remains the detailed technical and acceptance specification.
 | WP1b remaining evalfast passes | Evaluator at most 1.2 s per segment and at least 3 s saved at 10M | Closed: 1.043/1.001 s evaluator GPU medians, 6.846/7.022 s complete savings, exact differentials and lifecycle passed. |
 | WP8-lite native wrap overlap | At least 1.5 s saved at 10M; cancellation during identity and wrap leaves no helper; lifecycle green | Closed, timing gate missed: 0.018/0.034 s saved at 10M and 0.988 s at 46M; 36 paired proofs, 21 lifecycle proofs, cancellation and platform checks passed. Best correct variant retained. |
 | WP6 pipeline cache | Warm process first dispatch at most 5 s, stale archive rebuilds | Pending |
-| WP7 admission | No refusal under specified desktop load with at least 40 GiB truly free; pressure refusal still works | Pending |
+| WP7 admission | No refusal under specified desktop load with at least 40 GiB truly free; pressure refusal still works | Passed; separate PR pending review |
 | WP8 identity_p254 on Metal | Exact differential and verified identity receipts | Optional; requires owner approval before starting |
 
 The mid-point decision after WP3 targets both 10M warm medians at most 60 s.

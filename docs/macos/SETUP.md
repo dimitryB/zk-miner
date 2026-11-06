@@ -47,30 +47,30 @@ beyond the single-worker admission requirement before starting the comparison.
 
 The current po2-20 resident Metal configuration is intended for a **64 GiB-class
 Apple Silicon Mac or larger**. Validation has used an Apple M5 Max with 128 GiB;
-64 GiB capacity itself has not been tested. The default admission calculation
-requires approximately **40 GiB available** before accounting for resident worker
-credit: a 24 GiB initial proof budget plus a 16 GiB host reserve. Installed RAM
-alone does not establish admission when other applications or VMs use memory.
+64 GiB capacity itself has not been tested. On the WP7 branch, the default host
+reserve is **8 GiB**; the configured range remains 8..64 GiB. Admission requires
+normal kernel memory pressure and accounts for the measured resident worker and
+helper footprint. As a secondary check, the conservative VM estimate must cover
+the reserve plus at most 8 GiB of projected additional owned footprint. For a
+fresh worker with a 24 GiB budget, that floor is 16 GiB of estimated headroom.
+The ledger still bounds total commitments and the worker guard enforces the
+32 GiB owned-footprint ceiling. Installed RAM alone does not establish admission.
 
 The original campaign's largest worker/helper footprint was 16.305 GiB; the
 review's warmed proof groups reached 19.783 GiB. These observations exclude
 other retained workers and host processes; they are not worst-case bounds.
-The 32 GiB worker/helper ceiling, kernel pressure check and existing headroom
-floor still apply. The post-refresh serial regression used an explicitly recorded
-12 GiB reserve; the production default remains 16 GiB. A smaller-machine po2-18
-profile has not been validated. Lowering the segment cap alone is not documented
-as establishing support for a 32 GiB Mac.
+The post-refresh serial regression used an explicitly recorded 12 GiB reserve;
+the earlier controlled final reading used the then-default 16 GiB reserve.
+A smaller-machine po2-18 profile has not been validated. Lowering the segment
+cap alone is not documented as establishing support for a 32 GiB Mac.
 
-For a controlled desktop admission test, set `ZKMINER_MACOS_HOST_RESERVE_GIB=12`
-on the single-worker acceptance command. This changes the initial 24 GiB proof
-budget plus reserve threshold from about 40 GiB to 36 GiB before resident credit.
-It still requires normal kernel pressure and does not change the in-flight 8 GiB
-headroom floor or 32 GiB group limit. Test with ordinary apps open and compare
-the headroom at the proof call, since it can change between preflight and dispatch.
-The [desktop spot check](evidence/rv32im-desktop-admission-spot-check.json)
-verified one 10M arithmetic proof at 39.28 GiB of estimated headroom with a
-12 GiB reserve and Brave open. This is a local test setting; the default
-remains 16 GiB.
+The [WP7 desktop validation](evidence/phase2-wp7-validation.json) used the new
+default reserve with Brave, Zed and Colima running. A 10M arithmetic proof
+verified with 64.87 GiB conservatively estimated available at preflight. A
+real warning-pressure allocation caused a typed refusal before worker dispatch;
+the next proof verified after pressure returned to normal. The earlier
+[12 GiB override spot check](evidence/rv32im-desktop-admission-spot-check.json)
+belongs to the pre-WP7 policy.
 
 ## Native macOS wrapping
 

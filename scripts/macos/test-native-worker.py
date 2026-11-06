@@ -42,6 +42,8 @@ def main():
     parser.add_argument("--rayon-threads", type=int, choices=range(1,19), default=18)
     parser.add_argument("--go-threads", type=int, choices=range(1,19), default=18)
     parser.add_argument("--admission-pressure", action="store_true")
+    parser.add_argument("--kernel-pressure", action="store_true",
+                        help="apply real macOS warning pressure and check refusal before dispatch and recovery")
     parser.add_argument("--calibration", type=Path, help="load a measured DeviceBenchmark for native host-memory admission")
     parser.add_argument("--limit-controls", action="store_true", help="run input rejection controls without completing a proof")
     parser.add_argument("--thread-cases", help="comparison settings, e.g. 6:6,12:6,18:6")
@@ -92,6 +94,8 @@ def main():
     if args.pipeline_cancel and (not args.proof_only or args.po2 != 20 or
                                  args.segment_hal != "metal" or args.recursion_hal != "metal"):
         parser.error("pipeline cancellation requires proof-only po2-20 Metal segment and recursion")
+    if args.kernel_pressure and not args.proof_only:
+        parser.error("kernel pressure requires proof-only acceptance")
     if args.recursion_cases:
         cases = args.recursion_cases.split(',')
         if args.worker_kind != "native-recursion-metal" or sorted(cases) != ["cpu", "metal"]:
@@ -145,6 +149,7 @@ def main():
                ZKMINER_MACOS_FAILURE_TIMEOUT_SECS=str(args.failure_timeout_seconds), RAYON_NUM_THREADS=str(args.rayon_threads),
                ZKMINER_RISC0_CPU_THREADS=str(args.rayon_threads), RISC0_GROTH16_NATIVE_THREADS=str(args.go_threads),
                ZKMINER_MACOS_ADMISSION_PRESSURE="1" if args.admission_pressure else "0",
+               ZKMINER_MACOS_KERNEL_PRESSURE="1" if args.kernel_pressure else "0",
                PATH=str(directory / "bin") + os.pathsep + os.environ["PATH"])
     if args.thread_cases:
         env.update(ZKMINER_MACOS_THREAD_CASES=args.thread_cases, ZKMINER_MACOS_THREAD_SAMPLES=str(args.samples))

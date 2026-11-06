@@ -1,5 +1,28 @@
 # macOS proving handoff
 
+## WP7 admission estimator — 2026-11-06
+
+The WP7 miner branch is `codex/hemi-macos-metal-wp7`, based on the Phase 2
+branch. Its source-bound Metal worker is the unchanged WP8-lite binary
+`625589c35f6583bfaf4510a00d6f98dceb781b004064500ce38b44b42d659be7`
+from engine `6521f87c2`. The default host reserve changes from 16 to 8 GiB;
+normal kernel pressure and measured owned footprint drive admission, with the
+conservative VM estimate retained as a floor. The 8..64 GiB override range and
+32 GiB worker/helper ceiling remain.
+
+Brave, Zed and default Colima were present for the 10M arithmetic proof. The
+preflight VM estimate was 64.87 GiB; no admission refusal occurred and the
+caller-minus-worker time was 0.494 s, bounding admission wait. The unchanged
+external verifier accepted the proof and rejected all three tamper cases.
+An opt-in real allocation raised kernel pressure to warning; admission refused
+before dispatch in 0.5 ms, with zero sidecars and helpers, and a proof verified
+after the allocator exited and pressure recovered. The logical reservation
+case also refused and recovered. Six macOS policy and twelve memory ledger
+tests passed. CPU-only feature paths compiled on macOS and in the offline
+Colima Linux VM. See [WP7 evidence](evidence/phase2-wp7-validation.json) and the
+[setup guidance](SETUP.md). WP6 remains in its separate engine draft PR with
+its cold-start gate miss documented.
+
 ## Controlled final reading — 2026-11-06
 
 The updated Phase 2 brief SHA-256 is

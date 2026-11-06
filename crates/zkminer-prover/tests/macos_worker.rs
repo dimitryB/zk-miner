@@ -7,7 +7,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -854,6 +854,103 @@ fn admission_pressure(pool: &WorkerPool, elf: &[u8], workload: &Workload, eviden
     // independently verify a genuine full proof after releasing the guards.
 }
 
+fn kernel_pressure(pool: &WorkerPool, elf: &[u8], workload: &Workload, evidence: &Path) {
+    fn level() -> Option<u32> {
+        let output = Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.memorystatus_vm_pressure_level"])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+            .flatten()
+    }
+    struct PressureChild(Child);
+    impl Drop for PressureChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    assert_eq!(level(), Some(1));
+    let before = sidecar_paths();
+    assert!(helpers().is_empty());
+    let log = fs::File::create(evidence.join("kernel-pressure.log")).unwrap();
+    let child = Command::new("/usr/bin/memory_pressure")
+        .args(["-l", "warn", "-s", "30"])
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("cannot start real memory-pressure allocator");
+    let mut allocator = PressureChild(child);
+    let started = Instant::now();
+    let warned = loop {
+        let pressure = level();
+        if matches!(pressure, Some(2 | 4)) {
+            break pressure.unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "real allocator did not raise kernel pressure within 60 seconds"
+        );
+        assert!(
+            allocator.0.try_wait().unwrap().is_none(),
+            "real allocator exited before kernel pressure changed"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let warning_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let needed = pool.expected_host_peak_at_po2("risc0", Some(workload.po2));
+    let refused_at = Instant::now();
+    let refusal = pool
+        .prove(
+            "risc0",
+            elf,
+            &workload.input,
+            Some(workload.po2),
+            Some(Duration::from_secs(30)),
+            None,
+        )
+        .expect_err("proof dispatched under warning or critical kernel pressure");
+    let refusal_ms = refused_at.elapsed().as_secs_f64() * 1000.0;
+    let shortage = refusal
+        .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+        .expect("kernel pressure did not return typed HostMemoryShortage");
+    assert!(!shortage.attempted, "pressure refusal attempted a proof");
+    assert_eq!(shortage.slot_key, KEY);
+    assert_eq!(shortage.needed, needed);
+    assert_eq!(sidecar_paths(), before, "pressure refusal started a worker request");
+    assert!(helpers().is_empty(), "pressure refusal started a helper");
+    drop(allocator);
+    let release_started = Instant::now();
+    while level() != Some(1) {
+        assert!(
+            release_started.elapsed() < Duration::from_secs(30),
+            "kernel pressure did not recover after allocator exit"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let report = json!({
+        "kind":"real_allocation_kernel_pressure", "allocator_command":"memory_pressure -l warn -s 30",
+        "warning_level":warned, "time_to_warning_ms":warning_ms,
+        "refusal_ms":refusal_ms, "attempted":shortage.attempted,
+        "host_reserve_bytes":zkminer_prover::memory::host_reserve_bytes(),
+        "sidecar_count_before":before.len(), "sidecar_count_after":sidecar_paths().len(),
+        "helper_count_after":helpers().len(), "recovered_level":1,
+        "recovery_ms":release_started.elapsed().as_secs_f64()*1000.0,
+        "error":format!("{refusal:#}"),
+    });
+    fs::write(
+        evidence.join("kernel-pressure.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    ledger(evidence, &json!({"case":"kernel-pressure","status":"refused_then_recovered","pressure":report}));
+    // The normal proof loop then proves and independently verifies recovery.
+}
+
 fn verify(
     verifier: &Path,
     program: &Path,
@@ -1170,9 +1267,17 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         "1" => true,
         _ => panic!("admission pressure must be 0 or 1"),
     };
+    let real_pressure = match std::env::var("ZKMINER_MACOS_KERNEL_PRESSURE")
+        .as_deref()
+        .unwrap_or("0")
+    {
+        "0" => false,
+        "1" => true,
+        _ => panic!("kernel pressure must be 0 or 1"),
+    };
     assert!(
-        !pressure || !lifecycle,
-        "logical admission pressure requires proof-only acceptance"
+        !(pressure || real_pressure) || !lifecycle,
+        "admission pressure cases require proof-only acceptance"
     );
     if let Some(path) = std::env::var_os("ZKMINER_MACOS_CALIBRATION") {
         use zkminer_prover::benchmark::{BenchmarkSuite, DeviceBenchmark};
@@ -1196,6 +1301,9 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
     }
     if pressure {
         admission_pressure(&pool, &elf, &workload, &evidence);
+    }
+    if real_pressure {
+        kernel_pressure(&pool, &elf, &workload, &evidence);
     }
     let mut request_identities = BTreeSet::new();
     let warmups: usize = std::env::var("ZKMINER_MACOS_WARMUP_COUNT")
@@ -1513,6 +1621,6 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
         "verified_proofs":repeats + usize::from(lifecycle), "helper_cancel":lifecycle,"helper_timeout":lifecycle && worker_kind() != "native","worker_timeout":lifecycle,
         "restart":lifecycle,"shutdown":true,"pipeline_cancel":pipeline_cancel,"workload":workload.name,"po2":workload.po2,
         "min_segments":workload.min_segments,"expected_journal_hex":workload.expected_hex,
-        "admission_pressure":pressure,"unique_completed_requests":request_identities.len(),
+        "admission_pressure":pressure,"kernel_pressure":real_pressure,"unique_completed_requests":request_identities.len(),
     })).unwrap()).unwrap();
 }

@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "scope": "WP7 admission estimator on 128 GiB Apple Silicon Mac; separate from WP6 engine archive PR",
+  "spec_sha256": "c7cd2ab3cf8f6f67fb4deeabfd9ed86c28d24aa98c0e7c1a7b578640718d475d",
+  "branch": "codex/hemi-macos-metal-wp7",
+  "engine_head": "6521f87c2daf873c54d011a33d48fee8097db924",
+  "engine_clean_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "worker_sha256": "625589c35f6583bfaf4510a00d6f98dceb781b004064500ce38b44b42d659be7",
+  "verifier_sha256": "2bcdcb7f50e2303545898962d23bdc6cba9512038383a93c975f95b89cf8225c",
+  "acceptance_binary_sha256": "efd6dc7536838ab5c99fd365705e30eba8340421f979fc66e14742a313233cc4",
+  "acceptance_source_sha256": {
+    "Cargo.lock": "75d710409c3107e465ca0520bb7c551e8027c47ecb7c8e3b13d9b106cad5c6b9",
+    "crates/zkminer-prover/src/dispatcher.rs": "9bdabb96f3cf3842bc56c22f70931ea5751e5a0314f2a8899ca8177346ea3c81",
+    "crates/zkminer-prover/src/macos.rs": "7ef8a286d303215ca7fcb12127abe470baa29da19f6e313f383228637c6eb81a",
+    "crates/zkminer-prover/src/memory.rs": "6e7c799b3384ba2f8b4686357219a660661b5fd8a85b8496e3649a658fdaed2b",
+    "crates/zkminer-prover/tests/macos_worker.rs": "7fd27fbf3a772357eb028c205d3db2d1924345ee2faaf2574370cf1cf0179a67"
+  },
+  "host_before_10m": {
+    "observed_utc": "2026-11-06T20:38:52.332927+00:00",
+    "estimated_available_bytes": 69652094976,
+    "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+    "kernel_memory_free_percent": 80,
+    "kernel_memory_free_percent_method": "memory_pressure -Q; a pressure metric, not free physical pages",
+    "thermal": {
+      "low_power_false_may_mean_unknown": true,
+      "low_power_mode_enabled": false,
+      "schema_version": 1,
+      "thermal_nominal_may_mean_unknown": true,
+      "thermal_state": 0,
+      "thermal_state_name": "nominal"
+    },
+    "background_process_present": {
+      "brave": true,
+      "chatgpt_codex": true,
+      "claude": true,
+      "colima": true,
+      "vscode": false,
+      "xcode": false,
+      "zed": true
+    },
+    "scope": "instantaneous host observation; process changes are recorded by the campaign driver"
+  },
+  "host_after_10m": {
+    "observed_utc": "2026-11-06T20:40:36.624597+00:00",
+    "estimated_available_bytes": 69154332672,
+    "estimated_available_method": "free pages plus half of the lesser of file-backed and inactive pages",
+    "kernel_memory_free_percent": 80,
+    "kernel_memory_free_percent_method": "memory_pressure -Q; a pressure metric, not free physical pages",
+    "thermal": {
+      "low_power_false_may_mean_unknown": true,
+      "low_power_mode_enabled": false,
+      "schema_version": 1,
+      "thermal_nominal_may_mean_unknown": true,
+      "thermal_state": 0,
+      "thermal_state_name": "nominal"
+    },
+    "background_process_present": {
+      "brave": true,
+      "chatgpt_codex": true,
+      "claude": true,
+      "colima": true,
+      "vscode": false,
+      "xcode": false,
+      "zed": true
+    },
+    "scope": "instantaneous host observation; process changes are recorded by the campaign driver"
+  },
+  "normal_desktop_10m": {
+    "run": "target/macos/native-wrap/worker-runs/c1ebd27d0a5d4d34a2cfc758a7e343b6",
+    "fixture": "fibonacci arithmetic, 1,000,000 iterations, >=10,000,000 guest cycles, po2 20, 18 Rayon/Go threads",
+    "reserve_override": null,
+    "default_reserve_gib": 8,
+    "verified_proofs": 1,
+    "tamper_rejections": 3,
+    "prove_call_ms": 58535.007584,
+    "worker_total_ms": 58040.934625,
+    "admission_wait_upper_bound_ms": 494.07295899999735,
+    "admission_wait_upper_bound_method": "prove call wall time minus worker-reported total; includes IPC and host handling, so admission wait cannot exceed this gap",
+    "same_worker_before_and_after": true,
+    "refusals": 0
+  },
+  "real_pressure": {
+    "run": "target/macos/native-wrap/worker-runs/489fe9328e2d4a4a9c551a7ce885e60f",
+    "details": {
+      "allocator_command": "memory_pressure -l warn -s 30",
+      "attempted": false,
+      "error": "host RAM is short for risc0:generic: needs ~24.0 GiB, 0.0 GiB already reserved by proofs in flight, 0.0 GiB available",
+      "helper_count_after": 0,
+      "host_reserve_bytes": 8589934592,
+      "kind": "real_allocation_kernel_pressure",
+      "recovered_level": 1,
+      "recovery_ms": 32.392666,
+      "refusal_ms": 0.49716699999999997,
+      "sidecar_count_after": 0,
+      "sidecar_count_before": 0,
+      "time_to_warning_ms": 22309.067082999998,
+      "warning_level": 2
+    },
+    "proof_after_recovery_verified": 1,
+    "tamper_rejections_after_recovery": 3
+  },
+  "logical_reservation": {
+    "attempted": false,
+    "error": "host RAM is short for risc0:generic: needs ~24.0 GiB, 97.0 GiB already reserved by proofs in flight, 61.1 GiB available",
+    "helper_count_after": 0,
+    "host_available_at_refusal_bytes": 65596063744,
+    "host_available_bytes": 65599553536,
+    "host_reserve_bytes": 8589934592,
+    "host_total_bytes": 137438953472,
+    "kind": "in_flight_reservation_admission",
+    "needed_bytes": 25769803776,
+    "physical_memory_pressure": false,
+    "reservation_count": 97,
+    "reserved_after_bytes": 0,
+    "reserved_before_bytes": 0,
+    "reserved_held_bytes": 104152956928,
+    "sidecar_count_after": 0,
+    "sidecar_count_before": 0,
+    "step_bytes": 1073741824,
+    "worker_pid_after": 21596,
+    "worker_pid_before": 21596
+  },
+  "bounded_pressure_probe": {
+    "run": "target/macos/phase2/wp7-kernel-pressure-probe.json",
+    "before": {
+      "pressure_level": 1,
+      "kernel_memory_free_percent": 86
+    },
+    "warning_sample": {
+      "elapsed_s": 31.417,
+      "pressure_level": 2,
+      "kernel_memory_free_percent": 48
+    },
+    "after": {
+      "pressure_level": 1,
+      "kernel_memory_free_percent": 81
+    }
+  },
+  "unit_tests": {
+    "macos_policy_passed": 6,
+    "memory_ledger_passed": 12
+  },
+  "feature_paths": {
+    "macos_cpu_only": {
+      "status": "passed",
+      "command": "cargo check --offline --locked -p zkminer-prover --no-default-features",
+      "log_path": "target/macos/phase2/wp7-cpu-only-check.log",
+      "log_sha256": "f5e952af096a494b54b38cea6ee2627c481adc681e6533f0231de89366174add"
+    },
+    "linux_cpu_only": {
+      "status": "passed",
+      "command": "cargo check --offline --locked -p zkminer-prover --no-default-features",
+      "log_path": "target/macos/phase2/wp7-linux/check.log",
+      "log_sha256": "ae7062aaad39affe8feeaf941425f752d169e52c7c8f63ed8007ce0924195cbd"
+    }
+  }
+}
