@@ -43,7 +43,7 @@ use std::time::Duration;
 #[cfg(not(target_os = "macos"))]
 pub const DEFAULT_HOST_RESERVE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 #[cfg(target_os = "macos")]
-pub const DEFAULT_HOST_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const DEFAULT_HOST_RESERVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Host memory SP1's one-time warm-up (`WorkerPool::warm_up`) may use at peak: where the server
 /// runs Groth16 in a helper, building the stripped circuit reads the full one (13.9 GB measured on

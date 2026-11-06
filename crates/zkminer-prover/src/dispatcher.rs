@@ -3579,12 +3579,15 @@ impl WorkerPool {
         // the full peak on top would count the same pages twice — see `can_admit`'s `resident`.
         // Zero when unreadable, which is the conservative reading.
         let resident = self.current_host_bytes_for_slot(slot_key).unwrap_or(0);
+        let reserve = crate::memory::host_reserve_bytes();
+        #[cfg(target_os = "macos")]
+        let available = crate::macos::admission_headroom(available, expected_peak, resident, reserve)?;
         self.memory_ledger.try_reserve(
             expected_peak,
             resident,
             available,
             total,
-            crate::memory::host_reserve_bytes(),
+            reserve,
         )
     }
 
@@ -3734,6 +3737,10 @@ impl WorkerPool {
         want: u64,
         abort_at: Option<Instant>,
     ) -> Option<crate::memory::MemoryReservation<'_>> {
+        #[cfg(target_os = "macos")]
+        if crate::macos::pressure_level() != Some(1) {
+            return None;
+        }
         let backend = key.split(':').next().unwrap_or(key);
         let (Some(available), Some(total)) = (
             crate::memory::mem_available_bytes(),
@@ -3824,6 +3831,10 @@ impl WorkerPool {
             self.resident_host_bytes_for_backend(backend)
         } else {
             0
+        };
+        #[cfg(target_os = "macos")]
+        let Some(available) = crate::macos::admission_headroom(available, expected_peak, resident, reserve) else {
+            return false;
         };
         let reserved = self.reserved_host_memory();
         if crate::memory::can_admit(expected_peak, resident, reserved, available, total, reserve) {

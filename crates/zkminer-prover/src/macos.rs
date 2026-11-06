@@ -174,7 +174,7 @@ pub fn pressure_level() -> Option<u32> {
 }
 
 fn parse_reserve(value: Option<&str>) -> Option<u64> {
-    let gib = value.map(str::parse::<u64>).unwrap_or(Ok(16)).ok()?;
+    let gib = value.map(str::parse::<u64>).unwrap_or(Ok(8)).ok()?;
     if !(8..=64).contains(&gib) {
         return None;
     }
@@ -262,6 +262,35 @@ pub fn admission_available_bytes() -> Option<u64> {
     Some(if pressure_level()? == 1 { available } else { 0 })
 }
 
+/// Translate a normal-pressure reading into the live headroom accepted by
+/// the shared reservation ledger. The VM estimate is a secondary floor:
+/// reserve plus at most 8 GiB of this proof's additional owned footprint.
+/// The ledger still bounds total commitments and the worker guard enforces
+/// the 32 GiB owned-footprint ceiling during the proof.
+fn policy_headroom(
+    available: u64,
+    pressure: Option<u32>,
+    expected_peak: u64,
+    resident: u64,
+    reserve: u64,
+) -> Option<u64> {
+    if pressure != Some(1) {
+        return None;
+    }
+    let growth = expected_peak.saturating_sub(resident);
+    let floor = reserve.saturating_add(growth.min(8 * 1024u64.pow(3)));
+    (available >= floor).then(|| available.max(growth.saturating_add(reserve)))
+}
+
+pub fn admission_headroom(
+    available: u64,
+    expected_peak: u64,
+    resident: u64,
+    reserve: u64,
+) -> Option<u64> {
+    policy_headroom(available, pressure_level(), expected_peak, resident, reserve)
+}
+
 fn safe_to_continue(
     footprint: Option<u64>,
     available: Option<u64>,
@@ -300,7 +329,7 @@ pub fn available_bytes() -> Option<u64> {
     // Bare free pages exclude the large filesystem cache after builds. Credit
     // only half the smaller of file-backed and inactive pages; do not add both
     // counters (they overlap), or credit compressed/anonymous pages separately.
-    // A further 16 GiB admission reserve and sampled RSS/pressure floor apply.
+    // The admission policy applies a separate reserve and pressure/floor gate.
     let reclaim_estimate = stats.external_page_count.min(stats.inactive_count) as u64 / 2;
     Some((stats.free_count as u64 + reclaim_estimate) * page_size as u64)
 }
@@ -507,7 +536,7 @@ mod tests {
     #[test]
     fn pressure_and_reserve_boundaries() {
         let gib = 1024u64.pow(3);
-        assert_eq!(parse_reserve(None), Some(16 * gib));
+        assert_eq!(parse_reserve(None), Some(8 * gib));
         assert_eq!(parse_reserve(Some("32")), Some(32 * gib));
         for value in ["0", "7", "65", "no", "18446744073709551615"] {
             assert_eq!(parse_reserve(Some(value)), None);
@@ -543,6 +572,24 @@ mod tests {
             Some(1),
             32 * gib
         ));
+    }
+
+    #[test]
+    fn admission_uses_pressure_first_and_vm_estimate_as_a_floor() {
+        let gib = 1024u64.pow(3);
+        // A fresh 24 GiB budget no longer demands 24 + 16 GiB of the
+        // conservative VM estimate; normal pressure and 16 GiB suffice.
+        assert_eq!(policy_headroom(40 * gib, Some(1), 24 * gib, 0, 8 * gib), Some(40 * gib));
+        assert_eq!(policy_headroom(16 * gib, Some(1), 24 * gib, 0, 8 * gib), Some(32 * gib));
+        assert_eq!(policy_headroom(15 * gib, Some(1), 24 * gib, 0, 8 * gib), None);
+        // The actual owned footprint reduces expected growth. Warning,
+        // critical or unreadable kernel pressure always refuses, then a
+        // recovered normal reading permits the same request again.
+        assert_eq!(policy_headroom(12 * gib, Some(1), 24 * gib, 20 * gib, 8 * gib), Some(12 * gib));
+        assert_eq!(policy_headroom(40 * gib, Some(2), 24 * gib, 0, 8 * gib), None);
+        assert_eq!(policy_headroom(40 * gib, Some(4), 24 * gib, 0, 8 * gib), None);
+        assert_eq!(policy_headroom(40 * gib, None, 24 * gib, 0, 8 * gib), None);
+        assert!(policy_headroom(40 * gib, Some(1), 24 * gib, 0, 8 * gib).is_some());
     }
 
     #[test]
