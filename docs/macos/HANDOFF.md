@@ -1,5 +1,41 @@
 # macOS proving handoff
 
+## WP1b evalfast hot slab and chain tails — 2026-11-06
+
+The revised Phase 2 brief SHA-256 is
+`a8627ca24baec008b140a4bb75f9ef8bb75fd67281e9a8e628c328afb6542a09`.
+Engine `7222459e3` runs `mksm2.py` and `mksub.py` after the WP1 evalfast
+pipeline and retargets their output to MSL. At 256 threads, 32 hot slab
+words per phase occupy the full 32 KiB threadgroup budget; all other slab
+words remain private. The prior tail-split evaluator is available with
+`RISC0_RV32IM_TAIL_SPLIT=1`.
+
+The source-bound WP4 worker is sealed at
+`target/macos/phase2/wp4-baseline/manifest.json`. The pinned CUDA generator
+check, po2-4/8/14/18/20 synthetic CPU comparisons with reuse, and complete
+po2-14/18/20 real-witness CPU differentials passed. The po2-20 sweep
+selected 256 threads at 0.994 s repeated evaluator GPU time, versus 1.179,
+1.966 and 3.132 s at 128, 64 and 32. See
+[sweep evidence](evidence/phase2-wp1b-sweep.json).
+
+The first two five-pair fixture medians against sealed WP4 are
+57.324 → 50.477 s arithmetic 10M and 57.322 → 50.299 s hashing 10M,
+saving 6.846 and 7.022 s. Evaluator GPU medians are 1.043 and 1.001 s
+per segment. Both package gates pass on the 10M fixtures. The 46M median
+was 191.189 → 168.031 s, saving 23.158 s. All 36 campaign proofs
+verified with 108 tamper rejections, normal memory pressure, and a
+22.14 GiB maximum guard footprint. See
+[paired evidence](evidence/phase2-wp1b-paired.json) and
+[all paired rows](evidence/phase2-wp1b-paired.csv). The source-bound
+[validation record](evidence/phase2-wp1b-validation.json) binds 22/22,
+1/1 and 1/1 exact segment CPU checks at po2 14/18/20, the tail-split
+fallback, input limits, five CPU-only unit tests and three offline Linux
+feature paths. The 20-request lifecycle and recovery proof verified 21
+proofs with 63 tamper rejections; idle footprint decreased 7.06%.
+WP1b is closed and WP8-lite is next. The package-gate 10M medians are
+below 55 s, but the final absolute line still needs a controlled default
+16 GiB reserve reading.
+
 ## WP4 recursion evaluator — 2026-11-06
 
 The revised Phase 2 brief SHA-256 is

@@ -1,5 +1,39 @@
 # Phase 2: Metal proving performance on macOS
 
+## WP1b scope — remaining evalfast passes, 2026-11-06
+
+The current brief SHA-256 is
+`a8627ca24baec008b140a4bb75f9ef8bb75fd67281e9a8e628c328afb6542a09`.
+Engine `7222459e3` retargets the pinned CUDA pipeline's `mksm2.py` hot-slab
+placement and `mksub.py` chain-tail split to Metal. The generated shader
+places the 32 hottest words per main or LogUp phase in one 32 KiB
+threadgroup array at 256 threads; other words remain in private memory.
+The existing `RISC0_RV32IM_TAIL_SPLIT=1` fallback remains available.
+The sealed WP4 po2-20 pipelined worker is the baseline arm.
+
+The build-time CPU/CUDA polynomial check and the pinned CUDA generator
+`--check` pass. The synthetic Metal-vs-CPU harness matches at po2
+4/8/14/18/20 with reuse, offsets and sentinels. Complete po2-14/18/20
+real-witness proofs passed the segment CPU differential and unchanged
+external verifier. A source-identical po2-20 sweep with CPU checks and reuse
+measured evaluator GPU times of 3.132, 1.966, 1.179 and 0.994 seconds at
+32, 64, 128 and 256 threads respectively; 256 remains selected. See
+`evidence/phase2-wp1b-sweep.json` and `.csv`.
+The five-pair package campaign against sealed WP4 verified all 36 proofs
+and 108 tamper rejections. Arithmetic and hashing 10M complete medians
+fell 57.324 → 50.477 s and 57.322 → 50.299 s, saving 6.846 and
+7.022 s. The corresponding evaluator GPU medians fell 1.700 → 1.043 s
+and 1.681 → 1.001 s per segment. Both 10M package gates pass. The
+46M stretch improved 191.189 → 168.031 s. All rows had normal memory
+pressure and the largest guard footprint was 22.14 GiB. See
+`evidence/phase2-wp1b-paired.json` and `.csv`. The final clean worker passed
+22/22, 1/1 and 1/1 exact real-witness CPU checks at po2 14/18/20,
+the tail-split fallback, input-limit controls, five CPU-only unit tests and
+all three offline Linux feature paths. The 20-request lifecycle plus
+recovery proof verified 21 proofs and 63 tamper rejections; idle worker
+footprint decreased 7.06% from request 1 to request 20. See
+`evidence/phase2-wp1b-validation.json`. WP1b is closed; WP8-lite is next.
+
 ## WP4 scope — revised source brief, 2026-11-05
 
 The latest re-export has SHA-256
@@ -365,7 +399,7 @@ brief remains the detailed technical and acceptance specification.
 | WP2b wider overlap | At least 4 s saved at 10M against WP3, lifecycle and cancellation green | Closed after one bounded iteration; gate missed (−1.028/+0.129 s). Queue experiment reverted; WP3 worker retained. |
 | WP5 po2 21 assessment | Faster on both 10M fixtures and 46M within the 32 GiB ceiling | Closed; five-pair gate missed: +0.978/−3.016/+6.864 s savings. Po2-21 pipeline exceeded ceiling on resident reuse; po2-20 pipeline remains default. Lifecycle and build checks passed. |
 | WP4 recursion evaluator | At most 7 s lift/join at 10M, exact differential | Closed: 5.609/5.489 s recursion medians, 19/19 CPU differentials on both 10M witnesses, 36 paired proofs and 21-proof lifecycle passed; split plus lazy REDC is default. |
-| WP1b remaining evalfast passes | Evaluator at most 1.2 s per segment and at least 3 s saved at 10M | Next |
+| WP1b remaining evalfast passes | Evaluator at most 1.2 s per segment and at least 3 s saved at 10M | Closed: 1.043/1.001 s evaluator GPU medians, 6.846/7.022 s complete savings, exact differentials and lifecycle passed. |
 | WP6 pipeline cache | Warm process first dispatch at most 5 s, stale archive rebuilds | Pending |
 | WP7 admission | No refusal under specified desktop load with at least 40 GiB truly free; pressure refusal still works | Pending |
 | WP8 Poseidon254 | Exact differential and verified identity receipts | Optional; requires owner approval before starting |

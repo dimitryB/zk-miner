@@ -1,5 +1,47 @@
 # macOS proving measurements
 
+## WP1b evalfast hot slab and chain tails — 2026-11-06
+
+The revised brief SHA-256 is
+`a8627ca24baec008b140a4bb75f9ef8bb75fd67281e9a8e628c328afb6542a09`.
+Engine `7222459e3` ports the remaining pinned evalfast passes to MSL.
+A po2-20 CPU-checked synthetic sweep of the same shader and seed, including
+buffer reuse, measured evaluator GPU times of 3.132, 1.966, 1.179 and
+0.994 s at 32, 64, 128 and 256 threads. The 256-thread choice uses exactly
+32 KiB of threadgroup memory and passed the po2-4/8/14/18/20 synthetic
+CPU oracle. See [sweep JSON](evidence/phase2-wp1b-sweep.json) and
+[sweep rows](evidence/phase2-wp1b-sweep.csv).
+
+The sealed WP4 worker and WP1b candidate ran one excluded warmup per arm,
+then five alternating measured pairs on each 10M fixture at po2 20 with
+WP2 pipelining, 18 Rayon/Go threads, an 8 GiB reserve, the same native
+helper and unchanged verifier. The opening arm was reversed from the WP4
+campaign. All 36 complete proofs verified and all 108 tamper checks rejected.
+Memory pressure stayed normal, the browser was closed in recorded host
+snapshots, and the maximum guard footprint was 22.14 GiB.
+
+| Median of five | Sealed WP4 | WP1b | Saving |
+| --- | ---: | ---: | ---: |
+| Arithmetic 10M complete | 57.324 s | 50.477 s | 6.846 s |
+| Hashing 10M complete | 57.322 s | 50.299 s | 7.022 s |
+| Arithmetic 46M complete | 191.189 s | 168.031 s | 23.158 s |
+| Arithmetic evaluator GPU per segment | 1.700 s | 1.043 s | 0.657 s |
+| Hashing evaluator GPU per segment | 1.681 s | 1.001 s | 0.680 s |
+
+Both 10M package gates pass: at least 3 s complete latency saved and at
+most 1.2 s evaluator GPU time per segment. The 46M evaluator GPU median
+was 1.665 → 1.384 s per segment; the 1.2 s gate is specified for 10M.
+Full ranges, pair ratios, thermal observations, memory, and source identities
+are in [paired JSON](evidence/phase2-wp1b-paired.json) and
+[paired rows](evidence/phase2-wp1b-paired.csv).
+The source-bound [validation record](evidence/phase2-wp1b-validation.json)
+covers exact real-witness CPU checks at po2 14/18/20, the verified
+20-request lifecycle and recovery proof, a 7.06% idle-footprint decrease,
+the tail-split fallback, input limits, five CPU-only unit tests and three
+offline Linux feature paths. These package-gate measurements used an 8 GiB
+reserve; the final absolute-line reading requires the spec's controlled
+default 16 GiB reserve.
+
 ## WP4 recursion evaluator — 2026-11-06
 
 The revised brief SHA-256 is
