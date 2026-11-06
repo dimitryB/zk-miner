@@ -550,6 +550,7 @@ fn prove_staged(
             let checks =
                 after.completed_constraint_checks - recursion_before.completed_constraint_checks;
             let points = after.evaluation_points - recursion_before.evaluation_points;
+            let cpu_checks = after.cpu_differential_checks - recursion_before.cpu_differential_checks;
             if c.recursion_hal == "metal" {
                 ensure!(
                     checks >= 2 * info.stats.segments as u64 - 1 && points > 0,
@@ -557,6 +558,8 @@ fn prove_staged(
                 );
                 report["observed_stages"]["recursion_metal"] = json!({
                     "completed_constraint_checks":checks,"evaluation_points":points,
+                    "cpu_differential_checks":cpu_checks,
+                    "eval_check_split":after.eval_check_split,
                     "kernel_source_sha256":hash(risc0_zkvm::metal_recursion_kernel_source().as_bytes()),
                     "cpu_stages":["witness","accumulation"],
                 });

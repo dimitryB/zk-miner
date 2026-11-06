@@ -1,5 +1,41 @@
 # macOS proving measurements
 
+## WP4 recursion evaluator — 2026-11-06
+
+The revised brief SHA-256 is
+`a8627ca24baec008b140a4bb75f9ef8bb75fd67281e9a8e628c328afb6542a09`.
+The sealed WP5 po2-20 pipeline worker was paired with the six-part recursion
+Metal evaluator plus pinned lazy-REDC pass at the same po2 and pipeline
+setting. Each fixture used one
+excluded warmup per arm and five alternating measured pairs, with the opening
+arm reversed for hashing. Both arms used 18 Rayon/Go threads, an 8 GiB host
+reserve, the same helper bundle and unchanged verifier. All 36 proofs
+verified and all 108 tamper checks rejected. Memory pressure stayed normal;
+the largest owned worker/helper guard footprint was 22.49 GiB. Brave was
+closed in the recorded host snapshots.
+
+| Median of five | Sealed WP5 | WP4 split + lazy REDC | Saving |
+| --- | ---: | ---: | ---: |
+| Arithmetic 10M complete | 57.615 s | 55.571 s | 2.044 s |
+| Hashing 10M complete | 57.570 s | 55.589 s | 1.981 s |
+| Arithmetic 46M complete | 199.888 s | 189.745 s | 10.143 s |
+| Arithmetic 10M recursion | 7.733 s | 5.609 s | 2.124 s |
+| Hashing 10M recursion | 7.480 s | 5.489 s | 1.991 s |
+
+The recursion gate of at most 7 s on both 10M fixtures passes. Recursion
+evaluator GPU medians fell 3.394 → 1.270 s on arithmetic and
+3.143 → 1.158 s on hashing. The package-gate campaign used an 8 GiB reserve;
+these are paired results, not a controlled absolute-line reading with the
+default 16 GiB reserve. Full ranges, pair ratios, stage timings, memory,
+thermal observations and source identities are in
+[paired JSON](evidence/phase2-wp4-paired.json) and
+[paired rows](evidence/phase2-wp4-paired.csv).
+The first, pre-lazy split iteration is retained separately in
+[split iteration evidence](evidence/phase2-wp4-split-paired.json).
+The source-bound [WP4 validation record](evidence/phase2-wp4-validation.json)
+covers exact CPU differentials, the 20-request lifecycle, fallback, limits,
+CPU-only build, and offline Linux feature checks.
+
 ## WP5 segment po2 assessment — 2026-11-05
 
 The revised brief SHA-256 is

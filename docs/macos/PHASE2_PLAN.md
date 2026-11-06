@@ -1,5 +1,45 @@
 # Phase 2: Metal proving performance on macOS
 
+## WP4 scope — revised source brief, 2026-11-05
+
+The latest re-export has SHA-256
+`a8627ca24baec008b140a4bb75f9ef8bb75fd67281e9a8e628c328afb6542a09`.
+WP4 applies the existing recursion split generator to the Metal gated-sum
+evaluator, keeps the six parts in order inside one command buffer per check,
+and keeps Poseidon2 unchanged. The sealed WP5 po2-20 pipelined worker is the
+baseline arm. The gate is lift/join at most 7 seconds on each 10M fixture,
+with a build-time body check, recursion CPU differential on real witnesses,
+and complete externally verified proofs. The five-pair campaign holds po2 20,
+WP2 pipelining, 18 Rayon/Go threads, and the helper bundle fixed across arms.
+The six-part Metal evaluator is selected by default; set
+`RISC0_RECURSION_METAL_SPLIT=0` to select the prior single-kernel body for
+bisection. Set `RISC0_RECURSION_METAL_CHECK_CPU=1` in a validation run to
+compare every recursion constraint result with the CPU oracle on the same
+valid witness. The Metal port applies the CUDA generator's pinned lazy-REDC
+rewrite after the gated-sum split. HIP-specific arithmetic variants remain
+CUDA/HIP only.
+
+The split-only iteration on engine `47bbd7f5a` passed exact recursion
+differentials and all 36 paired proofs, reaching 6.829/6.560 s recursion
+medians on arithmetic/hashing 10M. A bounded lazy-REDC iteration reduced
+evaluator GPU time further, passed the 43-check po2-14 CPU differential,
+and became engine `bca7044c5`. The final source passed 19/19 CPU recursion
+checks on each complete po2-20 arithmetic and hashing witness. Its five-pair
+campaign against sealed WP5 verified all 36 proofs and 108 tamper rejections,
+with normal memory pressure and a 22.49 GiB maximum guard footprint.
+Recursion medians were 7.733 → 5.609 s arithmetic and 7.480 → 5.489 s
+hashing, meeting the ≤7 s gate on both. Complete medians were
+57.615 → 55.571 s arithmetic 10M, 57.570 → 55.589 s hashing 10M, and
+199.888 → 189.745 s arithmetic 46M. See
+`evidence/phase2-wp4-paired.json` and `.csv`; the pre-lazy iteration remains
+in `evidence/phase2-wp4-split-paired.json` and `.csv`.
+The final 20-request lifecycle plus recovery proof passed with 21 external
+verifications and 63 tamper rejections. Idle worker footprint decreased
+9.94% from request 1 to request 20. The fallback proof, input-limit controls,
+CPU-only build and five unit tests, and all three offline Colima Linux feature
+paths passed. See `evidence/phase2-wp4-validation.json`. WP4 is closed;
+WP1b is next.
+
 ## WP5 scope — revised source brief, 2026-11-05
 
 The latest re-export has SHA-256
@@ -324,7 +364,8 @@ brief remains the detailed technical and acceptance specification.
 | WP3 transforms | At most 0.8 s transform wall time per po2-20 segment, at least 30% of the approximately 600 GB/s bandwidth ceiling, exact primitive tests and unchanged Merkle outputs | Closed, stage and paired-saving gates passed: 0.636 s isolated transform wall, 327 GB/s modeled requested-buffer bandwidth, 11.095/11.025 s paired savings. Midpoint 60 s line missed. |
 | WP2b wider overlap | At least 4 s saved at 10M against WP3, lifecycle and cancellation green | Closed after one bounded iteration; gate missed (−1.028/+0.129 s). Queue experiment reverted; WP3 worker retained. |
 | WP5 po2 21 assessment | Faster on both 10M fixtures and 46M within the 32 GiB ceiling | Closed; five-pair gate missed: +0.978/−3.016/+6.864 s savings. Po2-21 pipeline exceeded ceiling on resident reuse; po2-20 pipeline remains default. Lifecycle and build checks passed. |
-| WP4 recursion evaluator | At most 7 s lift/join at 10M, exact differential | Pending |
+| WP4 recursion evaluator | At most 7 s lift/join at 10M, exact differential | Closed: 5.609/5.489 s recursion medians, 19/19 CPU differentials on both 10M witnesses, 36 paired proofs and 21-proof lifecycle passed; split plus lazy REDC is default. |
+| WP1b remaining evalfast passes | Evaluator at most 1.2 s per segment and at least 3 s saved at 10M | Next |
 | WP6 pipeline cache | Warm process first dispatch at most 5 s, stale archive rebuilds | Pending |
 | WP7 admission | No refusal under specified desktop load with at least 40 GiB truly free; pressure refusal still works | Pending |
 | WP8 Poseidon254 | Exact differential and verified identity receipts | Optional; requires owner approval before starting |

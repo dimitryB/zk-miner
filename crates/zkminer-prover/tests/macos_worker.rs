@@ -498,6 +498,9 @@ fn validate_stage(record: &Value, workload: &Workload) {
             assert!(positive(stage, "completed_constraint_checks") >= 2 * count - 1);
             assert!(positive(stage, "evaluation_points") > 0);
             assert_eq!(stage["kernel_source_sha256"].as_str().unwrap().len(), 64);
+            if std::env::var("RISC0_RECURSION_METAL_CHECK_CPU").as_deref() == Ok("1") {
+                assert_eq!(stage["cpu_differential_checks"], stage["completed_constraint_checks"]);
+            }
             assert_eq!(record["observed_stages"]["identity"], "cpu");
         }
     }

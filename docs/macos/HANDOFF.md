@@ -1,5 +1,40 @@
 # macOS proving handoff
 
+## WP4 recursion evaluator — 2026-11-06
+
+The revised Phase 2 brief SHA-256 is
+`a8627ca24baec008b140a4bb75f9ef8bb75fd67281e9a8e628c328afb6542a09`.
+Engine `47bbd7f5a` generates six ordered Metal recursion evaluator parts
+from the pinned CUDA gated-sum split; `bca7044c5` applies its pinned
+lazy-REDC rewrite. The parts dispatch in one command buffer per recursion
+check. The old single-kernel evaluator remains
+selectable with `RISC0_RECURSION_METAL_SPLIT=0`. Poseidon2 hashing is
+unchanged. `RISC0_RECURSION_METAL_CHECK_CPU=1` enables an exact CPU oracle
+comparison on each valid recursion witness.
+
+The sealed WP5 po2-20 pipeline worker and WP4 candidate completed five
+measured alternating pairs per fixture after one warmup per arm. Both used
+po2 20, WP2 pipelining, 18 Rayon/Go threads, 8 GiB reserve, the same native
+helper and unchanged external verifier. All 36 proofs verified, all 108
+tamper checks rejected, memory pressure stayed normal, and the largest
+guard footprint was 22.49 GiB. The recursion medians were 7.733 →
+5.609 s arithmetic 10M and 7.480 → 5.489 s hashing 10M, passing the
+≤7 s gate. Complete medians were 57.615 → 55.571 s arithmetic 10M,
+57.570 → 55.589 s hashing 10M, and 199.888 → 189.745 s arithmetic 46M.
+See [paired evidence](evidence/phase2-wp4-paired.json) and
+[all paired rows](evidence/phase2-wp4-paired.csv). These are package-gate
+results with an 8 GiB reserve, not controlled 16 GiB absolute-line readings.
+The pre-lazy split iteration is preserved in
+[split iteration evidence](evidence/phase2-wp4-split-paired.json); the
+lazy rewrite reduced evaluator GPU time further and is the default.
+The [WP4 validation record](evidence/phase2-wp4-validation.json) binds
+19/19 exact CPU recursion checks on each complete po2-20 arithmetic and
+hashing witness, the 21-proof lifecycle and 63 tamper rejections, a 9.94%
+idle-footprint decrease, the verified single-kernel fallback, input-limit
+controls, five CPU-only unit tests and three offline Linux feature paths.
+WP4 is closed; WP1b is next. The package-gate 10M medians are near the
+55 s minimum line, which still requires a controlled default-reserve reading.
+
 ## WP5 segment po2 assessment — 2026-11-05
 
 The revised Phase 2 brief SHA-256 is

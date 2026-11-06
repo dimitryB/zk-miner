@@ -31,6 +31,8 @@ def main():
     parser.add_argument("--segment-hal", choices=["cpu", "metal"], default="cpu")
     parser.add_argument("--segment-check-cpu", action="store_true", help="compare every Metal constraint output with the CPU oracle on the same valid witness")
     parser.add_argument("--recursion-hal", choices=["cpu", "metal"], default="cpu")
+    parser.add_argument("--recursion-check-cpu", action="store_true",
+                        help="compare each Metal recursion constraint output with the CPU oracle")
     parser.add_argument("--recursion-cases", help="counterbalanced warm-worker comparison, e.g. cpu,metal")
     parser.add_argument("--workload", choices=["fibonacci", "sha256-chain", "segment-boundary"], default="fibonacci")
     parser.add_argument("--repeat", type=int, default=3)
@@ -85,6 +87,8 @@ def main():
     if args.segment_hal == "metal" and args.worker_kind != "native-rv32im-metal":
         parser.error("segment Metal requires the native-rv32im-metal worker")
     if args.segment_check_cpu and args.segment_hal != "metal":parser.error("CPU differential requires segment Metal")
+    if args.recursion_check_cpu and args.recursion_hal != "metal":
+        parser.error("recursion CPU differential requires recursion Metal")
     if args.pipeline_cancel and (not args.proof_only or args.po2 != 20 or
                                  args.segment_hal != "metal" or args.recursion_hal != "metal"):
         parser.error("pipeline cancellation requires proof-only po2-20 Metal segment and recursion")
@@ -124,6 +128,7 @@ def main():
                ZKMINER_RISC0_EVIDENCE_DIR=str(directory / "sidecars"),
                ZKMINER_MACOS_WORKER=str(paths(args.worker_kind)["binary"]), ZKMINER_MACOS_WORKER_KIND="native",
                RISC0_RECURSION_HAL=args.recursion_hal,
+               RISC0_RECURSION_METAL_CHECK_CPU="1" if args.recursion_check_cpu else "0",
                RISC0_SEGMENT_HAL=args.segment_hal,
                RISC0_RV32IM_METAL_CHECK_CPU="1" if args.segment_check_cpu else "0",
                ZKMINER_MACOS_PROGRAM=str(program), ZKMINER_MACOS_VERIFIER=str(ROOT / "target/macos/verifier/release/hemi-macos-proof"),
@@ -165,7 +170,9 @@ def main():
               "proof_watchdog_seconds":args.timeout_seconds,"warmup_count":int(args.warmup),"measured_repeats":args.repeat,
               "planned_proof_requests":planned_requests,"suite_timeout_seconds":suite_timeout,
               "min_guest_cycles":args.min_guest_cycles,"program_sha256":sha(program),"input_sha256":sha(directory / "input.bin")}
-    report.update(worker_kind=args.worker_kind, segment_hal=args.segment_hal, segment_check_cpu=args.segment_check_cpu, recursion_hal=args.recursion_hal, recursion_cases=args.recursion_cases)
+    report.update(worker_kind=args.worker_kind, segment_hal=args.segment_hal,
+                  segment_check_cpu=args.segment_check_cpu, recursion_hal=args.recursion_hal,
+                  recursion_check_cpu=args.recursion_check_cpu, recursion_cases=args.recursion_cases)
     report["pipeline_cancel"] = args.pipeline_cancel
     if args.paired_baseline:
         report["paired_baseline"] = {"path":str(args.paired_baseline), "sha256":sha(args.paired_baseline)}
