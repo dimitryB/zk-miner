@@ -1,5 +1,45 @@
 # Phase 2: Metal proving performance on macOS
 
+## WP8-lite scope — native wrap overlap, 2026-11-06
+
+The revised brief SHA-256 is
+`a7ab34ce1697757bcb73622aebe0b503d42b38e3a601942f76e90fd5744f581c`.
+The immediately preceding WP1b worker is sealed at
+`target/macos/phase2/wp1b-baseline/` (manifest SHA-256
+`7b117d05a76c9307abe3ce54752a2ddfdf0036e86b406c1d428ae578e2491950`).
+Engine `cd018ee72` starts the native gnark child as `identity_p254` begins,
+owns it through identity and wrap, and streams the unchanged witness through
+stdin after the helper loads its circuit and proving key. `6521f87c2`
+defers Go GC during setup, with 18 Go threads retained for proving. The Go
+prover still accepts the prior witness-file path for sealed WP1b. The native
+child keeps its parent watchdog, deadline, cleared environment and drop-time
+kill/wait behavior.
+
+The one-day WP8-lite time box is closed. The first candidate's arithmetic
+10M five-pair median saved 0.030 s (see
+`evidence/phase2-wp8lite-iteration1.json`), so a bounded setup-scheduling
+iteration was tried. The final campaign against sealed WP1b used one excluded warmup
+per arm and five alternating measured pairs on each 10M fixture and the 46M
+stretch, with po2 20, WP2 pipeline, 18 Rayon/Go threads, 8 GiB reserve,
+the same active helper bundle and unchanged verifier. All 36 proofs and 108
+tamper rejections passed. The complete medians were 49.497 → 49.479 s
+arithmetic 10M, 49.519 → 49.484 s hashing 10M, and 167.598 → 166.609 s
+arithmetic 46M. Identity plus wrap improved 0.509/0.425 s at 10M. The
+required 1.5 s complete saving was missed on both 10M fixtures; the
+candidate is retained as the best correct measured variant. Maximum guard
+footprint was 19.31 GiB with normal pressure. See
+`evidence/phase2-wp8lite-paired.json` and `.csv`.
+
+Complete real-witness CPU checks passed at po2 14/18/20 (22/1/1 checks),
+as did input limits, five CPU-only unit tests and three offline Linux
+feature paths. The 20-request lifecycle plus recovery proof verified 21
+proofs and 63 tamper rejections; idle footprint decreased 17.86%.
+Cancellation during identity and wrap left no owned helper, and separate
+real-helper parent-death probes during key loading and proving exited
+without a proof. See `evidence/phase2-wp8lite-validation.json`.
+The controlled final absolute-line reading at the default 16 GiB reserve
+is next, followed by WP6/WP7.
+
 ## WP1b scope — remaining evalfast passes, 2026-11-06
 
 The current brief SHA-256 is
@@ -400,9 +440,10 @@ brief remains the detailed technical and acceptance specification.
 | WP5 po2 21 assessment | Faster on both 10M fixtures and 46M within the 32 GiB ceiling | Closed; five-pair gate missed: +0.978/−3.016/+6.864 s savings. Po2-21 pipeline exceeded ceiling on resident reuse; po2-20 pipeline remains default. Lifecycle and build checks passed. |
 | WP4 recursion evaluator | At most 7 s lift/join at 10M, exact differential | Closed: 5.609/5.489 s recursion medians, 19/19 CPU differentials on both 10M witnesses, 36 paired proofs and 21-proof lifecycle passed; split plus lazy REDC is default. |
 | WP1b remaining evalfast passes | Evaluator at most 1.2 s per segment and at least 3 s saved at 10M | Closed: 1.043/1.001 s evaluator GPU medians, 6.846/7.022 s complete savings, exact differentials and lifecycle passed. |
+| WP8-lite native wrap overlap | At least 1.5 s saved at 10M; cancellation during identity and wrap leaves no helper; lifecycle green | Closed, timing gate missed: 0.018/0.034 s saved at 10M and 0.988 s at 46M; 36 paired proofs, 21 lifecycle proofs, cancellation and platform checks passed. Best correct variant retained. |
 | WP6 pipeline cache | Warm process first dispatch at most 5 s, stale archive rebuilds | Pending |
 | WP7 admission | No refusal under specified desktop load with at least 40 GiB truly free; pressure refusal still works | Pending |
-| WP8 Poseidon254 | Exact differential and verified identity receipts | Optional; requires owner approval before starting |
+| WP8 identity_p254 on Metal | Exact differential and verified identity receipts | Optional; requires owner approval before starting |
 
 The mid-point decision after WP3 targets both 10M warm medians at most 60 s.
 A near miss within a few seconds is the owner's call; the revised order is

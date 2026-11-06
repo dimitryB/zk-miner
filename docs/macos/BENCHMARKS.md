@@ -1,5 +1,46 @@
 # macOS proving measurements
 
+## WP8-lite native wrap overlap — 2026-11-06
+
+The revised brief SHA-256 is
+`a7ab34ce1697757bcb73622aebe0b503d42b38e3a601942f76e90fd5744f581c`.
+Engine `6521f87c2` starts the owned native Go helper as `identity_p254`
+begins, lets it load the constraint system and proving key, then streams the
+unchanged witness through stdin. The helper keeps the parent-death watchdog,
+deadline and cleared environment. A bounded first iteration saved only
+0.030 s in the arithmetic 10M median
+([diagnostic record](evidence/phase2-wp8lite-iteration1.json)); the second
+iteration deferred Go GC during setup and is the measured checkpoint.
+
+The sealed WP1b worker and candidate used one excluded warmup per arm and
+five alternating pairs per fixture, with the opening arm reversed from
+WP1b. Both were resident at po2 20 with pipelining, 18 Rayon/Go threads,
+an 8 GiB reserve, the same rebuilt helper bundle and unchanged verifier.
+All 36 proofs verified and all 108 tamper checks rejected. Pressure stayed
+normal, the recorded browser state was closed, and the maximum owned
+worker/helper guard footprint was 19.31 GiB.
+
+| Median of five | Sealed WP1b | WP8-lite | Saving |
+| --- | ---: | ---: | ---: |
+| Arithmetic 10M complete | 49.497 s | 49.479 s | 0.018 s |
+| Hashing 10M complete | 49.519 s | 49.484 s | 0.034 s |
+| Arithmetic 46M complete | 167.598 s | 166.609 s | 0.988 s |
+| Arithmetic 10M identity + wrap | 17.509 s | 17.000 s | 0.509 s |
+| Hashing 10M identity + wrap | 17.448 s | 17.023 s | 0.425 s |
+
+The required 1.5 s complete saving at 10M was missed on both fixtures.
+The candidate remains the best correct measured variant, with positive
+paired medians on all three fixtures; these small 10M differences are not a
+significance claim. The full ranges, pair ratios, stage/GPU times, thermal
+observations and source hashes are in [paired JSON](evidence/phase2-wp8lite-paired.json)
+and [paired rows](evidence/phase2-wp8lite-paired.csv).
+The [validation record](evidence/phase2-wp8lite-validation.json) binds
+exact real-witness CPU checks at po2 14/18/20 (22/1/1 checks), 21 verified
+lifecycle/recovery proofs and 63 tamper rejections, a 17.86% idle-footprint
+decrease, helper cleanup during identity and wrap, input limits, five
+CPU-only unit tests and three offline Linux feature paths. The final
+absolute-line reading still requires the controlled default 16 GiB reserve.
+
 ## WP1b evalfast hot slab and chain tails — 2026-11-06
 
 The revised brief SHA-256 is

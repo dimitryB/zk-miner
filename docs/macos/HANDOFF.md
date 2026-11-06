@@ -1,5 +1,35 @@
 # macOS proving handoff
 
+## WP8-lite native wrap overlap — 2026-11-06
+
+The revised brief SHA-256 is
+`a7ab34ce1697757bcb73622aebe0b503d42b38e3a601942f76e90fd5744f581c`.
+Engine `6521f87c2daf873c54d011a33d48fee8097db924` prestarts the
+owned native gnark helper at `identity_p254` and streams its witness through
+stdin; Go GC is deferred during setup. The source-bound candidate worker
+SHA-256 is `625589c35f6583bfaf4510a00d6f98dceb781b004064500ce38b44b42d659be7`.
+The sealed WP1b baseline manifest SHA-256 is
+`7b117d05a76c9307abe3ce54752a2ddfdf0036e86b406c1d428ae578e2491950`.
+
+The full five-pair campaign with an 8 GiB reserve, po2 20, WP2 pipelining,
+18 Rayon/Go threads and the same active helper/verifier in both arms gave
+complete medians of 49.497 → 49.479 s arithmetic 10M, 49.519 →
+49.484 s hashing 10M, and 167.598 → 166.609 s arithmetic 46M. Identity
+plus wrap fell 17.509 → 17.000 s and 17.448 → 17.023 s at 10M. All 36
+proofs verified, all 108 tamper checks rejected, pressure stayed normal,
+and the largest guard footprint was 19.31 GiB. The 1.5 s 10M saving gate
+was missed; the correct candidate is retained as the best measured variant.
+See [paired evidence](evidence/phase2-wp8lite-paired.json) and
+[all rows](evidence/phase2-wp8lite-paired.csv).
+
+The [validation record](evidence/phase2-wp8lite-validation.json) binds
+22/1/1 exact CPU checks on complete po2-14/18/20 proofs, 21 verified
+lifecycle/recovery proofs, 63 tamper rejections, a 17.86% idle-footprint
+decrease, no helper after cancellation during identity or wrap, input
+limits, five CPU-only tests and three offline Linux feature paths.
+WP8-lite is closed with a timing-gate miss. Next is the controlled final
+absolute-line reading at the default 16 GiB reserve, then WP6/WP7.
+
 ## WP1b evalfast hot slab and chain tails — 2026-11-06
 
 The revised Phase 2 brief SHA-256 is
