@@ -3581,7 +3581,7 @@ impl WorkerPool {
         let resident = self.current_host_bytes_for_slot(slot_key).unwrap_or(0);
         let reserve = crate::memory::host_reserve_bytes();
         #[cfg(target_os = "macos")]
-        let available = crate::macos::admission_headroom(available, expected_peak, resident, reserve)?;
+        let available = crate::macos::admission_headroom(available, expected_peak, resident)?;
         self.memory_ledger.try_reserve(
             expected_peak,
             resident,
@@ -3749,6 +3749,8 @@ impl WorkerPool {
             return None;
         };
         let resident = self.current_host_bytes_for_slot(key).unwrap_or(0);
+        #[cfg(target_os = "macos")]
+        let available = crate::macos::admission_headroom(available, want, resident)?;
         let plan = crate::memory::plan_host_room(
             want,
             resident,
@@ -3833,7 +3835,7 @@ impl WorkerPool {
             0
         };
         #[cfg(target_os = "macos")]
-        let Some(available) = crate::macos::admission_headroom(available, expected_peak, resident, reserve) else {
+        let Some(available) = crate::macos::admission_headroom(available, expected_peak, resident) else {
             return false;
         };
         let reserved = self.reserved_host_memory();
