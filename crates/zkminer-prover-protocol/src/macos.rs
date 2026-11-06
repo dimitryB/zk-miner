@@ -1,7 +1,7 @@
 //! Shared local macOS RISC0 bounds; these are configuration, not IPC fields.
 pub const MAX_GUEST_CYCLES_ENV: &str = "ZKMINER_RISC0_MAX_GUEST_CYCLES";
 pub const MIN_SEGMENT_PO2: u8 = 14;
-pub const MAX_SEGMENT_PO2: u8 = 20;
+pub const MAX_SEGMENT_PO2: u8 = 21;
 pub const DEFAULT_NATIVE_SEGMENT_PO2: u8 = 20;
 pub const MAX_GUEST_CYCLES: u64 = 64 * 1024 * 1024;
 
@@ -80,8 +80,9 @@ mod tests {
             assert!(limits.validate_claim(cycles, Some(po2)).is_ok());
         }
         assert!(limits.validate_claim(1, Some(20)).is_ok());
+        assert!(limits.validate_claim(1, Some(21)).is_ok());
         assert!(Risc0Limits::parse(None, false).unwrap().validate_po2(Some(19)).is_err());
-        for (cycles, po2) in [(0, 18), (10_000_001, 18), (1, 13), (1, 21)] {
+        for (cycles, po2) in [(0, 18), (10_000_001, 18), (1, 13), (1, 22)] {
             assert!(limits.validate_claim(cycles, Some(po2)).is_err());
         }
     }

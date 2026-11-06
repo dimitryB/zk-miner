@@ -89,6 +89,7 @@ pub fn resolve_po2(
                 if !macos_profile_po2_allowed(
                     po2,
                     std::env::var("ZKMINER_RISC0_WRAP").as_deref() == Ok("native"),
+                    std::env::var("RISC0_SEGMENT_PIPELINE").as_deref() != Ok("0"),
                 ) {
                     return None; // Keep the selected Mac pipeline's segment setting.
                 }
@@ -102,21 +103,22 @@ pub fn resolve_po2(
 }
 
 #[cfg(target_os = "macos")]
-fn macos_profile_po2_allowed(po2: u8, native: bool) -> bool {
-    po2 == if native {
-        zkminer_prover_protocol::macos::DEFAULT_NATIVE_SEGMENT_PO2
-    } else {
-        18
+fn macos_profile_po2_allowed(po2: u8, native: bool, pipeline_enabled: bool) -> bool {
+    if !native {
+        return po2 == 18;
     }
+    po2 == zkminer_prover_protocol::macos::DEFAULT_NATIVE_SEGMENT_PO2
+        || (!pipeline_enabled && po2 == zkminer_prover_protocol::macos::MAX_SEGMENT_PO2)
 }
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     #[test]
-    fn calibration_keeps_each_mac_pipeline_at_its_measured_cap() {
+    fn calibration_allows_po2_21_only_without_native_pipelining() {
         for po2 in 13..=24 {
-            assert_eq!(super::macos_profile_po2_allowed(po2, true), po2 == 20);
-            assert_eq!(super::macos_profile_po2_allowed(po2, false), po2 == 18);
+            assert_eq!(super::macos_profile_po2_allowed(po2, true, true), po2 == 20);
+            assert_eq!(super::macos_profile_po2_allowed(po2, true, false), (20..=21).contains(&po2));
+            assert_eq!(super::macos_profile_po2_allowed(po2, false, true), po2 == 18);
         }
     }
 }

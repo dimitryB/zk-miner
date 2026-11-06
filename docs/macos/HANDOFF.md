@@ -1,5 +1,40 @@
 # macOS proving handoff
 
+## WP5 segment po2 assessment — 2026-11-05
+
+The revised Phase 2 brief SHA-256 is
+`7b67d229839eb5f9d424dc27fed31906e766ea8bcea3c9d892e323d9ebcf5df7`.
+Engine `748e7a202` permits native Metal RV32IM evaluation at po2 21. The
+miner accepts native po2 21 while leaving its po2-20 default in place.
+The admission calibration permits po2 21 only when
+`RISC0_SEGMENT_PIPELINE=0`; an explicit po2 override can select the same
+optional serial profile. The production 32 GiB owned worker/helper ceiling
+is unchanged.
+
+A resident po2-21 pipeline worker verified one 10M proof but reached
+35,255,359,656 bytes (32.84 GiB) on its second request and was stopped by
+the guard at normal pressure. Po2-21 serial verified two resident proofs
+at 19.21 and 22.94 GiB peaks. The fixed campaign then compared the sealed
+WP3 po2-20 pipeline with po2-21 serial: five measured pairs on each 10M
+fixture and the 46M stretch, plus two excluded warmups per fixture. All
+36 proofs externally verified and all 108 tamper checks rejected. The
+medians were 59.586 → 58.607 s arithmetic 10M, 58.599 → 61.616 s hashing
+10M, and 213.049 → 206.186 s arithmetic 46M. Po2-21 loses on hashing,
+so the default remains po2 20 with WP2 pipelining. Po2-21 serial is a
+documented profile for large arithmetic work. The campaign's desktop load
+and thermal observations are recorded, and reserve was 8 GiB; these are
+package-gate numbers, not a new controlled absolute-line reading. See
+[paired evidence](evidence/phase2-wp5-paired.json),
+[all paired rows](evidence/phase2-wp5-paired.csv), and
+[feasibility diagnostics](evidence/phase2-wp5-feasibility.json).
+The [WP5 validation record](evidence/phase2-wp5-validation.json) binds the
+21-proof lifecycle, its 17.28% idle-footprint decrease, CPU-only build,
+32 protocol tests, calibration test, limit controls, three offline Linux
+feature paths and the po2-20 serial screens. The corrected lifecycle
+timeout assertion checks a partial in-flight sidecar; previous harness
+attempts and their failures remain in the validation record. WP5 is
+closed with the po2-20 pipeline default. WP4 recursion evaluation is next.
+
 ## WP2b bounded overlap iteration — 2026-11-05
 
 The latest Phase 2 brief SHA-256 is

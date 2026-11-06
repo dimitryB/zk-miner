@@ -45,7 +45,7 @@ def main():
     parser.add_argument("--thread-cases", help="comparison settings, e.g. 6:6,12:6,18:6")
     parser.add_argument("--samples", type=int, choices=range(1,6), default=3)
     parser.add_argument("--iterations", type=int, help="guest loop/hash count; boundary uses units of 1024 additions")
-    parser.add_argument("--po2", type=int, choices=range(14,21))
+    parser.add_argument("--po2", type=int, choices=range(14,22))
     parser.add_argument("--session-limit", type=int, default=67_108_864, help="maximum guest cycles, 1..67108864")
     parser.add_argument("--timeout-seconds", type=int, default=600, help="per-proof watchdog, 30..3600 seconds")
     parser.add_argument("--failure-timeout-seconds", type=int, default=10,
@@ -55,6 +55,10 @@ def main():
     parser.add_argument("--paired-baseline", type=Path, help="frozen step-5 worker for a counterbalanced CPU-segment/resident-Metal comparison")
     parser.add_argument("--paired-metal-baseline", type=Path,
                         help="sealed WP0 worker for a counterbalanced Metal/Metal comparison")
+    parser.add_argument("--paired-po2-baseline", type=int, choices=range(14,22),
+                        help="segment po2 for the sealed paired Metal arm; --po2 selects the candidate arm")
+    parser.add_argument("--paired-pipeline-candidate-off", action="store_true",
+                        help="keep WP2 enabled in the sealed Metal arm and disable it in the candidate arm")
     parser.add_argument("--paired-start-case", type=int, choices=(0, 1), default=0,
                         help="which paired arm runs first in round zero")
     args = parser.parse_args()
@@ -65,8 +69,14 @@ def main():
             parser.error("paired Metal baseline requires resident segment and recursion Metal")
         args.paired_metal_baseline = args.paired_metal_baseline.resolve(strict=True)
         args.thread_cases = "18:18,18:18"
+        if args.paired_po2_baseline is not None and args.po2 is None:
+            parser.error("paired po2 comparison requires --po2 for the candidate arm")
     elif args.paired_start_case:
         parser.error("--paired-start-case requires --paired-metal-baseline")
+    elif args.paired_po2_baseline is not None:
+        parser.error("--paired-po2-baseline requires --paired-metal-baseline")
+    if args.paired_pipeline_candidate_off and not args.paired_metal_baseline:
+        parser.error("--paired-pipeline-candidate-off requires --paired-metal-baseline")
     if args.paired_baseline:
         if args.worker_kind != "native-rv32im-metal" or args.segment_hal != "metal" or args.recursion_hal != "metal":
             parser.error("paired baseline requires the resident worker with segment and recursion Metal")
@@ -140,6 +150,10 @@ def main():
         env.update(ZKMINER_MACOS_SEGMENT_CASES="metal,metal",
             ZKMINER_MACOS_WORKER_BINARIES=json.dumps([str(args.paired_metal_baseline), str(paths(args.worker_kind)["binary"])]),
             ZKMINER_MACOS_PAIRED_START_CASE=str(args.paired_start_case))
+        if args.paired_po2_baseline is not None:
+            env["ZKMINER_MACOS_PO2_CASES"] = f"{args.paired_po2_baseline},{po2}"
+        if args.paired_pipeline_candidate_off:
+            env["ZKMINER_MACOS_PIPELINE_CASES"] = "1,0"
     if args.recursion_cases:
         env["ZKMINER_MACOS_RECURSION_CASES"] = args.recursion_cases
     if args.calibration:
@@ -158,6 +172,10 @@ def main():
     if args.paired_metal_baseline:
         report["paired_metal_baseline"] = {"path":str(args.paired_metal_baseline), "sha256":sha(args.paired_metal_baseline)}
         report["paired_start_case"] = args.paired_start_case
+        if args.paired_po2_baseline is not None:
+            report["paired_po2_cases"] = [args.paired_po2_baseline, po2]
+        if args.paired_pipeline_candidate_off:
+            report["paired_pipeline_cases"] = [True, False]
     if args.calibration:
         report["calibration"] = {"path":str(args.calibration), "sha256":sha(args.calibration)}
     print(directory, flush=True)

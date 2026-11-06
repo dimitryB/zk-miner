@@ -1,5 +1,49 @@
 # Phase 2: Metal proving performance on macOS
 
+## WP5 scope — revised source brief, 2026-11-05
+
+The latest re-export has SHA-256
+`7b67d229839eb5f9d424dc27fed31906e766ea8bcea3c9d892e323d9ebcf5df7`.
+WP5 assesses native po2 21 against po2 20 on arithmetic and hashing 10M
+fixtures and the 46M arithmetic stretch, each with WP2 pipelining enabled
+and disabled. A faster option becomes the default only after complete
+unchanged-verifier acceptance, normal pressure, and the existing 32 GiB
+owned worker/helper ceiling hold. Po2 20 remains available as the other
+profile. The sealed WP3 worker is the preceding checkpoint because WP2b's
+candidate was reverted. The revised post-WP5 order is WP4, WP1b, WP8-lite,
+then WP6/WP7; WP8 remains optional. The minimum absolute final lines are
+55 s on both 10M fixtures and 220 s on 46M under controlled conditions.
+
+The first po2-21 complete proofs verified with the unchanged external
+verifier and all three tamper rejections. Pipelining passed a single 10M
+proof at 29.25 GiB guard peak and a 46M diagnostic at 29.09 GiB, but a
+second resident 10M proof reached 35,255,359,656 bytes (32.84 GiB) with
+normal pressure and the production guard stopped it at the 32 GiB ceiling.
+The 46M outer harness run is diagnostic only because its test source changed
+during execution. Two serial po2-21 resident proofs verified at 19.21 and
+22.94 GiB peaks; the warm second proof took 62.40 s. The fixed campaign
+therefore compares po2 21 without WP2 pipelining against the sealed WP3
+po2-20 pipeline. See `evidence/phase2-wp5-feasibility.json`.
+
+The fixed campaign completed 36 externally verified proofs and 108 tamper
+rejections, with normal pressure, zero admission wait and a largest guard
+footprint of 23.57 GiB. Five-pair complete medians for sealed WP3 po2-20
+pipeline versus po2-21 serial were 59.586 → 58.607 s arithmetic 10M,
+58.599 → 61.616 s hashing 10M, and 213.049 → 206.186 s arithmetic 46M.
+The candidate is slower on hashing, so it misses the WP5 default-change
+gate. Po2 20 with pipelining remains the default; po2 21 with
+`RISC0_SEGMENT_PIPELINE=0` is the measured optional profile. Full rows and
+source identities are in `evidence/phase2-wp5-paired.json` and `.csv`.
+The 20-request lifecycle plus recovery proof passed with 21 external
+verifications and 63 tamper rejections; idle worker footprint decreased
+17.28% from request 1 to request 20. CPU-only build and tests, protocol
+and calibration unit tests, input-limit controls, and all three offline
+Linux feature paths passed. The serial po2-20 warm screens were 67.625,
+66.339 and 227.060 s on arithmetic 10M, hashing 10M and arithmetic 46M;
+each followed an excluded warmup and verified. See
+`evidence/phase2-wp5-validation.json`. WP5 is closed with the existing
+default; WP4 is next.
+
 ## WP2b scope — revised source brief, 2026-11-05
 
 The latest re-export has SHA-256
@@ -279,7 +323,7 @@ brief remains the detailed technical and acceptance specification.
 | WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | Closed, passed: 6.029/6.050 s paired savings; 15.50% idle decrease; overlap cancellation and CPU differential passed. |
 | WP3 transforms | At most 0.8 s transform wall time per po2-20 segment, at least 30% of the approximately 600 GB/s bandwidth ceiling, exact primitive tests and unchanged Merkle outputs | Closed, stage and paired-saving gates passed: 0.636 s isolated transform wall, 327 GB/s modeled requested-buffer bandwidth, 11.095/11.025 s paired savings. Midpoint 60 s line missed. |
 | WP2b wider overlap | At least 4 s saved at 10M against WP3, lifecycle and cancellation green | Closed after one bounded iteration; gate missed (−1.028/+0.129 s). Queue experiment reverted; WP3 worker retained. |
-| WP5 po2 21 assessment | Faster than po2 20 within measured memory ceiling | Pending; owner approval before changing default |
+| WP5 po2 21 assessment | Faster on both 10M fixtures and 46M within the 32 GiB ceiling | Closed; five-pair gate missed: +0.978/−3.016/+6.864 s savings. Po2-21 pipeline exceeded ceiling on resident reuse; po2-20 pipeline remains default. Lifecycle and build checks passed. |
 | WP4 recursion evaluator | At most 7 s lift/join at 10M, exact differential | Pending |
 | WP6 pipeline cache | Warm process first dispatch at most 5 s, stale archive rebuilds | Pending |
 | WP7 admission | No refusal under specified desktop load with at least 40 GiB truly free; pressure refusal still works | Pending |

@@ -1,5 +1,48 @@
 # macOS proving measurements
 
+## WP5 segment po2 assessment — 2026-11-05
+
+The revised brief SHA-256 is
+`7b67d229839eb5f9d424dc27fed31906e766ea8bcea3c9d892e323d9ebcf5df7`.
+The sealed WP3 po2-20 pipeline worker was paired against po2-21 without
+pipelining. A resident po2-21 pipeline worker exceeded the unchanged 32 GiB
+owned worker/helper ceiling on its second 10M proof (32.84 GiB), despite
+normal memory pressure. The serial po2-21 candidate stayed below the ceiling.
+
+Each fixture used one excluded warmup per arm and five alternating measured
+pairs, with opposite opening arm on hashing. Both arms used 18 Rayon/Go
+threads, an 8 GiB host reserve, the same helper and unchanged verifier.
+Desktop load and thermal state were recorded; the browser was open. All 36
+proofs verified, all 108 tamper checks rejected, memory pressure stayed
+normal, and admission wait was zero.
+
+| Complete proof plus verifier, median of five | WP3 po2-20 pipeline | WP5 po2-21 serial | Saving |
+| --- | ---: | ---: | ---: |
+| Arithmetic 10M | 59.586 s | 58.607 s | +0.978 s |
+| Hashing 10M | 58.599 s | 61.616 s | −3.016 s |
+| Arithmetic 46M | 213.049 s | 206.186 s | +6.864 s |
+
+Po2-21 serial misses the requirement to improve both 10M fixtures and the
+46M stretch. The default remains po2-20 with pipelining. Po2-21 serial is
+available as a measured optional profile by setting `RISC0_SEGMENT_PIPELINE=0`
+and selecting po2 21 explicitly; it is useful for the 46M arithmetic fixture,
+not as an all-workload default. The highest guard footprint in the serial
+campaign was 25,304,798,800 bytes (23.57 GiB). The full ranges, five
+within-pair ratios, stage GPU times, pressure and source identities are in
+[paired JSON](evidence/phase2-wp5-paired.json) and
+[paired rows](evidence/phase2-wp5-paired.csv). These package-gate timings
+were taken under recorded load and are not controlled absolute-line readings.
+
+For the configuration screen, one excluded warmup followed by one measured
+po2-20 serial proof on each fixture gave 67.625 s arithmetic 10M,
+66.339 s hashing 10M, and 227.060 s arithmetic 46M. All six proofs
+verified with normal pressure. These single warm samples support the
+po2-20 pipeline choice; they do not replace the five-pair medians above.
+Po2-21 pipelining was excluded from the campaign after its second resident
+proof breached the unchanged memory ceiling.
+The source-bound lifecycle, build and configuration-screen details are in
+[WP5 validation](evidence/phase2-wp5-validation.json).
+
 ## WP2b wider overlap — 2026-11-05
 
 The revised brief SHA-256 is

@@ -46,7 +46,7 @@ fn native_workload_limit_controls() {
         other => panic!("expected execution cycle-limit rejection, got {other:?}"),
     }
     cases.push(json!({"operation":"execute","outcome":"guest_cycle_limit_rejected"}));
-    for (id, po2) in [(2, 13), (3, 21), (4, 20)] {
+    for (id, po2) in [(2, 13), (3, 22), (4, 20)] {
         worker.send(&WorkerCommand::Prove {request_id:id,elf:elf.clone(),input_data:input.clone(),po2:Some(po2)}).unwrap();
         loop {
             match worker.recv().unwrap() {
@@ -89,6 +89,7 @@ fn proof_timeout() -> Duration {
     assert!((30..=3600).contains(&seconds));
     Duration::from_secs(seconds)
 }
+#[derive(Clone)]
 struct Workload {
     name: String,
     input: Vec<u8>,
@@ -150,8 +151,8 @@ impl Workload {
             )
         };
         assert!(
-            (14..=20).contains(&po2),
-            "acceptance po2 must be in 14..=20"
+            (14..=21).contains(&po2),
+            "acceptance po2 must be in 14..=21"
         );
         assert!(
             (1..=256).contains(&min_segments),
@@ -223,6 +224,20 @@ fn native_thread_comparison() {
         .ok().map(|s| serde_json::from_str(&s).unwrap());
     let segment_cases: Option<Vec<String>> = std::env::var("ZKMINER_MACOS_SEGMENT_CASES")
         .ok().map(|s| s.split(',').map(str::to_owned).collect());
+    let po2_cases: Option<Vec<u8>> = std::env::var("ZKMINER_MACOS_PO2_CASES")
+        .ok().map(|s| s.split(',').map(|value| value.parse().unwrap()).collect());
+    if let Some(cases) = &po2_cases {
+        assert_eq!(cases.len(), settings.len());
+        assert!(cases.iter().all(|po2| (14..=21).contains(po2)));
+        assert!(segment_cases.is_some(), "per-arm po2 requires paired segment cases");
+    }
+    let pipeline_cases: Option<Vec<String>> = std::env::var("ZKMINER_MACOS_PIPELINE_CASES")
+        .ok().map(|s| s.split(',').map(str::to_owned).collect());
+    if let Some(cases) = &pipeline_cases {
+        assert_eq!(cases.len(), settings.len());
+        assert!(cases.iter().all(|value| value == "0" || value == "1"));
+        assert!(segment_cases.is_some(), "per-arm pipeline requires paired segment cases");
+    }
     if let Some(cases) = &segment_cases {
         assert!(cases == &["cpu", "metal"] || cases == &["metal", "metal"]);
         assert_eq!(cases.len(), settings.len());
@@ -241,6 +256,9 @@ fn native_thread_comparison() {
         if let Some(cases) = &segment_cases {
             overrides.insert("RISC0_SEGMENT_HAL".into(), cases[index].clone());
         }
+        if let Some(cases) = &pipeline_cases {
+            overrides.insert("RISC0_SEGMENT_PIPELINE".into(), cases[index].clone());
+        }
         let binary = binaries.as_ref().map(|v| v[index].clone())
             .unwrap_or_else(|| required("ZKMINER_MACOS_WORKER"));
         pool.insert_test_worker(KEY, "risc0", binary, overrides).unwrap();
@@ -258,12 +276,16 @@ fn native_thread_comparison() {
             order.reverse();
         }
         for index in order {
+            let mut case_workload = workload.clone();
+            if let Some(cases) = &po2_cases {
+                case_workload.po2 = cases[index];
+            }
             let before = sidecar_paths();
             let mut admission_wait_ms = 0.0;
             let (outcome, mut resources) = loop {
                 let attempt = Instant::now();
                 let worker_pid = pools[index].worker_pid(KEY);
-                let (result, resources) = measured_prove(&pools[index], &elf, &workload);
+                let (result, resources) = measured_prove(&pools[index], &elf, &case_workload);
                 match result {
                     Ok(outcome) => break (outcome, resources),
                     Err(error) if error.downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>().is_some() => {
@@ -294,6 +316,7 @@ fn native_thread_comparison() {
             let (_, record) = require_sidecar(&before);
             assert_eq!(record["rayon_threads"], settings[index].0);
             assert_eq!(record["gomaxprocs"], settings[index].1);
+            assert_eq!(record["po2"], case_workload.po2);
             assert_eq!(record["helper_arch"], "darwin/arm64");
             if let Some(cases) = &segment_cases {
                 assert_eq!(record["segment_hal"].as_str().unwrap_or("cpu"), cases[index]);
@@ -309,7 +332,7 @@ fn native_thread_comparison() {
                 &directory,
                 outcome,
                 &record,
-                &workload,
+                &case_workload,
             );
             finish_resources(&directory, &record, &mut resources);
             let timing = save_proof_timing(&directory, &record, &resources, external);
@@ -333,7 +356,7 @@ fn native_thread_comparison() {
     fs::write(
         evidence.join("complete.json"),
         serde_json::to_vec_pretty(&json!({"status":"complete_independently_verified",
-        "samples_per_case":samples,"settings":settings,"recursion_cases":recursion_cases,"segment_cases":segment_cases,"worker_binaries":binaries,"rows":rows}))
+        "samples_per_case":samples,"settings":settings,"recursion_cases":recursion_cases,"segment_cases":segment_cases,"po2_cases":po2_cases,"pipeline_cases":pipeline_cases,"worker_binaries":binaries,"rows":rows}))
         .unwrap(),
     )
     .unwrap();
@@ -1393,8 +1416,16 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             "request failed before the configured watchdog deadline"
         );
         let observed = observed.expect("watchdog did not reach this request's running helper");
-        validate_stage(&observed, &workload);
+        // The watchdog may stop a proof before recursion or constraint stages
+        // write their completed counters. This is an in-flight sidecar, not a
+        // completed proof record.
+        assert_eq!(observed["schema_version"], 1);
+        assert_eq!(observed["operation"], "prove");
+        assert_eq!(observed["po2"], workload.po2);
+        assert_eq!(observed["requested_mode"], mode());
+        let timeout_worker_pid = positive(&observed, "worker_pid") as u32;
         assert!(helpers().is_empty(), "owned helper survived watchdog");
+        assert_group_gone(timeout_worker_pid);
         assert_group_gone(observed["worker_pid"].as_u64().unwrap() as u32);
 
         let before = sidecar_paths();
