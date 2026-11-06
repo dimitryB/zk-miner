@@ -1,5 +1,38 @@
 # macOS proving handoff
 
+## WP2b bounded overlap iteration — 2026-11-05
+
+The latest Phase 2 brief SHA-256 is
+`f92bf25a4d8d6c94f83acca60383ff7b81fc04e0c5bd1ada20ec603df72d4454`.
+The controlled WP3 midpoint retake gave 59.556 s arithmetic and 60.369 s
+hashing five-proof complete medians with Brave closed, default 16 GiB
+reserve and nominal initial thermal state. It passed 12 external proofs and
+36 tamper checks. The owner had already chosen to proceed after the WP3
+near miss.
+
+Engine `a9120a42e` tested a second Metal queue for next-segment DATA
+transforms and Merkle stages under the prior eval-check. The complete
+arithmetic diagnostic verified, the 21-test Metal primitive suite passed,
+and the fixed five-pair campaign against sealed WP3 verified all 24 proofs
+and 72 tamper rejections. With 8 GiB reserve, 18 Rayon/Go threads, fair
+initial thermal state and recorded desktop load, the complete medians were
+60.602 → 61.630 s arithmetic and 63.472 → 63.342 s hashing. The required
+4 s saving on both fixtures was not observed. Transform wall time was
+unchanged; the extra queue contended with the evaluator.
+
+Engine `bc5dfd6eb` reverts that iteration. Its source tree is identical to
+the sealed WP3 engine `8520c7377`; the retained WP5 baseline is the
+[sealed WP3 archive](../../target/macos/phase2/wp3-baseline/manifest.json)
+with manifest SHA-256
+`8f1f57c81a2955c91c7aa773c8309822d13557f8527bf1b2c93b4b2953888836`.
+No candidate lifecycle or cancellation check was used for deployment, since
+the candidate was rejected on latency and reverted. WP5 po2-21 assessment
+is next. See [WP2b paired evidence](evidence/phase2-wp2b-paired.json),
+[all paired rows](evidence/phase2-wp2b-paired.csv), and
+[controlled midpoint](evidence/phase2-wp3-controlled-midpoint.json).
+The [WP2b validation record](evidence/phase2-wp2b-validation.json) pins the
+primitive and diagnostic logs and the tree-equivalence check.
+
 ## WP3 fused transforms — 2026-11-05
 
 The revised Phase 2 source brief SHA-256 is

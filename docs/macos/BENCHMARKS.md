@@ -1,5 +1,42 @@
 # macOS proving measurements
 
+## WP2b wider overlap — 2026-11-05
+
+The revised brief SHA-256 is
+`f92bf25a4d8d6c94f83acca60383ff7b81fc04e0c5bd1ada20ec603df72d4454`.
+The sealed WP3 absolute midpoint retake, with Brave closed, the default
+16 GiB reserve and nominal initial thermal state, measured five warm
+complete medians of **59.556 s arithmetic** and **60.369 s hashing**.
+All 12 proofs verified and all 36 tamper checks rejected. The hashing result
+misses the 60 s line by 0.369 s. See
+[controlled midpoint](evidence/phase2-wp3-controlled-midpoint.json) and
+[midpoint rows](evidence/phase2-wp3-controlled-midpoint.csv).
+
+The one WP2b iteration tested a second Metal queue for the next segment's
+DATA transforms and Merkle tree while the previous eval-check was deferred.
+The fixed paired campaign used the sealed WP3 worker, one excluded warmup
+per arm, five alternating measured proofs per arm and opposite opening arms
+across fixtures. Both arms used po2 20, 18 Rayon/Go threads, 8 GiB reserve,
+the same helper and unchanged verifier. Codex, Claude and Colima were present;
+Brave was absent. Initial thermal state was fair. All 24 proofs verified and
+all 72 tamper checks rejected; admission wait was zero.
+
+| Complete proof plus verifier, median of five | Sealed WP3 | WP2b queue | Saving |
+| --- | ---: | ---: | ---: |
+| Arithmetic 10M | 60.602 s | 61.630 s | −1.028 s |
+| Hashing 10M | 63.472 s | 63.342 s | +0.129 s |
+
+The required saving was at least 4 s on both fixtures, so WP2b misses the
+gate. Arithmetic measured ranges were 59.570–63.338 s (WP3) and
+57.562–63.419 s (WP2b); within-pair WP3/WP2b ratios were 1.0349,
+0.9996, 0.9999, 0.9833 and 0.9987. The hashing ranges and all row-level
+GPU, memory, thermal and verifier data are in
+[paired JSON](evidence/phase2-wp2b-paired.json) and
+[paired rows](evidence/phase2-wp2b-paired.csv). The largest guard peak was
+21.962 GiB. Median transform dispatch wall time per segment remained near
+2.0 s for arithmetic and 1.9 s for hashing in both arms. The candidate
+queue was reverted; the sealed WP3 worker remains the WP5 baseline.
+
 ## WP3 fused Metal transforms — 2026-11-05
 
 Engine `8520c737725698ddb156ccda2a41e0521213b878` fuses commit

@@ -1,5 +1,51 @@
 # Phase 2: Metal proving performance on macOS
 
+## WP2b scope — revised source brief, 2026-11-05
+
+The latest re-export has SHA-256
+`f92bf25a4d8d6c94f83acca60383ff7b81fc04e0c5bd1ada20ec603df72d4454`.
+It places WP2b immediately after the closed WP3 checkpoint, followed by WP5
+and WP4. WP2b has one bounded iteration: widen the overlap so CPU preflight,
+witness generation and accumulation can run during the preceding segment's
+GPU work, while preserving WP2's explicit buffer ownership and cancellation
+rules. Its paired gate is at least 4 s saved on both 10M fixtures against the
+sealed WP3 worker at `target/macos/phase2/wp3-baseline/` (manifest SHA-256
+`8f1f57c81a2955c91c7aa773c8309822d13557f8527bf1b2c93b4b2953888836`).
+
+The revised protocol distinguishes paired package gates, which record
+background load without closing apps, from absolute midpoint and final-line
+readings. The latter require a closed browser, default 16 GiB reserve and
+nominal initial thermal state. The sealed WP3 midpoint retake under those
+conditions passed all 12 proofs and 36 tamper checks: arithmetic 59.556 s,
+hashing 60.369 s complete five-proof medians. The campaign started nominal,
+with Brave closed and the default 16 GiB reserve; thermal state was fair by
+the hashing fixture. The hashing absolute line remains 0.369 s above 60 s,
+so the owner's recorded choice to continue into WP2b is supported by the
+controlled reading. See `evidence/phase2-wp3-controlled-midpoint.{json,csv}`.
+
+WP2b closed after its single bounded iteration. Engine `a9120a42e` put the
+next segment's DATA transforms and Merkle stages on a second Metal queue while
+the previous eval-check command buffer was pending. It kept the same dispatch
+order and buffer sets, and a complete 10M diagnostic proof verified. The
+profile showed that the overlapped transform command took about 1.7 s GPU,
+while the prior eval-check took about 1.6 s; DATA commitment still occupied
+about 2.0 s wall per steady segment. The second queue competed for GPU time
+instead of hiding the dependency. The 21-test Metal primitive suite passed.
+
+The fixed paired campaign passed all 24 external proof verifications and 72
+tamper rejections. With recorded Codex, Claude and Colima load, Brave absent,
+8 GiB reserve, 18 Rayon/Go threads and fair initial thermal state, the
+five-proof complete medians were arithmetic **60.602 s WP3 → 61.630 s WP2b**
+and hashing **63.472 s WP3 → 63.342 s WP2b**. Savings were −1.028 s and
++0.129 s, both below the required 4 s. Median transform dispatch wall time
+per segment was effectively unchanged: 1.992 → 1.994 s arithmetic and
+1.895 → 1.901 s hashing. Peak owned guard footprint was 21.962 GiB.
+Engine `bc5dfd6eb` reverts the experiment; its tree is identical to the
+sealed WP3 engine. WP3 remains the best correct worker and the WP5 baseline.
+No WP2b candidate is deployed, so candidate lifecycle and cancellation were
+not used as acceptance gates. See `evidence/phase2-wp2b-paired.{json,csv}`
+and `evidence/phase2-wp2b-validation.json`.
+
 ## WP3 transform checkpoint — 2026-11-05
 
 The current re-export has SHA-256
@@ -36,9 +82,10 @@ fell 14.58%; the 46M stretch verified in 217.957 s with a 17.905 GiB guard
 peak. See `evidence/phase2-wp3-{paired,validation}.json` and
 `evidence/phase2-wp3-paired.csv`.
 
-The WP3 stage and paired-saving gates pass. The midpoint's 60 s line is
-missed by 1.589 s arithmetic and 5.384 s hashing; the revised brief leaves
-a near miss to the owner before the reserved WP2b wider-overlap iteration.
+The WP3 stage and paired-saving gates pass. Its recorded-load paired medians
+were 1.589 s arithmetic and 5.384 s hashing above 60 s; these are not
+absolute midpoint readings under the clarified protocol. The controlled
+retake above puts arithmetic below 60 s and hashing 0.369 s above it.
 The next baseline arm is sealed at `target/macos/phase2/wp3-baseline/` with
 manifest SHA-256 `8f1f57c81a2955c91c7aa773c8309822d13557f8527bf1b2c93b4b2953888836`;
 it pins engine `8520c7377` and miner checkpoint `afa97e3`.
@@ -231,7 +278,7 @@ brief remains the detailed technical and acceptance specification.
 | WP0.5 command batching | Revised 2026-11-05 gate: about 2–3 s saved; command counts and correctness/lifecycle gates | Closed with batching default after three iterations. Arithmetic saves 2.049 s, hashing saves 3.023 s; the former 3 s and 0.3 s targets missed, and the remaining transform gap moves to WP3. |
 | WP2 segment pipeline | At least 6 s saved per 10M proof, 20-request stable idle footprint, cancellation clean | Closed, passed: 6.029/6.050 s paired savings; 15.50% idle decrease; overlap cancellation and CPU differential passed. |
 | WP3 transforms | At most 0.8 s transform wall time per po2-20 segment, at least 30% of the approximately 600 GB/s bandwidth ceiling, exact primitive tests and unchanged Merkle outputs | Closed, stage and paired-saving gates passed: 0.636 s isolated transform wall, 327 GB/s modeled requested-buffer bandwidth, 11.095/11.025 s paired savings. Midpoint 60 s line missed. |
-| WP2b wider overlap | At least 4 s saved at 10M against WP3, lifecycle and cancellation green | Reserved for the owner's midpoint near-miss decision. |
+| WP2b wider overlap | At least 4 s saved at 10M against WP3, lifecycle and cancellation green | Closed after one bounded iteration; gate missed (−1.028/+0.129 s). Queue experiment reverted; WP3 worker retained. |
 | WP5 po2 21 assessment | Faster than po2 20 within measured memory ceiling | Pending; owner approval before changing default |
 | WP4 recursion evaluator | At most 7 s lift/join at 10M, exact differential | Pending |
 | WP6 pipeline cache | Warm process first dispatch at most 5 s, stale archive rebuilds | Pending |
@@ -265,8 +312,8 @@ full verified proof. Each checkpoint also runs the 20-request lifecycle,
 limit controls, and CPU-only and Linux feature checks. The source brief gives
 the exact per-package performance gates and bounded iteration rules.
 
-Checkpoint order is WP0, WP1, WP0.5, WP2, WP3, then the 60-second mid-point decision,
-WP5, WP4, WP6/WP7, and optional WP8. Changing the default po2, raising the
+Checkpoint order is WP0, WP1, WP0.5, WP2, WP3, the 60-second mid-point decision,
+WP2b, WP5, WP4, WP6/WP7, and optional WP8. Changing the default po2, raising the
 32 GiB ceiling, or starting WP8 requires owner approval. Engine commits precede
 miner commits that cite the engine SHA. Only personal fork Phase 2 branches are
 publication destinations; the three open upstream PR branches are untouched.
