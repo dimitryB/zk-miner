@@ -1,38 +1,376 @@
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::Provider;
+use alloy::rpc::types::TransactionReceipt;
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
 
-use crate::tx::TX_RECEIPT_TIMEOUT;
+use crate::revert::{ClaimClass, ClaimFailure, ClaimNotSent, FulfilClass, FulfilFailure};
+use alloy::eips::BlockId;
+use alloy::primitives::aliases::U96;
+use alloy::sol_types::SolCall;
+
+/// `JobStatus` values (Types.sol; enums are append-only — compare as integers, tolerate unknowns).
+pub const JOB_STATUS_OPEN: u8 = 0;
+pub const JOB_STATUS_LOCKED: u8 = 1;
+pub const JOB_STATUS_FULFILLED: u8 = 2;
+/// `MAX_REOPEN_COUNT` (Constants.sol): a job reopened this many times can no longer be claimed.
+pub const MAX_REOPEN_COUNT: u8 = 10;
+/// `MAX_JOURNAL_BYTES` (Constants.sol): a fulfil with a longer journal reverts `JournalTooLarge`.
+pub const MAX_JOURNAL_BYTES: usize = 32_768;
+/// Extra gas per resend after an `InsufficientGasFor*Settlement` revert (the reference daemons'
+/// step).
+pub const FULFIL_GAS_BUMP: u64 = 1_000_000;
+/// Per-attempt receipt wait on the fulfil path: ~1 Hemi block (12 s). An unmined fulfil is
+/// re-published, fee-bumped >= 12.5% at the same nonce, about once per missed block (handoff §10) —
+/// a slower climb makes holding it out of blocks several times cheaper.
+const FULFIL_RECEIPT_WAIT: Duration = Duration::from_secs(14);
+/// After an unconfirmed fulfil attempt, how long to poll job state before re-publishing (the next
+/// attempt's lock read is a state check too).
+const FULFIL_STATE_POLL: Duration = Duration::from_secs(4);
+/// A fulfil pending at its fee ceiling can't be bumped: wait this long for it between re-publishes
+/// (each re-publish also re-broadcasts it, should a node have dropped it), reading once a block.
+const FULFIL_HELD_WAIT: Duration = Duration::from_secs(60);
+const FULFIL_HELD_POLL: Duration = Duration::from_secs(12);
+/// Wait between reads while a lagging replica's head is still below a block we hold a receipt for.
+const LAG_RETRY_WAIT: Duration = Duration::from_secs(2);
+/// Per-rung receipt wait and state poll on the RELEASE ladder (~3 blocks + 1). The release window
+/// closes at D+G and only the lifecycle's reserved margin is left for it, so each rung must be short
+/// enough that several fee-bumped same-nonce rungs fit (see `RELEASE_LADDER_SECS`).
+pub(crate) const RELEASE_RECEIPT_WAIT: Duration = Duration::from_secs(36);
+/// Per-rung receipt wait on the CLAIM ladder. Every later nonce of this key queues behind an unmined
+/// claim (other jobs' fulfils and releases included), so it must climb quickly too.
+const CLAIM_RECEIPT_WAIT: Duration = Duration::from_secs(36);
+/// After an unconfirmed claim rung, how long to poll job state before re-broadcasting.
+const CLAIM_STATE_POLL: Duration = Duration::from_secs(12);
+const RELEASE_STATE_POLL: Duration = Duration::from_secs(12);
+/// Wall time the whole release ladder can take: MAX_TX_ATTEMPTS rungs of (receipt wait + state
+/// poll + a send's RPC round-trips). The lifecycle starts the release at least this long before the
+/// release window closes.
+pub const RELEASE_LADDER_SECS: u64 = MAX_TX_ATTEMPTS as u64
+    * (RELEASE_RECEIPT_WAIT.as_secs() + RELEASE_STATE_POLL.as_secs() + 6);
+
+/// `FulfilFailure::error_name` of a fulfil held by a governance state (nothing was sent).
+pub const GOVERNANCE_HOLD_NAME: &str = "GovernanceHold";
+
+/// A governance state that KEEPS a lock (see [`ChainClient::governance_hold`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernanceHold {
+    /// The router or the Registry is paused. Never release: `releaseJob` has no pause gate and would
+    /// burn the penalty, while the lock's clock is credited for the pause.
+    Paused,
+    /// The job's adapter is Disabled: fulfils revert, the lock cannot be slashed, and
+    /// `graceRelease` is a penalty-free exit.
+    AdapterDisabled,
+}
+
+/// A job's clock as zkminer acts on it (see [`ChainClient::job_clock_state`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobClockState {
+    /// A pause or a Disabled adapter: the clock is stopped for as long as it lasts, and a full
+    /// RESUME_GRACE is credited after it lifts.
+    pub hold: Option<GovernanceHold>,
+    /// Seconds of RESUME_GRACE still running after a lift (0 = none).
+    pub tail: u64,
+}
+
+/// The node refused a send because the account cannot cover `gas x maxFee (+ value)`.
+pub(crate) fn is_funds_refusal(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("insufficient funds")
+}
+
+/// op-geth's default `--rpc.txfeecap` (1 ETH): a send whose `gasLimit x maxFeePerGas` exceeds it is
+/// refused by the RPC.
+const TX_FEE_CAP_WEI: u128 = 1_000_000_000_000_000_000;
+/// Upper bound on a releaseJob's gas limit, for sizing what the balance can fund.
+const RELEASE_GAS_BOUND: u128 = 500_000;
+
+/// How many 12.5% replacement rungs the fulfil ladder leaves free below the per-nonce cap, so a
+/// same-nonce `releaseJob` can ALWAYS displace our own pooled fulfil (a release needs a strictly
+/// higher bid, and is the only thing that frees the collateral once the fulfil window closes).
+const RELEASE_DISPLACE_RUNGS: u32 = 2;
+
+/// A fee decision for the fulfil / release ladders (see [`job_path_bid`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobBid {
+    /// Send at this `(tip, max_fee)`.
+    Send(u128, u128),
+    /// The ladder reached its ceiling: re-publish at the fees ALREADY broadcast at this nonce (the
+    /// node answers "already known", or re-pools it if it was dropped) instead of raising further.
+    Hold(u128, u128),
+    /// No strictly-higher bid is possible within the cap.
+    Exhausted,
+}
+
+/// The bid for a fulfil (`reserve_rungs = RELEASE_DISPLACE_RUNGS`) or a release displacing our own
+/// pooled fulfil (`reserve_rungs = 0`) at a nonce with recorded `state`. The cap is the larger of
+/// the nonce's `8 x seed` ratchet cap and the key-wide `ceiling` (handoff §10): an `8 x` cap seeded
+/// from a 0.01-gwei tip tops out near 0.14 gwei, which makes holding our fulfil out of blocks cheap.
+///
+/// `affordable` is the highest `maxFeePerGas` the node will even admit for this send — `min(balance,
+/// the RPC's 1-ETH txfeecap) / gasLimit` (handoff §10's effective ceiling). A rung above it is refused,
+/// not pooled, so the ladder holds below it instead of sending bids that can only bounce.
+fn job_path_bid(
+    state: Option<crate::nonce::FeeFloorState>,
+    tip: u128,
+    max_fee: u128,
+    ceiling: u128,
+    reserve_rungs: u32,
+    affordable: u128,
+) -> JobBid {
+    let over = |v: u128| v.saturating_add((v / 8).max(1));
+    // Hemi orders by TIP: the ceiling (with its reserved release rungs) bounds the tip, and maxFee —
+    // only a cap on what we pay, ~2 x baseFee + tip — is bounded by what the node will admit
+    // (`affordable`). Bounding maxFee by the ceiling instead would freeze the tip far below it whenever
+    // one quote came in with a high maxFee (e.g. a fallback after a failed header read).
+    let cap = state.map_or(ceiling, |s| s.cap.max(ceiling));
+    let mut tip_limit = cap;
+    for _ in 0..reserve_rungs {
+        tip_limit = tip_limit / 9 * 8;
+    }
+    let max_limit = affordable.max(1);
+    // The fresh seed comes from `eth_maxPriorityFeePerGas`, which a block-filler can inflate: it is
+    // clamped into the limits on EVERY send (a first send included), never allowed to refuse a send or
+    // freeze the ladder. Only the replacement floor (what we already broadcast) can exhaust it.
+    let Some(s) = state else {
+        let m = max_fee.max(tip.min(tip_limit)).min(max_limit).max(1);
+        return JobBid::Send(tip.min(tip_limit).min(m), m);
+    };
+    let floor_tip = over(s.broadcast.0);
+    let floor_max = over(s.broadcast.1);
+    if floor_tip > tip_limit || floor_max > max_limit {
+        if reserve_rungs > 0 && s.broadcast.1 > 0 {
+            return JobBid::Hold(s.broadcast.0.min(s.broadcast.1), s.broadcast.1);
+        }
+        return JobBid::Exhausted;
+    }
+    let want_tip = tip.max(floor_tip).min(tip_limit);
+    let want_max = max_fee.max(floor_max).max(want_tip).min(max_limit);
+    JobBid::Send(want_tip.min(want_max), want_max)
+}
+
+/// The fee of release rung `attempt` (1-based): from the normal start price up to the key-wide ceiling
+/// by the last rung. A release not mined before D+G turns a flat 5% penalty into a 100% slash, its
+/// ~225k gas makes even the top rung cheap (~0.001 ETH at 4 gwei), and a ladder that only climbs 15%
+/// per rung can be held out of blocks for ~0.016 ETH. A release that mines at once pays the start
+/// price, so the climb costs nothing unless someone is actually holding it out.
+fn release_rung_fees(base_tip: u128, base_max_fee: u128, attempt: u32, ceiling: u128) -> (u128, u128) {
+    let last = MAX_TX_ATTEMPTS.saturating_sub(1).max(1) as f64;
+    let step = attempt.saturating_sub(1).min(MAX_TX_ATTEMPTS - 1) as f64;
+    let start = base_tip.max(1).min(ceiling.max(1));
+    let ratio = (ceiling.max(start) as f64 / start as f64).powf(step / last);
+    let tip = ((start as f64) * ratio) as u128;
+    let tip = tip.max(start).min(ceiling.max(start));
+    // Keep the base-fee headroom of the quote (maxFee = 2 x baseFee + tip).
+    let max_fee = base_max_fee.saturating_sub(base_tip).saturating_add(tip).max(tip);
+    (tip, max_fee)
+}
+
+/// The fulfil gas limit (handoff §7 step 7; `script/lib/FulfillGas.sol` `limit`). The router refuses
+/// to start verifying an adapter job unless `gasleft() >= 4,600,000 + callbackGasLimit` (a stored
+/// `callbackGasLimit` of 0 means 200,000), so: `2 * CUSTOM_VERIFIER_GAS_LIMIT (2M) +
+/// SETTLEMENT_GAS_BUFFER (500k) + 100k + callback + 250k pre-work + 16 * calldata bytes + 8 * journal
+/// bytes + 500k margin`. `calldata_len` includes the 4-byte selector. Never size it with
+/// `eth_estimateGas` — an estimate shows the seal to the RPC operator.
+pub fn fulfill_gas_formula(callback_gas_limit: u32, calldata_len: usize, journal_len: usize) -> u64 {
+    const ADAPTER_PREFLIGHT_GAS: u64 = 2 * 2_000_000 + 500_000 + 100_000;
+    let cb = if callback_gas_limit == 0 {
+        200_000
+    } else {
+        callback_gas_limit as u64
+    };
+    ADAPTER_PREFLIGHT_GAS
+        + cb
+        + 250_000
+        + 16 * calldata_len as u64
+        + 8 * journal_len as u64
+        + 500_000
+}
+
+/// The exact claim floors for one job, read at ONE mined block (handoff §7 step 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimQuote {
+    /// The mined block both reads were pinned to.
+    pub block: u64,
+    /// `eth_call` of `claimJob(jobId, 0, 0)` from our prover at `block` — the price a claim
+    /// included now settles at. Raised to the job's high-water mark before a send.
+    pub price_floor: u128,
+    /// `getPremiumCap(jobId)` at `block` (0 on a competitive job). Never ratcheted.
+    pub premium_floor: u128,
+}
+
+/// [`ChainClient::preview_claim`]'s answer when the quote didn't revert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimPreview {
+    /// A claim sent now would go out at these floors.
+    Claimable(ClaimQuote),
+    /// Some prover (possibly us) already holds the job.
+    Held(Address),
+}
+
+/// A lock confirmed on-chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimReceipt {
+    /// The block the lock is known at — the claim receipt's, or the block a pre-existing lock was
+    /// read at. Every later read that decides whether to publish a proof is pinned at or after it.
+    pub block: u64,
+    /// `JobClaimed.settledPrice` from OUR receipt (`None` for a lock found pre-existing / by poll).
+    pub settled_price: Option<u128>,
+}
+
+/// Per-job claim-price high-water mark (handoff §10 "Claim floors"): the highest `priceFloor` we
+/// have sent for a job. Never claim below it — a lower quote (a lagging replica, a reorg) is a reason
+/// to WAIT, never to chase the price down. Forgotten on our own lock, a terminal job, or 10 reopens.
+/// Process-wide, bounded like the run loop's other per-job maps.
+static CLAIM_HIGH_WATER: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<B256, u128>>,
+> = std::sync::OnceLock::new();
+const CLAIM_HIGH_WATER_CAP: usize = 100_000;
+
+fn claim_high_water() -> &'static std::sync::Mutex<std::collections::HashMap<B256, u128>> {
+    CLAIM_HIGH_WATER.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The floor to send for `job_id` given a fresh quote: the quote itself, recorded as the new
+/// high-water mark — or, if the live price has fallen BELOW the mark, a typed `Wait` refusal (a
+/// claim at the mark would revert `ClaimBelowFloor`; a claim below it is chasing the price down).
+fn claim_floor_with_high_water(job_id: B256, quoted: u128) -> Result<u128> {
+    let mut m = claim_high_water()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("claim high-water map poisoned"))?;
+    let hw = m.get(&job_id).copied().unwrap_or(0);
+    if quoted < hw {
+        return Err(ClaimFailure {
+            class: ClaimClass::Wait,
+            reason: format!("live price {quoted} is below our high-water floor {hw}"),
+            definitely_not_locked: true,
+            block: None,
+        }
+        .into());
+    }
+    if m.len() >= CLAIM_HIGH_WATER_CAP && !m.contains_key(&job_id) {
+        if let Some(k) = m.keys().next().copied() {
+            m.remove(&k);
+        }
+    }
+    m.insert(job_id, quoted);
+    Ok(quoted)
+}
+
+/// Forget a job's claim high-water mark (our own lock, a terminal job, or 10 reopens).
+pub fn forget_claim_high_water(job_id: B256) {
+    if let Ok(mut m) = claim_high_water().lock() {
+        m.remove(&job_id);
+    }
+}
+
+fn claim_not_sent(msg: String) -> anyhow::Error {
+    ClaimNotSent(crate::programs::sanitize_log(&msg)).into()
+}
+
+/// A typed [`ClaimFailure`] from a call error carrying revert data; an untyped (ambiguous) error for
+/// a transport failure with none. `block` is the mined block the call was evaluated at, if known.
+fn claim_failure_from_call(
+    e: &alloy::contract::Error,
+    definitely_not_locked: bool,
+    block: Option<u64>,
+) -> anyhow::Error {
+    match crate::revert::revert_data_of(e) {
+        Some(data) => {
+            let d = crate::revert::decode(&data);
+            ClaimFailure {
+                class: crate::revert::classify_claim(&d),
+                reason: d.name(),
+                definitely_not_locked,
+                block,
+            }
+            .into()
+        }
+        None => anyhow::anyhow!(
+            "claimJob call failed: {}",
+            crate::programs::sanitize_log(&format!("{e:#}"))
+        ),
+    }
+}
+
+/// `JobClaimed.settledPrice` from OUR claim receipt: a router-emitted `JobClaimed(jobId, prover = us,
+/// …)` log. `None` if absent (then the lock is confirmed by the `jobs()` re-read alone).
+fn receipt_job_claimed(
+    receipt: &TransactionReceipt,
+    job_id: B256,
+    prover: Address,
+    router: Address,
+) -> Option<u128> {
+    use alloy::sol_types::SolEvent;
+    receipt.inner.logs().iter().find_map(|log| {
+        let t = log.topics();
+        if log.inner.address != router
+            || t.first() != Some(&zkminer_contracts::bindings::IHemiProveCore::JobClaimed::SIGNATURE_HASH)
+            || t.get(1) != Some(&job_id)
+            || t.get(2) != Some(&prover.into_word())
+        {
+            return None;
+        }
+        let data = log.data().data.as_ref();
+        (data.len() >= 32).then(|| U256::from_be_slice(&data[..32]).to::<u128>())
+    })
+}
+
+/// topic0 of the `JobFulfilled` event (see `bindings.rs`), computed like monitor.rs's other
+/// canonical topics so a change to the event signature is caught by a test rather than
+/// silently breaking the match.
+fn job_fulfilled_topic0() -> B256 {
+    alloy::primitives::keccak256(
+        "JobFulfilled(bytes32,address,address,uint96,uint96,uint256,uint256,uint256,uint256,uint64,bytes)",
+    )
+}
+
+/// Did this receipt's OWN logs record a `JobFulfilled(jobId, …)` emitted BY THE ROUTER for `job_id`?
+///
+/// Reading the mined transaction's logs is race-free, unlike a follow-up `getJobStatusView` which a
+/// load-balanced RPC can serve from a block BEFORE the tx mined (showing the stale pre-fulfill
+/// Locked state). A submitter-controlled callback that rejects makes `fulfillJob` mine successfully
+/// (receipt.status() == true) WITHOUT fulfilling the job — so the mined receipt alone is not proof
+/// of fulfillment; the emitted event is.
+///
+/// The emitter address MUST be checked: the submitter's callback contract runs INSIDE the
+/// fulfillJob tx and can emit a counterfeit `JobFulfilled(jobId, …)` log from its own address. Only
+/// a log emitted by the HemiProve router (`expected_emitter`) is authentic, so matching on topics
+/// alone would let a rejecting callback forge "fulfilled" and walk the job into a slash.
+fn receipt_fulfilled_this_job(
+    receipt: &TransactionReceipt,
+    job_id: B256,
+    expected_emitter: Address,
+) -> bool {
+    receipt
+        .inner
+        .logs()
+        .iter()
+        .any(|log| log_is_authentic_fulfilled(log.inner.address, log.topics(), job_id, expected_emitter))
+}
+
+/// Pure predicate (testable without a TransactionReceipt): a log is an authentic `JobFulfilled` for
+/// `job_id` iff it was emitted BY the router (`expected_emitter`) with topic0 == JobFulfilled and
+/// topic1 == job_id. The emitter check is what defeats a submitter callback forging the event.
+fn log_is_authentic_fulfilled(
+    emitter: Address,
+    topics: &[B256],
+    job_id: B256,
+    expected_emitter: Address,
+) -> bool {
+    emitter == expected_emitter
+        && topics.first() == Some(&job_fulfilled_topic0())
+        && topics.get(1) == Some(&job_id)
+}
 use zkminer_contracts::bindings::{
-    HashedDescriptor, IHemiProveAux, IHemiProveCore, IHemiProveFulfill, JobDescriptor,
+    IHemiProveAux, IHemiProveCore, IHemiProveFulfill, IHemiProveRegistry, JobDescriptor, JobRecord,
     JobStatusView,
 };
 
-/// Per-job gas budget for `claimJobBatch`, and the batch's fixed overhead.
-///
-/// **Why an explicit limit instead of `eth_estimateGas`.** `claimJobBatch`
-/// isolates each job in a self-`call` and SWALLOWS per-job failures
-/// (`results[i] = ok`), so the OUTER tx never reverts no matter how many inner
-/// claims fail. `eth_estimateGas` binary-searches for the least gas at which the
-/// outer tx *succeeds* — and, because inner failures are swallowed, it happily
-/// settles on a value where the LAST sub-call is starved by EIP-150's 63/64 rule
-/// and returns `false`, while the tx still "succeeds" returning `[true, …, false]`.
-/// The estimate therefore SILENTLY DROPS the tail job(s): a batch of 3 mined with
-/// ~314k gas locked only 2 (the 3rd sub-call got ~13k of the ~144k it needed).
-///
-/// A single `claimJob` executes in ~144k gas; the self-call wrapper and adapter
-/// staticcall are included in that. 250k/job (~1.7×) leaves enough headroom that
-/// even the 10th sub-call in a MAX_BATCH_SIZE batch clears the 63/64 haircut. The
-/// unused portion is refunded, so over-provisioning is free beyond block-limit
-/// headroom (2.6M for n=10 is trivial against Hemi's block gas limit).
-const CLAIM_BATCH_PER_JOB_GAS: u64 = 250_000;
-const CLAIM_BATCH_BASE_GAS: u64 = 80_000;
-// [RPC quick-win] Explicit gas on the single claimJob so GasFiller sees a limit and both
+// Explicit gas on the single claimJob so GasFiller sees a limit and both
 // fee fields set → it skips the eth_estimateGas that otherwise fires back-to-back with the
 // send (up to 5x under retry, and a 429-fragile abort point) in the claim burst window.
 // claimJob is a fixed, loop-free path measured at ~144k; 300k is >2x headroom, refunded if
-// unused. (claimJobBatch already sets an explicit limit; releaseJob deliberately does NOT —
+// unused. (releaseJob deliberately does NOT set one —
 // it is heavier and an under-provisioned OOG revert is treated as terminal → stranded.)
 const CLAIM_JOB_GAS_LIMIT: u64 = 300_000;
 
@@ -46,9 +384,10 @@ pub const FEE_CAP_EXHAUSTED: &str = "fee cap exhausted";
 
 /// Log an exhausted-cap give-up uniformly across the four tx paths.
 ///
-/// The bid is logged because the 2026-08-14 wedge was diagnosable only by re-deriving
-/// the arithmetic from the cap: 327 rejected sends over 4h24m and not one fee value in
-/// the log. Never make an operator infer the number that was actually on the wire.
+/// The bid is logged because a fee-cap give-up is diagnosable only by re-deriving the
+/// arithmetic from the cap: without the actual fee values on the wire, an operator sees
+/// only a stream of rejected sends and has no number to reason from. Never make an
+/// operator infer the number that was actually on the wire.
 fn log_fee_cap_exhausted(what: &str, nonce: u64, state: &crate::nonce::FeeFloorState) {
     tracing::error!(
         "{what} at nonce {nonce}: fee cap EXHAUSTED — already broadcast \
@@ -61,37 +400,15 @@ fn log_fee_cap_exhausted(what: &str, nonce: u64, state: &crate::nonce::FeeFloorS
     );
 }
 
-/// Escalating EIP-1559 fees for re-broadcast `attempt` (1-based) given base fees.
-///
-/// Bumps BOTH the priority fee and the max fee enough to clear a node's same-nonce
-/// replacement threshold (geth default 10%, some nodes 12.5%), so a re-broadcast
-/// reliably DISPLACES a stuck predecessor (a claim/fulfill/release we're retrying, or
-/// a release over a stuck fulfill). Without this, a re-send at unchanged fees is
-/// rejected "replacement underpriced" forever.
-///
-/// The escalation is MULTIPLICATIVE — attempt N is ~15% over attempt N-1 on BOTH
-/// fields — so *every* re-broadcast (not just the first) clears the floor even after
-/// integer truncation. An earlier additive-percentage-point schedule decayed as the
-/// base grew (13% → 11.5% → 10.3% → 9.35% by attempt 4→5), dropping under geth's 10%
-/// floor on the final attempt — which is exactly `release_job`'s same-nonce collateral
-/// rescue, and the decay is the *normal* case on low-priority-fee L2s where max_fee
-/// dominates the tip. attempt 1 == base fees (the initial send is not a replacement);
-/// each further attempt multiplies by 1.15, with a strict +1 floor so a sub-100-wei
-/// base still moves.
-/// [H2/M5] `release_job` continues the fee escalation from HERE (past `fulfill_job`'s
-/// MAX_ATTEMPTS ceiling) so a release can out-bid — and thus displace at the same
-/// nonce — a fulfill tx parked at its top escalation. Equal to fulfill's MAX_ATTEMPTS.
-const FULFILL_ESCALATION_HEADROOM: u32 = 5;
-
 /// Raise `(tip, max_fee)` so it can DISPLACE whatever we last broadcast at `nonce`.
 ///
 /// The escalation ladder is seeded per INVOCATION (`base_fees()` is fetched once per
 /// `claim_job`/`fulfill_job` call and `attempt` restarts at 1), so a fresh invocation that
 /// recycles a nonce through `freed` restarts at the UNBUMPED base and cannot clear the
 /// node's replacement threshold against a resident tx left at a previous invocation's top
-/// attempt. That made the retry loop arithmetically non-terminating and wedged the signer
-/// for ~10 minutes on 2026-08-01. Anchoring the floor to the NONCE fixes it: every send at
-/// that nonce is strictly above the last one, whoever sends it.
+/// attempt. That makes the retry loop arithmetically non-terminating and wedges the signer.
+/// Anchoring the floor to the NONCE fixes it: every send at that nonce is strictly above
+/// the last one, whoever sends it.
 ///
 /// `REPLACEMENT_BUMP_NUM/DEN` is the margin over the recorded high-water. geth's default
 /// replacement rule needs +10%; 12.5% (= `+ v/8`) clears it with room for rounding, and
@@ -101,8 +418,8 @@ const FULFILL_ESCALATION_HEADROOM: u32 = 5;
 ///
 /// Returns `None` when the ratchet cap is EXHAUSTED — no strictly-higher bid is
 /// possible, so any send would be rejected `replacement transaction underpriced`
-/// every time. Callers must stop rather than spin: re-bidding a losing fee is what
-/// wedged nonce 11589 for 4h24m on 2026-08-14 and stranded three jobs' collateral.
+/// every time. Callers must stop rather than spin: re-bidding a losing fee is rejected
+/// forever, and the spin can strand locked collateral at the lock deadline.
 fn fees_over_floor(
     client: &ChainClient,
     nonce: u64,
@@ -130,13 +447,30 @@ fn fees_over_floor_state(
     let over = |v: u128| v.saturating_add((v / 8).max(1));
     let bid = (tip.max(over(floor_tip)), max_fee.max(over(floor_max)));
     // A bid at or below what we already broadcast cannot displace it. Treat that as
-    // exhaustion too -- this is the exact shape the cap used to produce silently.
+    // exhaustion too -- a send at such a bid is rejected "replacement underpriced".
     if bid.1 <= state.broadcast.1 && state.broadcast.1 > 0 {
         return None;
     }
     Some(bid)
 }
 
+/// Escalating EIP-1559 fees for re-broadcast `attempt` (1-based) given base fees.
+///
+/// Bumps BOTH the priority fee and the max fee enough to clear a node's same-nonce
+/// replacement threshold (geth default 10%, some nodes 12.5%), so a re-broadcast
+/// reliably DISPLACES a stuck predecessor (a claim/fulfill/release we're retrying, or
+/// a release over a stuck fulfill). Without this, a re-send at unchanged fees is
+/// rejected "replacement underpriced" forever.
+///
+/// The escalation is MULTIPLICATIVE — attempt N is ~15% over attempt N-1 on BOTH
+/// fields — so *every* re-broadcast (not just the first) clears the floor even after
+/// integer truncation. An additive-percentage-point schedule would instead decay as the
+/// base grew (13% → 11.5% → 10.3% → 9.35% by attempt 4→5), dropping under geth's 10%
+/// floor on the final attempt — which is exactly `release_job`'s same-nonce collateral
+/// rescue, and the decay is the *normal* case on low-priority-fee L2s where max_fee
+/// dominates the tip. attempt 1 == base fees (the initial send is not a replacement);
+/// each further attempt multiplies by 1.15, with a strict +1 floor so a sub-100-wei
+/// base still moves.
 fn escalated_fees(base_tip: u128, base_max_fee: u128, attempt: u32) -> (u128, u128) {
     let steps = attempt.saturating_sub(1);
     let bump = |mut v: u128| -> u128 {
@@ -162,12 +496,12 @@ fn escalated_fees(base_tip: u128, base_max_fee: u128, attempt: u32) -> (u128, u1
     (tip, max_fee)
 }
 
-/// [H2] A tx is already PENDING at the nonce we're using — a stuck predecessor at
+/// A tx is already PENDING at the nonce we're using — a stuck predecessor at
 /// this nonce (a fulfill we're releasing over, or our own prior re-broadcast). The
 /// correct response is to KEEP the same nonce and ESCALATE the fee so the next
-/// attempt DISPLACES it. Re-syncing the nonce forward here (the old is_nonce_error
-/// path) instead queues the new tx BEHIND the stuck one → it can never mine before
-/// the deadline → strand. This must be checked BEFORE is_nonce_error.
+/// attempt DISPLACES it. Re-syncing the nonce forward here instead queues the new tx
+/// BEHIND the stuck one → it can never mine before the deadline → strand. This must be
+/// checked BEFORE is_nonce_error.
 fn is_same_nonce_pending(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("replacement transaction underpriced")
@@ -179,7 +513,7 @@ fn is_same_nonce_pending(msg: &str) -> bool {
 /// chain) and a re-fetch of the on-chain nonce will fix it. NOTE: "replacement
 /// underpriced"/"already known"/"mempool" are NOT here — those mean the nonce is
 /// correct but a tx is pending at it (see is_same_nonce_pending); walking the nonce
-/// forward on those breaks the fulfill→release same-nonce displacement (H2).
+/// forward on those breaks the fulfill→release same-nonce displacement.
 fn is_nonce_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("nonce too low") || m.contains("nonce too high")
@@ -187,10 +521,11 @@ fn is_nonce_error(msg: &str) -> bool {
 
 /// Attempts every tx path gives its send ladder.
 ///
-/// One constant, not four copies: the backoff tests assert properties of the whole ladder, and
-/// against four private copies they were asserting about a number no production path had to
-/// honour. The per-attempt waits are likewise single-sourced through `nonce_retry_backoff` and
-/// the two unit constants — both arms of every ladder, not just the `is_nonce_error` ones.
+/// A single constant shared by all tx paths, not a copy per path: the backoff tests assert
+/// properties of the whole ladder, and a private per-path copy would let a path's real attempt
+/// count drift from the number the tests check. The per-attempt waits are likewise single-sourced
+/// through `nonce_retry_backoff` and the two unit constants — both arms of every ladder, not just
+/// the `is_nonce_error` ones.
 pub const MAX_TX_ATTEMPTS: u32 = 5;
 
 /// Backoff unit for a rejected nonce on the claim/fulfil paths.
@@ -199,10 +534,9 @@ const NONCE_RETRY_UNIT: Duration = Duration::from_millis(250);
 /// Wait after a send failure that is NOT about the nonce — a 429, a connection reset, an RPC
 /// hiccup. Longer than the nonce units because the condition is the endpoint, not our bookkeeping.
 ///
-/// Skipped on the final attempt, like the nonce arms. It was a flat 5s on EVERY rung, so
-/// `releaseJob` could spend 25s asleep — five times the whole ladder its own comments agonise
-/// about, and more than half of `RELEASE_JOIN_BUDGET` on a supervised stop, spent sleeping rather
-/// than broadcasting the tx that frees the collateral.
+/// Skipped on the final attempt, like the nonce arms. Without that skip, a 5s wait on every rung
+/// lets `releaseJob` spend up to 25s asleep — more than half of `RELEASE_JOIN_BUDGET` on a
+/// supervised stop, spent sleeping rather than broadcasting the tx that frees the collateral.
 const SEND_FAILURE_RETRY_WAIT: Duration = Duration::from_secs(5);
 
 /// Backoff unit for `releaseJob`, deliberately shorter: it is the collateral rescue, so its
@@ -213,12 +547,11 @@ const RELEASE_NONCE_RETRY_UNIT: Duration = Duration::from_millis(100);
 /// How long to wait before retrying a send whose nonce the node rejected.
 ///
 /// The invariant this exists to enforce: a nonce-error ladder must never be able to run to
-/// completion instantly. Before this, all four `is_nonce_error` arms did
-/// `resync → reserve → continue` with no delay at all, so MAX_ATTEMPTS re-sends could burn
-/// in microseconds against a node view that had not moved. That is the shape of the
-/// 2026-08-14 wedge (327 rejected sends in 4h24m); the fix for it gave every
-/// `is_same_nonce_pending` arm a backoff and left every `is_nonce_error` arm without one —
-/// same ladder, same burn, different branch.
+/// completion instantly. A `resync → reserve → continue` loop with no delay lets MAX_ATTEMPTS
+/// re-sends burn in microseconds against a node view that has not moved — a livelock that
+/// produces a long run of rejected sends while making no progress. Both the
+/// `is_same_nonce_pending` arms and the `is_nonce_error` arms must back off, or the untreated
+/// arm burns the whole ladder just as fast.
 ///
 /// `progressed` is whether the re-sync actually handed back a DIFFERENT nonce:
 ///
@@ -243,7 +576,7 @@ fn nonce_retry_backoff(attempt: u32, progressed: bool, unit: Duration) -> Durati
     }
 }
 
-/// [#4] Whether an error string is a rate-limit (429) response. Matches the HTTP 429
+/// Whether an error string is a rate-limit (429) response. Matches the HTTP 429
 /// status and the JSON-RPC "rate limit exceeded" body the endpoint returns (code -32005).
 fn is_rate_limit_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
@@ -256,13 +589,34 @@ use crate::client::ChainClient;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimOutcome {
     /// We now hold the lock on this job.
-    Claimed,
+    Claimed(ClaimReceipt),
     /// Someone else already owns (or has released/fulfilled) this job.
     LostRace,
 }
 
-/// Parsed job data from chain (derived from JobStatusView + events).
+/// `claim_job` found the job held by another prover on a read that already includes our claim's
+/// nonce: our claim cannot have locked it (an unpinned read showing another prover proves nothing
+/// of the kind — a replica behind our claim still shows the job's previous holder).
 #[derive(Debug, Clone)]
+pub struct ClaimLostRace(pub Address);
+
+impl std::fmt::Display for ClaimLostRace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "claimJob lost race — job taken by {}", self.0)
+    }
+}
+impl std::error::Error for ClaimLostRace {}
+
+/// What we know about where we last saw our own lock on a job (from the job journal): a block at
+/// which it read Locked by us, and its reopen count then. See `release_job_with_nonce`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LockSeen {
+    pub block: Option<u64>,
+    pub reopens: Option<u8>,
+}
+
+/// Parsed job data from chain (derived from JobStatusView + events).
+#[derive(Debug, Clone, Default)]
 pub struct JobInfo {
     pub job_id: B256,
     /// The programId (imageId/vKey) from the JobSubmitted event.
@@ -301,6 +655,33 @@ impl ChainClient {
         Ok(view)
     }
 
+    /// `getJobStatusView` read at a block AT OR AFTER `min_block` (waiting while a lagging replica's
+    /// head is below it), so a view taken right after our claim cannot show the pre-claim state.
+    pub async fn get_job_status_view_at(&self, job_id: B256, min_block: u64) -> Result<JobStatusView> {
+        const LAG_RETRIES: u32 = 10;
+        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
+        for attempt in 0..LAG_RETRIES {
+            let head = self
+                .provider
+                .get_block_number()
+                .await
+                .context("getJobStatusView: block number")?;
+            if head < min_block {
+                if attempt + 1 < LAG_RETRIES {
+                    tokio::time::sleep(LAG_RETRY_WAIT).await;
+                }
+                continue;
+            }
+            return aux
+                .getJobStatusView(job_id)
+                .block(BlockId::number(head))
+                .call()
+                .await
+                .context("Failed to get job status view");
+        }
+        bail!("getJobStatusView({job_id}): RPC head stays below block {min_block} (lagging replica)")
+    }
+
     /// Fetch `getJobStatusView` for many jobs in ONE RPC request via Multicall3.
     /// Returns `(job_id, Some(view))` for each, or `(job_id, None)` if that
     /// sub-call reverted (e.g. an unknown job) — the whole batch shares one
@@ -313,7 +694,7 @@ impl ChainClient {
         if job_ids.is_empty() {
             return Ok(Vec::new());
         }
-        // [M9] CHUNK the multicall. A single aggregate3 over a large set (recovery can pass
+        // CHUNK the multicall. A single aggregate3 over a large set (recovery can pass
         // 100+ historically-claimed jobs) can exceed the node's response/gas cap and fail
         // WHOLESALE, dropping us into the per-job fallback below for EVERY job — an RPC
         // storm that 429s the endpoint. Bounded chunks keep each multicall well within
@@ -330,7 +711,7 @@ impl ChainClient {
                 .multicall()
                 .dynamic::<IHemiProveAux::getJobStatusViewCall>();
             for jid in chunk {
-                // [review must-fix] allowFailure=TRUE per sub-call. alloy's `add_dynamic`
+                // allowFailure=TRUE per sub-call. alloy's `add_dynamic`
                 // defaults to allow_failure=FALSE, and aggregate3 reverts wholesale on any
                 // allowFailure=false sub-call revert — so a single unknown/reverting jobId
                 // would sink the entire 25-job chunk into the expensive per-job fallback
@@ -347,13 +728,13 @@ impl ChainClient {
                     }
                     i += chunk.len();
                 }
-                // [#4] Classify the chunk failure. Under a rate-limit storm the OLD code
-                // fanned out one get_job_status_view PER job in the failed chunk — the exact
-                // per-job storm that AMPLIFIES the 429s.
+                // Classify the chunk failure. Fanning out one get_job_status_view PER job in
+                // the failed chunk would be the exact per-job storm that AMPLIFIES the 429s,
+                // so this must not fall back per-job under a rate-limit storm.
                 //
                 // Classify PRIMARILY on THIS chunk's error being a 429 (not just the global
                 // recent-429 meter): a stray unrelated 429 within the window must not
-                // reclassify a genuine one-chunk error. [review must-fix] Mark ONLY the
+                // reclassify a genuine one-chunk error. Mark ONLY the
                 // current chunk unreadable (None) and CONTINUE — do NOT discard the later,
                 // possibly-healthy chunks. Each remaining chunk still costs exactly one
                 // paced multicall (N/25 total, never per-job), so the amplifier is gone,
@@ -382,7 +763,7 @@ impl ChainClient {
         Ok(out)
     }
 
-    /// [#4] True if the endpoint rate-limited us within the recent-classify window — a
+    /// True if the endpoint rate-limited us within the recent-classify window — a
     /// secondary storm signal used alongside the per-error 429 check.
     fn rate_limited_now(&self) -> bool {
         self.rpc_meter()
@@ -403,7 +784,7 @@ impl ChainClient {
     /// The governance-set per-job collateral floor (`MIN_COLLATERAL_AMOUNT`). The
     /// on-chain claim floors `computeCollateral()` with this value, so the miner's
     /// collateral gate must use the SAME floor (not an adapter's `minStake`, which is
-    /// the unrelated prover-eligibility total-stake threshold — [D6]). Constant across
+    /// the unrelated prover-eligibility total-stake threshold). Constant across
     /// a deployment, so callers fetch it once at startup and cache it.
     pub async fn get_min_collateral_amount(&self) -> Result<u128> {
         let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
@@ -426,25 +807,35 @@ impl ChainClient {
         Ok(index.to::<u64>())
     }
 
-    /// Scan `JobClaimed` events for jobs this miner locked on-chain (topic2 =
-    /// prover == our address), within `lookback_blocks` of the chain head. Used on
-    /// startup to discover locked positions that never made it into the journal
-    /// (crash before write, cleared journal, another machine). Chunked to stay
-    /// under RPC log-range limits; per-chunk errors are logged, not fatal. The
-    /// returned ids still need a per-job status check (the recovery loop confirms
-    /// each is currently Locked-by-us before re-driving it).
+    /// Scan `JobClaimed` events for jobs this miner locked on-chain (topic2 = prover == our
+    /// address), within `lookback_blocks` of the chain head and never below the deployment's first
+    /// block. Used on startup to find locks from the CHAIN, not local state (handoff §13 test 18):
+    /// a crash before the journal write, a cleared journal, another machine. Chunked under RPC
+    /// log-range limits; each failed chunk is RETRIED (a skipped window could hide a lock we must
+    /// settle or release before D+G), and if one still fails the scan returns an error so the caller
+    /// re-runs it rather than trusting a partial answer. The returned ids still need a per-job status
+    /// check. `settleBid` also emits `JobClaimed`, so bid-won locks are found too.
     pub async fn find_locked_jobs(&self, lookback_blocks: u64) -> Result<Vec<B256>> {
-        use alloy::rpc::types::Filter;
         let head = self
             .head_block_cached()
             .await
             .context("find_locked_jobs: head block")?;
         let from = head.saturating_sub(lookback_blocks);
+        Ok(self.find_locked_jobs_in(from, head).await?.0)
+    }
+
+    /// Every jobId with a JobClaimed(prover = us) log in `[from, to]` (floored at the deployment's
+    /// first block), and the block the scan covered up to — the cursor for the next incremental scan.
+    pub async fn find_locked_jobs_in(&self, from: u64, to: u64) -> Result<(Vec<B256>, u64)> {
+        use alloy::rpc::types::Filter;
+        const CHUNK: u64 = 9000;
+        const CHUNK_TRIES: u32 = 3;
+        let head = to;
+        let from = from.max(self.scan_from_block.min(head));
         let topic = alloy::primitives::keccak256(
             "JobClaimed(bytes32,address,address,uint96,uint96,uint40)",
         );
         let prover_topic = self.address.into_word();
-        const CHUNK: u64 = 9000;
 
         let mut job_ids: Vec<B256> = Vec::new();
         let mut start = from;
@@ -456,90 +847,527 @@ impl ChainClient {
                 .topic2(prover_topic)
                 .from_block(start)
                 .to_block(end);
-            match self.provider.get_logs(&filter).await {
-                Ok(logs) => {
-                    for log in logs {
-                        // topics: [sig, jobId, prover, operator]
-                        if let Some(jid) = log.topics().get(1).copied() {
-                            if !job_ids.contains(&jid) {
-                                job_ids.push(jid);
-                            }
-                        }
+            let mut tries = 0;
+            let logs = loop {
+                tries += 1;
+                match self.provider.get_logs(&filter).await {
+                    Ok(l) => break l,
+                    Err(e) if tries < CHUNK_TRIES => {
+                        tracing::warn!(
+                            "find_locked_jobs: get_logs {start}..={end} failed (try {tries}/{CHUNK_TRIES}): {e:#}"
+                        );
+                        tokio::time::sleep(Duration::from_secs(2 * tries as u64)).await;
+                    }
+                    Err(e) => {
+                        bail!("LOOKBACK-FAILED: JobClaimed scan {start}..={end} failed {CHUNK_TRIES}x: {e:#}")
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("find_locked_jobs: get_logs {start}..={end} failed: {e:#}");
+            };
+            for log in logs {
+                // topics: [sig, jobId, prover, operator]
+                if let Some(jid) = log.topics().get(1).copied() {
+                    if !job_ids.contains(&jid) {
+                        job_ids.push(jid);
+                    }
                 }
             }
             start = end.saturating_add(1);
         }
-        Ok(job_ids)
+        Ok((job_ids, head))
     }
 
-    /// Claim an open job.
-    pub async fn claim_job(&self, job_id: B256) -> Result<()> {
+    /// Read the router's raw `jobs(jobId)` record at a block AT OR AFTER `min_block`.
+    ///
+    /// A load-balanced RPC may serve a replica that has not yet seen a block we already hold a
+    /// receipt for; reading "latest" there shows the pre-claim state (prover 0) for a lock we own.
+    /// Pinning the read to `max(min_block, head)` — and waiting while the head is below `min_block`
+    /// — is the handoff's "re-read `jobs(jobId).prover` at a block at or after the receipt's".
+    /// Returns the record and the block it was read at.
+    pub async fn read_job_record(
+        &self,
+        job_id: B256,
+        min_block: Option<u64>,
+    ) -> Result<(JobRecord, u64)> {
+        const LAG_RETRIES: u32 = 10;
+        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
+        for attempt in 0..LAG_RETRIES {
+            let head = self
+                .provider
+                .get_block_number()
+                .await
+                .context("jobs(): block number")?;
+            if let Some(m) = min_block {
+                if head < m {
+                    if attempt + 1 < LAG_RETRIES {
+                        tokio::time::sleep(LAG_RETRY_WAIT).await;
+                    }
+                    continue;
+                }
+            }
+            let words = aux
+                .jobs(job_id)
+                .block(BlockId::number(head))
+                .call()
+                .await
+                .context("jobs() read")?;
+            let rec = JobRecord::from_words(&words).map_err(|e| anyhow::anyhow!(e))?;
+            return Ok((rec, head));
+        }
+        bail!(
+            "jobs({job_id}): RPC head stays below block {} (lagging replica)",
+            min_block.unwrap_or_default()
+        )
+    }
+
+    /// Read `jobs(jobId)` at a block that already INCLUDES our transaction at `nonce` — i.e. where
+    /// our account nonce is past it. Whatever our tx at `nonce` did (a claim that locked, a revert),
+    /// the record read there reflects it, so a "not ours" answer is authoritative about that tx. Used
+    /// when a later claim attempt is refused after an earlier one was broadcast: the refusal alone
+    /// (`JobNotOpen`) cannot tell our own lock from someone else's.
+    pub async fn read_job_record_after_nonce(&self, job_id: B256, nonce: u64) -> Result<(JobRecord, u64)> {
+        const NONCE_RETRIES: u32 = 10;
+        for attempt in 0..NONCE_RETRIES {
+            let head = self
+                .provider
+                .get_block_number()
+                .await
+                .context("jobs(): block number")?;
+            let count = self
+                .provider
+                .get_transaction_count(self.address)
+                .block_id(BlockId::number(head))
+                .await
+                .context("jobs(): account nonce")?;
+            if count > nonce {
+                return self.read_job_record(job_id, Some(head)).await;
+            }
+            if attempt + 1 < NONCE_RETRIES {
+                tokio::time::sleep(LAG_RETRY_WAIT).await;
+            }
+        }
+        bail!("jobs({job_id}): our tx at nonce {nonce} is not yet included (pending or lagging replica)")
+    }
+
+    /// The governance state that makes a lock KEPT rather than fulfilled or released (handoff §9,
+    /// §11), read at ONE block: the router or the Registry paused (every fulfil reverts; the lock's
+    /// clock is credited), or the job's adapter Disabled (fulfils revert `AdapterDisabled`; the lock
+    /// cannot be slashed and `graceRelease` is a penalty-free exit). `None` = no hold.
+    pub async fn governance_hold(&self, proof_system_id: B256) -> Result<Option<GovernanceHold>> {
+        let block = self.provider.get_block_number().await.context("block number")?;
+        let at = BlockId::number(block);
+        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
+        if aux.paused().block(at).call().await.context("router paused()")? {
+            return Ok(Some(GovernanceHold::Paused));
+        }
+        let reg = IHemiProveRegistry::new(self.hemi_prove_registry, &*self.provider);
+        if reg.paused().block(at).call().await.context("Registry paused()")? {
+            return Ok(Some(GovernanceHold::Paused));
+        }
+        if proof_system_id != B256::ZERO {
+            let entry = reg
+                .getAdapter(proof_system_id)
+                .block(at)
+                .call()
+                .await
+                .context("Registry getAdapter")?;
+            // AdapterStatus: 0 Unregistered, 1 Active, 2 Deprecated, 3 Disabled.
+            if entry.status == 3 {
+                return Ok(Some(GovernanceHold::AdapterDisabled));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Seconds of RESUME_GRACE still running on a job's clock (0 when none): the base clock's (after a
+    /// router or Registry lift) or the job's adapter key clock's (after the adapter is re-enabled — a
+    /// key lift does not move the base anchor). For that long job-local time stays frozen, so a job's
+    /// `cutoff - now` does not shrink and `getJobStatusView.lockDeadline` (credit so far) understates
+    /// the real cutoff by up to this much. Both clocks are read at ONE block.
+    pub async fn resume_grace_tail_secs(&self, proof_system_id: B256) -> Result<u64> {
+        let block = self
+            .provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .await
+            .context("resume grace: latest block")?
+            .ok_or_else(|| anyhow::anyhow!("resume grace: no latest block"))?;
+        let at = BlockId::number(block.header.number);
+        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
+        let union = aux.getUnionClock().block(at).call().await.context("getUnionClock")?;
+        let mut grace_end = union.u.anchor.to::<u64>();
+        if proof_system_id != B256::ZERO {
+            let key = aux
+                .getKeyClock(proof_system_id)
+                .block(at)
+                .call()
+                .await
+                .context("getKeyClock")?;
+            // While a window is ACTIVE `a` is its start, not a grace end.
+            if !key.active {
+                grace_end = grace_end.max(key.a.to::<u64>());
+            }
+        }
+        Ok(grace_end.saturating_sub(block.header.timestamp))
+    }
+
+    /// The governance hold and the resume-grace tail on a job's clock, read together.
+    pub async fn job_clock_state(&self, proof_system_id: B256) -> Result<JobClockState> {
+        let hold = self.governance_hold(proof_system_id).await?;
+        let tail = self.resume_grace_tail_secs(proof_system_id).await?;
+        Ok(JobClockState { hold, tail })
+    }
+
+    /// True while a job's clock is NOT consuming its window: a pause or Disabled hold, or a resume grace
+    /// after a lift. A budget that looks exhausted then is not actually shrinking, so nothing should be
+    /// abandoned or released on it. An unreadable state counts as not stopped.
+    pub async fn job_clock_stopped(&self, proof_system_id: B256) -> bool {
+        self.job_clock_state(proof_system_id)
+            .await
+            .is_ok_and(|c| c.hold.is_some() || c.tail > 0)
+    }
+
+    /// The psId a job was submitted under (`jobProofSystems`; zero once fulfilled).
+    pub async fn job_proof_system(&self, job_id: B256) -> Result<B256> {
+        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
+        aux.jobProofSystems(job_id).call().await.context("jobProofSystems")
+    }
+
+    /// `graceRelease(jobId)`: the permissionless, PENALTY-FREE exit for a Locked job whose adapter is
+    /// Disabled (HemiProveAux). `Ok(true)`: the lock is gone. `Ok(false)`: the call MINED and reverted
+    /// (e.g. `JobExpiredBeforePause` — the lock was already late when the window opened), so retrying
+    /// only burns gas. `Err`: not sent or not confirmed — the caller may retry.
+    pub async fn grace_release_job(&self, job_id: B256) -> Result<bool> {
+        let fulfill = IHemiProveFulfill::new(self.hemi_prove, &*self.provider);
+        let nonce = self.reserve_nonce().await?;
+        let (tip, max_fee) = self.base_fees().await;
+        // Lift over anything already at this (possibly recycled) nonce.
+        let (tip, max_fee) = match job_path_bid(
+            self.nonce_fee_floor_state(nonce),
+            tip,
+            max_fee,
+            self.fee_ceiling,
+            0,
+            u128::MAX,
+        ) {
+            JobBid::Send(t, m) | JobBid::Hold(t, m) => (t, m),
+            JobBid::Exhausted => (tip, max_fee),
+        };
+        let sent = {
+            let _guard = self.tx_lock.lock().await;
+            let mut tx = fulfill.graceRelease(job_id).nonce(nonce);
+            if max_fee > 0 {
+                tx = tx.max_priority_fee_per_gas(tip).max_fee_per_gas(max_fee);
+            }
+            tx.send().await
+        };
+        let pending = match sent {
+            Ok(p) => {
+                self.note_broadcast_fee(nonce, tip, max_fee, max_fee);
+                p
+            }
+            Err(e) => {
+                self.abort_nonce(nonce);
+                // graceRelease carries no explicit gas, so a revert surfaces HERE (gas estimation),
+                // not as a mined receipt. A refusal from the contract is an answer: the lock was
+                // already late when the window opened (`JobExpiredBeforePause` — it stays slashable),
+                // is gone, or the adapter is no longer Disabled. Retrying would loop; the caller's
+                // normal path decides.
+                if let Some(data) = crate::revert::revert_data_of(&e) {
+                    use zkminer_contracts::bindings::IHemiProveErrors::IHemiProveErrorsErrors as E;
+                    match crate::revert::decode(&data) {
+                        crate::revert::Decoded::Hemi(
+                            E::JobExpiredBeforePause(_) | E::JobNotLocked(_) | E::UseGraceReleaseWithDescriptor(_),
+                        ) => return Ok(false),
+                        crate::revert::Decoded::Message(m) if m == "Adapter not disabled" => return Ok(false),
+                        _ => {}
+                    }
+                }
+                let msg = format!("{e:#}");
+                if is_funds_refusal(&msg) {
+                    self.note_funds_short();
+                }
+                bail!("graceRelease send failed: {}", crate::programs::sanitize_log(&msg));
+            }
+        };
+        let tx_hash = *pending.tx_hash();
+        match crate::tx::await_receipt(&*self.provider, tx_hash, RELEASE_RECEIPT_WAIT).await {
+            Some(r) if r.status() => {
+                self.commit_nonce(nonce);
+                tracing::info!("Job {job_id} grace-released (penalty-free): {tx_hash:?}");
+                Ok(true)
+            }
+            Some(_) => {
+                self.commit_nonce(nonce);
+                tracing::warn!("graceRelease {tx_hash:?} for {job_id} reverted — not retrying it");
+                Ok(false)
+            }
+            None => {
+                if let Ok((rec, _)) = self.read_job_record(job_id, None).await {
+                    if rec.prover != self.address {
+                        self.abort_nonce(nonce);
+                        return Ok(true);
+                    }
+                }
+                self.abort_nonce(nonce);
+                bail!("graceRelease {tx_hash:?} not confirmed")
+            }
+        }
+    }
+
+    /// `getPremiumCap(jobId)`: the most of the job's speed premium a fulfil can still earn (each
+    /// release lowers it, a slash zeroes it).
+    pub async fn get_premium_cap(&self, job_id: B256) -> Result<u128> {
+        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
+        let cap = aux
+            .getPremiumCap(job_id)
+            .call()
+            .await
+            .context("getPremiumCap")?;
+        Ok(cap.min(U256::from(u128::MAX)).to::<u128>())
+    }
+
+    /// `getJobSnapshots(jobId)` — a job's OWN economics, snapshotted at submit: `(releasePenaltyBps,
+    /// minCollateral, collateralBps)` — for many jobs: two Multicall3 requests per 25 jobs, both
+    /// pinned at one fresh head. A submitter may set collateralBps up to 50,000 (500%), so the
+    /// collateral a claim locks must be sized from this, never a default. `getJobSnapshots` does not revert for a job the serving
+    /// node hasn't seen — it answers with the live defaults — so each job's `jobs()` record is read at
+    /// the same block, and only a job that exists there gets `Some`. A replica behind that block
+    /// fails the pinned call rather than answering for an older state. `None` = unknown for now.
+    pub async fn get_job_snapshots_batch(
+        &self,
+        job_ids: &[B256],
+    ) -> Result<Vec<(B256, Option<(u128, u128, u128)>)>> {
+        use alloy::providers::MulticallItem;
+        const MC_CHUNK: usize = 25;
+        if job_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let head = self
+            .provider
+            .get_block_number()
+            .await
+            .context("getJobSnapshots: block number")?;
+        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
+        let clamp = |v: U256| v.min(U256::from(u128::MAX)).to::<u128>();
+        let mut out = Vec::with_capacity(job_ids.len());
+        for chunk in job_ids.chunks(MC_CHUNK) {
+            let mut snaps = self
+                .provider
+                .multicall()
+                .dynamic::<IHemiProveAux::getJobSnapshotsCall>()
+                .block(BlockId::number(head));
+            let mut recs = self
+                .provider
+                .multicall()
+                .dynamic::<IHemiProveAux::jobsCall>()
+                .block(BlockId::number(head));
+            for jid in chunk {
+                snaps = snaps.add_call_dynamic(aux.getJobSnapshots(*jid).into_call(true));
+                recs = recs.add_call_dynamic(aux.jobs(*jid).into_call(true));
+            }
+            let (snaps, recs) = match (snaps.aggregate3().await, recs.aggregate3().await) {
+                (Ok(s), Ok(r)) => (s, r),
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::debug!("getJobSnapshots batch at block {head} failed: {e:#}");
+                    out.extend(chunk.iter().map(|jid| (*jid, None)));
+                    continue;
+                }
+            };
+            for ((jid, snap), rec) in chunk.iter().zip(snaps).zip(recs) {
+                let exists = rec
+                    .ok()
+                    .and_then(|w| JobRecord::from_words(&w).ok())
+                    .is_some_and(|r| r.caller != Address::ZERO);
+                out.push((
+                    *jid,
+                    snap.ok().filter(|_| exists).map(|r| {
+                        (
+                            clamp(r.releasePenaltyBps),
+                            clamp(r.minCollateral),
+                            clamp(r.collateralBps),
+                        )
+                    }),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `bidConfigs(jobId).underbidWindow`: non-zero means a COMPETITIVE job (priced by public,
+    /// binding descending bids once a round starts). Immutable per job.
+    pub async fn get_underbid_window(&self, job_id: B256) -> Result<u64> {
+        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
+        let r = aux.bidConfigs(job_id).call().await.context("bidConfigs")?;
+        Ok(r.underbidWindow.to::<u64>())
+    }
+
+    /// True if the router OR the Registry is paused (handoff §11). While paused, claims and fulfils
+    /// revert (`EnforcedPause` / `RegistryPaused`), every lock's effective deadline moves out by the
+    /// pause's length, and a pause is NEVER a reason to release.
+    pub async fn protocol_paused(&self) -> Result<bool> {
+        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
+        if aux.paused().call().await.context("router paused()")? {
+            return Ok(true);
+        }
+        let reg = IHemiProveRegistry::new(self.hemi_prove_registry, &*self.provider);
+        reg.paused().call().await.context("Registry paused()")
+    }
+
+    /// Whether a `VerifierCallFailed` on a `proof_system_id` job has a GOVERNANCE cause (handoff §9):
+    /// the Registry is paused or the adapter is Disabled, read at ONE block. With a cause the lock is
+    /// KEPT (time is credited; a penalty-free exit opens); without one the failure is our proof's and
+    /// the lock is released. An Unregistered adapter is NOT a cause (release, and alert).
+    pub async fn verifier_failure_has_governance_cause(&self, proof_system_id: B256) -> Result<bool> {
+        let block = self.provider.get_block_number().await.context("block number")?;
+        let at = BlockId::number(block);
+        let reg = IHemiProveRegistry::new(self.hemi_prove_registry, &*self.provider);
+        if reg.paused().block(at).call().await.context("Registry paused()")? {
+            return Ok(true);
+        }
+        let entry = reg
+            .getAdapter(proof_system_id)
+            .block(at)
+            .call()
+            .await
+            .context("Registry getAdapter")?;
+        // AdapterStatus: 0 Unregistered, 1 Active, 2 Deprecated, 3 Disabled.
+        Ok(entry.status == 3)
+    }
+
+    /// The exact claim floors for `job_id` (handoff §7 step 3), both read at ONE mined block:
+    /// `priceFloor` is the return value of an `eth_call` of `claimJob(jobId, 0, 0)` FROM our prover
+    /// address, and `premiumFloor` is `getPremiumCap(jobId)`. Never `minPrice`, `getCurrentPrice`, a
+    /// `pending` read or 0. A reverting quote is the claim's own pre-check: it is returned as a typed
+    /// [`ClaimFailure`] (`definitely_not_locked`), so the caller can tell a pause or a stake
+    /// shortfall from a job that is gone.
+    pub async fn quote_claim(&self, job_id: B256) -> Result<ClaimQuote> {
+        let block = self
+            .provider
+            .get_block_number()
+            .await
+            .map_err(|e| claim_not_sent(format!("claim quote: block number: {e:#}")))?;
+        let at = BlockId::number(block);
+        let core = IHemiProveCore::new(self.hemi_prove, &*self.provider);
+        let price = match core
+            .claimJob(job_id, U96::ZERO, U96::ZERO)
+            .from(self.address)
+            .block(at)
+            .call()
+            .await
+        {
+            Ok(p) => p.to::<u128>(),
+            // Not yet authoritative: `claim_job_idempotent` re-reads ownership at >= `block` before
+            // treating it as "nothing of ours is locked".
+            Err(e) if crate::revert::revert_data_of(&e).is_none() => {
+                // A transport failure of an eth_call: nothing was sent, nothing is known.
+                return Err(claim_not_sent(format!("claim quote: {e:#}")));
+            }
+            Err(e) => return Err(claim_failure_from_call(&e, true, Some(block))),
+        };
+        let aux = IHemiProveAux::new(self.hemi_prove, &*self.provider);
+        let cap = aux
+            .getPremiumCap(job_id)
+            .block(at)
+            .call()
+            .await
+            .map_err(|e| claim_not_sent(format!("claim quote: getPremiumCap: {e:#}")))?;
+        // premiumFloor is a uint96 argument; the cap is a uint256 view. A cap above uint96 cannot be
+        // a real premium (premiums are uint96), so clamp rather than truncate.
+        let premium_floor = cap.min(U256::from(U96::MAX)).to::<u128>();
+        Ok(ClaimQuote {
+            block,
+            price_floor: price,
+            premium_floor,
+        })
+    }
+
+    /// What [`Self::claim_job_idempotent`] would meet for `job_id` right now, read without sending
+    /// anything (watch-only runs): the same ownership and reopen pre-checks, then the same quote.
+    /// A refused quote is returned as the typed [`ClaimFailure`] the claim would have hit.
+    pub async fn preview_claim(&self, job_id: B256) -> Result<ClaimPreview> {
+        // An unreadable record skips these pre-checks and goes to the quote, as the real claim does.
+        if let Ok((rec, at)) = self.read_job_record(job_id, None).await {
+            if rec.prover != Address::ZERO {
+                return Ok(ClaimPreview::Held(rec.prover));
+            }
+            if rec.reopen_count >= MAX_REOPEN_COUNT {
+                return Err(ClaimFailure {
+                    class: ClaimClass::Gone,
+                    reason: format!(
+                        "job at {} reopens (MaxReopenCountReached)",
+                        rec.reopen_count
+                    ),
+                    definitely_not_locked: true,
+                    block: Some(at),
+                }
+                .into());
+            }
+        }
+        Ok(ClaimPreview::Claimable(self.quote_claim(job_id).await?))
+    }
+
+    /// Claim an open job at exactly `quote`'s floors. Sent ALONE (never pipelined with a fulfil);
+    /// returns only once the lock is confirmed by re-reading `jobs(jobId).prover` at a block at or
+    /// after the claim receipt's (handoff §7 step 4 / §10 broadcast rule).
+    ///
+    /// Errors: a revert (a preflighting node's send-time revert, or a mined revert re-simulated at its
+    /// block for the reason) is a typed [`ClaimFailure`] with `definitely_not_locked = true`; anything
+    /// else (no receipt, RPC errors) is ambiguous and untyped, so the caller checks ownership on-chain.
+    pub async fn claim_job(&self, job_id: B256, quote: &ClaimQuote) -> Result<ClaimReceipt> {
         const MAX_ATTEMPTS: u32 = MAX_TX_ATTEMPTS;
         let core = IHemiProveCore::new(self.hemi_prove, &*self.provider);
+        let price_floor = U96::saturating_from(quote.price_floor);
+        let premium_floor = U96::saturating_from(quote.premium_floor);
 
-        // Reserve the nonce once from the local cache (fetching only if unset) and
-        // reuse it across re-broadcasts, so a timed-out tx is *replaced* at the same
-        // nonce rather than leaving a gap. Committed on success; on any error/give-up the
-        // nonce is ABORTED (recycled as a gap for the next reservation) — not "invalidated":
-        // `invalidate` re-anchors the whole allocator and has no callers.
-        let mut nonce = self.reserve_nonce().await?;
-        // Seed fee escalation once; each attempt bumps fees so a re-broadcast can
-        // displace a stuck same-nonce tx even under default (auto-gas) config.
+        // Reserve the nonce once and reuse it across re-broadcasts, so a timed-out tx is *replaced*
+        // at the same nonce rather than leaving a gap. Committed on success; on any error/give-up the
+        // nonce is ABORTED (recycled as a gap for the next reservation).
+        let mut nonce = self
+            .reserve_nonce()
+            .await
+            .map_err(|e| claim_not_sent(format!("claim: nonce reservation: {e:#}")))?;
         let (base_tip, base_max_fee) = self.base_fees().await;
+        // The highest nonce at which a claimJob of OURS reached the mempool. Once set, a later
+        // attempt's refusal (`JobNotOpen`) can be caused by that earlier tx having LOCKED the job,
+        // so it is never taken as "nothing locked" without a read at a block that includes it.
+        let mut broadcast_nonce: Option<u64> = None;
 
         for attempt in 1..=MAX_ATTEMPTS {
-            // Send under the nonce lock. The local nonce cache bypasses a per-send
-            // eth_getTransactionCount; the provider's own cached nonce is unreliable
-            // when the flaky RPC drops then later mines a tx.
             let send_result = {
                 let _guard = self.tx_lock.lock().await;
-                let mut tx = core.claimJob(job_id).nonce(nonce).gas(CLAIM_JOB_GAS_LIMIT);
+                let mut tx = core
+                    .claimJob(job_id, price_floor, premium_floor)
+                    .nonce(nonce)
+                    .gas(CLAIM_JOB_GAS_LIMIT);
                 let mut bid = None;
                 if base_max_fee > 0 {
                     let (tip, seed_max_fee) = escalated_fees(base_tip, base_max_fee, attempt);
                     // Must exceed anything WE already put at this nonce, even if that came
                     // from an earlier invocation with its own fresh ladder.
-                    let max_fee = seed_max_fee;
-                    let Some((tip, max_fee)) = fees_over_floor(self, nonce, tip, max_fee) else {
-                        // Cap exhausted: no strictly-higher bid exists, so every send from
-                        // here is rejected "replacement underpriced". Stop now rather than
-                        // burning the attempt ladder against a wall.
+                    let Some((tip, max_fee)) = fees_over_floor(self, nonce, tip, seed_max_fee)
+                    else {
+                        // Cap exhausted: no strictly-higher bid exists, so every send from here is
+                        // rejected "replacement underpriced". Leave abort EVIDENCE without handing the
+                        // poisoned nonce back to reservers (see `note_nonce_unresolved`); the live
+                        // watchdog's gap branch will heal it.
                         if let Some(st) = self.nonce_fee_floor_state(nonce) {
                             log_fee_cap_exhausted("claimJob", nonce, &st);
                         }
                         self.note_nonce_undisplaceable(nonce);
-                        // Leave abort EVIDENCE but do NOT offer the nonce back to
-                        // reservers. `abort` would push it to the HEAD of `freed`, and
-                        // `reserve_locked` hands the lowest freed nonce out first -- so the
-                        // next reserver (preferentially a deadline-critical release) would
-                        // draw this same poisoned nonce and bail again, in a loop.
-                        // `note_unresolved` writes `aborted_at` only: the gap detector's
-                        // branch (B) still nominates the nonce via `recently_aborted`, so
-                        // it stays visible and healable, while nothing is handed it.
-                        //
-                        // BEWARE: the healer this arms is the LIVE watchdog branch (B),
-                        // which is consumed UNGATED (client.rs `hole_we_own` and its
-                        // `frontier_has_executable_tx` gate are on the SHUTDOWN path only).
-                        // So roughly WEDGE_CHECK_TICKS + WEDGE_MIN_PERSIST after this, the
-                        // healer will try to evict the resident tx with a self-transfer --
-                        // and since that bid now lifts over the uncapped high-water, it
-                        // will SUCCEED. That is the intended unwedge, but it does mean a
-                        // live tx of ours at this nonce is deliberately displaced.
                         self.note_nonce_unresolved(nonce);
+                        if broadcast_nonce.is_none() {
+                            return Err(claim_not_sent(format!(
+                                "{FEE_CAP_EXHAUSTED} at nonce {nonce} (claimJob)"
+                            )));
+                        }
                         bail!("{FEE_CAP_EXHAUSTED} at nonce {nonce} (claimJob)");
                     };
                     bid = Some((tip, max_fee, seed_max_fee));
                     tx = tx.max_priority_fee_per_gas(tip).max_fee_per_gas(max_fee);
                 }
                 let r = tx.send().await;
-                // Ratchet ONLY on an accepted broadcast: a rejected send (429, balance
-                // pre-check) never reached the mempool, and inflating the floor for it
-                // would raise later bids for nothing.
+                // Ratchet ONLY on an accepted broadcast: a rejected send never reached the mempool.
                 if r.is_ok() {
+                    broadcast_nonce = Some(broadcast_nonce.map_or(nonce, |b| b.max(nonce)));
                     if let Some((tip, max_fee, seed)) = bid {
                         self.note_broadcast_fee(nonce, tip, max_fee, seed);
                     }
@@ -551,24 +1379,13 @@ impl ChainClient {
                 Ok(p) => p,
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    // [H2] A tx is pending at this nonce → keep it and let the next
-                    // attempt's escalated fee displace it; do NOT walk the shared nonce
-                    // forward (that orphans the pending tx and poisons the cache for
-                    // concurrent lifecycle tasks).
+                    // A tx is pending at this nonce → keep it and let the next attempt's escalated
+                    // fee displace it; do NOT walk the shared nonce forward.
                     if is_same_nonce_pending(&msg) {
                         tracing::warn!(
-                            "claimJob replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — bumping fee, keeping nonce"
+                            "claimJob replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {} — bumping fee, keeping nonce",
+                            crate::programs::sanitize_log(&msg)
                         );
-                        // Give the node a moment before re-bidding. Without this the
-                        // whole attempt ladder burns in well under a second, which learns
-                        // nothing (the resident tx has not moved) and, during the
-                        // 2026-08-14 wedge, produced 327 rejected sends in 4h24m. Linear in
-                        // the attempt so a transient collision still clears quickly.
-                        // Named unit, and skipped on the last attempt — the loop is about to
-                        // exit, so that wait buys nothing and only delays the give-up. Both were
-                        // applied to the `is_nonce_error` arms and not to these, so the two arms
-                        // of the same ladder paid different rungs (1..=5 here against 1..=4
-                        // there) and the documented figures described neither.
                         if attempt < MAX_ATTEMPTS {
                             tokio::time::sleep(nonce_retry_backoff(
                                 attempt,
@@ -579,16 +1396,32 @@ impl ChainClient {
                         }
                         continue;
                     }
-                    // Genuine nonce mismatch (our nonce was consumed by an external tx):
-                    // re-sync and take a FRESH distinct nonce. The stale nonce is consumed
-                    // on-chain, so it is NOT recycled.
+                    // Genuine nonce mismatch: re-sync and take a FRESH distinct nonce.
                     if is_nonce_error(&msg) {
                         tracing::warn!(
-                            "claimJob nonce error (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — re-syncing nonce"
+                            "claimJob nonce error (attempt {attempt}/{MAX_ATTEMPTS}): {} — re-syncing nonce",
+                            crate::programs::sanitize_log(&msg)
                         );
-                        // [nonce-review] Recycle the abandoned nonce so a "nonce too high"
-                        // (a gap below us) doesn't leak it; resync then prunes it from the
-                        // gap set if it was actually consumed ("nonce too low").
+                        // "nonce too low" at a nonce WE broadcast a claim at means that claim MINED.
+                        // Read the job where it is included before re-sending at a fresh nonce: if it
+                        // locked the job, re-sending would only mine a JobNotOpen revert (and taking
+                        // that refusal at face value would drop a lock we hold).
+                        if broadcast_nonce == Some(nonce) {
+                            if let Ok((rec, at)) = self.read_job_record_after_nonce(job_id, nonce).await {
+                                if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED {
+                                    self.commit_nonce(nonce);
+                                    tracing::info!("Job claimed: {job_id} (an earlier broadcast at nonce {nonce} mined)");
+                                    return Ok(ClaimReceipt {
+                                        block: at,
+                                        settled_price: None,
+                                    });
+                                }
+                                if rec.prover != Address::ZERO && rec.prover != self.address {
+                                    self.commit_nonce(nonce);
+                                    return Err(ClaimLostRace(rec.prover).into());
+                                }
+                            }
+                        }
                         let rejected = nonce;
                         self.abort_nonce(nonce);
                         self.resync_nonce().await.ok();
@@ -602,11 +1435,6 @@ impl ChainClient {
                                 tracing::warn!("claimJob nonce re-reserve failed: {e:#} — retrying")
                             }
                         }
-                        // Only pay the wait when the retry would repeat itself; see
-                        // `nonce_retry_backoff`.
-                        // Not on the last attempt: the loop is about to exit, so the wait buys
-                        // nothing and delays the give-up — and on the fulfil path that delay is
-                        // spent directly against the release margin that follows it.
                         if attempt < MAX_ATTEMPTS {
                             tokio::time::sleep(nonce_retry_backoff(
                                 attempt,
@@ -617,10 +1445,33 @@ impl ChainClient {
                         }
                         continue;
                     }
-                    // Send failed for a non-nonce reason and the tx did not land → recycle
-                    // the nonce as a gap so it doesn't wedge higher nonces.
+                    if is_funds_refusal(&msg) {
+                        self.note_funds_short();
+                    }
+                    // Send failed and the tx did not land → recycle the nonce as a gap.
                     self.abort_nonce(nonce);
-                    return Err(anyhow::anyhow!("Failed to send claimJob tx: {msg}"));
+                    // A preflighting node rejects a reverting claim at SEND with the revert data.
+                    // THIS send locked nothing — but if an earlier attempt of ours was broadcast,
+                    // its tx may be the very reason the job is no longer open. Decide from a read
+                    // at a block that includes it.
+                    let Some(bn) = broadcast_nonce else {
+                        return Err(claim_failure_from_call(&e, true, None));
+                    };
+                    return match self.read_job_record_after_nonce(job_id, bn).await {
+                        Ok((rec, at)) if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED => {
+                            tracing::info!("Job claimed: {job_id} (an earlier broadcast at nonce {bn} mined)");
+                            Ok(ClaimReceipt {
+                                block: at,
+                                settled_price: None,
+                            })
+                        }
+                        Ok((rec, _)) if rec.prover != Address::ZERO => {
+                            Err(ClaimLostRace(rec.prover).into())
+                        }
+                        Ok((_, at)) => Err(claim_failure_from_call(&e, true, Some(at))),
+                        // Ownership unknown: keep the breadcrumb (ambiguous).
+                        Err(_) => Err(claim_failure_from_call(&e, false, None)),
+                    };
                 }
             };
             let tx_hash = *pending.tx_hash();
@@ -628,24 +1479,90 @@ impl ChainClient {
                 "claimJob tx sent (attempt {attempt}/{MAX_ATTEMPTS}): {tx_hash:?}, waiting for receipt..."
             );
 
-            // [RPC #1] Poll for the receipt instead of registering alloy's heartbeat
-            // watcher. Some(receipt) = mined (same status handling); None folds the old
-            // timeout AND RPC-error arms into the on-chain STATE poll (a transient 429 no
-            // longer blind-rebroadcasts at the same nonce — the storm amplifier).
-            match crate::tx::await_receipt(&*self.provider, tx_hash, TX_RECEIPT_TIMEOUT).await {
+            match crate::tx::await_receipt(&*self.provider, tx_hash, CLAIM_RECEIPT_WAIT).await {
                 Some(receipt) => {
-                    if receipt.status() {
-                        self.commit_nonce(nonce);
-                        tracing::info!(
-                            "Job claimed: {} tx: {:?}",
-                            job_id,
-                            receipt.transaction_hash
-                        );
-                        return Ok(());
-                    }
-                    // Mined revert consumed the nonce on-chain → commit it.
+                    // A mined tx consumed the nonce either way.
                     self.commit_nonce(nonce);
-                    anyhow::bail!("claimJob transaction reverted (tx {tx_hash:?})");
+                    let receipt_block = receipt.block_number.unwrap_or_default();
+                    if receipt.status() {
+                        let settled = receipt_job_claimed(&receipt, job_id, self.address, self.hemi_prove);
+                        if let Some(s) = settled {
+                            if s < quote.price_floor {
+                                // The router enforces the floor, so this cannot happen unless our
+                                // decode or the floor plumbing is wrong — page a human (CANARY).
+                                tracing::error!(
+                                    "CANARY: job {job_id} settled at {s} below the floor {} we sent",
+                                    quote.price_floor
+                                );
+                            }
+                        }
+                        // Confirm the lock at a block >= the receipt's (a lagging replica would
+                        // otherwise show the pre-claim state for a lock we own). The receipt's own
+                        // router-emitted JobClaimed(jobId, us) already PROVES the lock at
+                        // `receipt_block`: a read that cannot be completed (a 429, a lagging
+                        // replica) must not turn that proven lock into an "ambiguous" failure — the
+                        // caller would release it. Every later publish re-reads jobs() at >= this
+                        // block anyway. Only a read that SUCCEEDS and disagrees (a reorg) refutes it.
+                        let mut confirm = self.read_job_record(job_id, Some(receipt_block)).await;
+                        for _ in 0..2 {
+                            if confirm.is_ok() {
+                                break;
+                            }
+                            tokio::time::sleep(LAG_RETRY_WAIT).await;
+                            confirm = self.read_job_record(job_id, Some(receipt_block)).await;
+                        }
+                        match confirm {
+                            Ok((rec, at)) => {
+                                if rec.prover != self.address || rec.status != JOB_STATUS_LOCKED {
+                                    bail!(
+                                        "claimJob {tx_hash:?} mined but jobs({job_id}) at block {at} shows \
+                                         status {} prover {} (reorg?) — ownership unconfirmed",
+                                        rec.status,
+                                        rec.prover
+                                    );
+                                }
+                                tracing::info!("Job claimed: {job_id} tx: {tx_hash:?} (block {receipt_block})");
+                                return Ok(ClaimReceipt {
+                                    block: receipt_block.max(at),
+                                    settled_price: settled,
+                                });
+                            }
+                            Err(e) if settled.is_some() => {
+                                tracing::warn!(
+                                    "Job claimed: {job_id} tx: {tx_hash:?} (block {receipt_block}) — the \
+                                     confirm read failed ({e:#}); the receipt's JobClaimed proves the lock"
+                                );
+                                return Ok(ClaimReceipt {
+                                    block: receipt_block,
+                                    settled_price: settled,
+                                });
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    // A mined revert locked nothing AT THIS NONCE. The receipt carries no reason, so
+                    // replay the identical call at its block to classify it (its calldata is already
+                    // public). It is included at `receipt_block`, after every earlier nonce of ours, so
+                    // an ownership read pinned there is authoritative for all of them.
+                    let sim = core
+                        .claimJob(job_id, price_floor, premium_floor)
+                        .from(self.address)
+                        .gas(CLAIM_JOB_GAS_LIMIT)
+                        .block(BlockId::number(receipt_block))
+                        .call()
+                        .await;
+                    return Err(match sim {
+                        Err(e) => claim_failure_from_call(&e, true, Some(receipt_block)),
+                        Ok(_) => ClaimFailure {
+                            class: ClaimClass::Unknown,
+                            reason: format!(
+                                "claimJob {tx_hash:?} reverted but replays cleanly at block {receipt_block}"
+                            ),
+                            definitely_not_locked: true,
+                            block: Some(receipt_block),
+                        }
+                        .into(),
+                    });
                 }
                 None => {
                     // No receipt within budget: the tx may still land. Poll on-chain state
@@ -654,25 +1571,32 @@ impl ChainClient {
                         "claimJob receipt not confirmed (attempt {attempt}/{MAX_ATTEMPTS}, tx {tx_hash:?}); \
                          polling state before re-broadcast"
                     );
-                    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                    let deadline = std::time::Instant::now() + CLAIM_STATE_POLL;
                     while std::time::Instant::now() < deadline {
-                        if let Ok(view) = self.get_job_status_view(job_id).await {
-                            if view.prover == self.address {
-                                // [nonce-review] State signal = SOME claim of ours landed, not
-                                // necessarily THIS nonce (an is_nonce_error re-reserve may have
-                                // moved us off it). abort self-heals; commit could advance past
-                                // an unmined nonce → permanent gap/wedge.
+                        if let Ok((rec, at)) = self.read_job_record(job_id, None).await {
+                            if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED {
+                                // SOME claim of ours landed, not necessarily THIS nonce → abort
+                                // (self-heals); commit could advance past an unmined nonce.
                                 self.abort_nonce(nonce);
                                 tracing::info!("Job {} claimed (confirmed via poll)", job_id);
-                                return Ok(());
+                                return Ok(ClaimReceipt {
+                                    block: at,
+                                    settled_price: None,
+                                });
                             }
-                            if view.prover != Address::ZERO {
-                                self.abort_nonce(nonce); // our claim didn't land → recycle the gap
-                                anyhow::bail!(
-                                    "claimJob lost race — job {} taken by {}",
-                                    job_id,
-                                    view.prover
-                                );
+                            // Another prover is the answer only at a block that includes our claim's
+                            // nonce: before that, our claim may still mine (and lock it later).
+                            if rec.prover != Address::ZERO && rec.prover != self.address {
+                                let included = self
+                                    .provider
+                                    .get_transaction_count(self.address)
+                                    .block_id(BlockId::number(at))
+                                    .await
+                                    .is_ok_and(|c| c > broadcast_nonce.unwrap_or(nonce));
+                                if included {
+                                    self.abort_nonce(nonce);
+                                    return Err(ClaimLostRace(rec.prover).into());
+                                }
                             }
                         }
                         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -681,310 +1605,133 @@ impl ChainClient {
             }
         }
 
-        // Final on-chain check before declaring failure.
-        if let Ok(view) = self.get_job_status_view(job_id).await {
-            if view.prover == self.address {
-                self.abort_nonce(nonce); // [nonce-review] state signal, not a receipt for THIS nonce
-                return Ok(());
+        // Final on-chain check before declaring failure — at a block that includes our last broadcast
+        // claim when there was one, so "another prover" there is the answer.
+        let read = match broadcast_nonce {
+            Some(bn) => self.read_job_record_after_nonce(job_id, bn).await,
+            None => self.read_job_record(job_id, None).await,
+        };
+        if let Ok((rec, at)) = read {
+            if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED {
+                self.abort_nonce(nonce);
+                return Ok(ClaimReceipt {
+                    block: at,
+                    settled_price: None,
+                });
             }
-            if view.prover != Address::ZERO {
-                self.abort_nonce(nonce); // our claim didn't land → recycle the gap
-                anyhow::bail!(
-                    "claimJob lost race — job {} taken by {}",
-                    job_id,
-                    view.prover
-                );
+            if rec.prover != Address::ZERO && rec.prover != self.address {
+                self.abort_nonce(nonce);
+                return Err(ClaimLostRace(rec.prover).into());
             }
         }
-        self.abort_nonce(nonce); // gave up; tx didn't land → recycle the gap
+        self.abort_nonce(nonce);
         anyhow::bail!("claimJob failed after {MAX_ATTEMPTS} attempts (RPC may be dropping txs)")
     }
 
-    /// Batch-lock up to MAX_BATCH_SIZE (10) jobs in ONE tx via `claimJobBatch`.
+    /// Idempotent claim: pre-checks on-chain state, quotes the exact floors, applies the per-job
+    /// price high-water mark, claims, and reconciles an ambiguous failure against the chain.
     ///
-    /// Partial-completion: the outer tx SUCCEEDS even if some sub-claims fail (lost
-    /// race, adapter disabled, insufficient collateral) — each is isolated per-job on
-    /// chain. The per-job `bool[]` result is not visible from a tx receipt, so this
-    /// returns `Ok(())` once the batch tx has EXECUTED on-chain and leaves the caller
-    /// to reconcile which jobs actually locked (via `get_job_status_views_batch`).
-    ///
-    /// Mirrors `claim_job`'s single-nonce / escalating-fee / re-broadcast machinery
-    /// (the whole batch is one tx = one nonce). The "executed" signal for the poll/
-    /// final paths is "≥1 job in the set is now locked by us"; a batch where every
-    /// sub-claim lost the race also executes but locks nothing — that surfaces as a
-    /// (false) Err here, which is safe because the caller treats unclaimed jobs as
-    /// not-locked either way and keeps its claim-intent breadcrumbs for reconciliation.
-    pub async fn claim_job_batch(&self, job_ids: &[B256]) -> Result<()> {
-        if job_ids.is_empty() {
-            return Ok(());
-        }
-        const MAX_ATTEMPTS: u32 = MAX_TX_ATTEMPTS;
-        // [D5] A batch claim is SPECULATIVE (it locks MORE work). It must not
-        // monopolize the single shared nonce lane for the full ~11 min worst case
-        // (5 × (TX_RECEIPT_TIMEOUT + 20s poll)): while it holds/reuses nonce N and
-        // keeps escalating fees, a deadline-critical fulfill/release reserving the
-        // same N is out-bid → walked to N+1 behind the stuck batch → its already-
-        // locked job misses the deadline → keeper slash. Cap total wall time well
-        // under any fulfillment deadline; on give-up the nonce is ABORTED — recycled as a
-        // gap so the next reservation refills it and an urgent tx takes the lane. (Not
-        // "invalidated": that re-anchors the whole allocator and has no callers.) The batch's last tx may still mine —
-        // the background caller reconciles on-chain regardless, so cutting the retry
-        // loop short never loses a lock we actually won.
-        const WALL_CAP: Duration = Duration::from_secs(90);
-        let started = std::time::Instant::now();
-        let core = IHemiProveCore::new(self.hemi_prove, &*self.provider);
-        let ids: Vec<B256> = job_ids.to_vec();
-        let mut nonce = self.reserve_nonce().await?;
-        let (base_tip, base_max_fee) = self.base_fees().await;
-
-        let any_ours = |views: &[(B256, Option<JobStatusView>)]| -> bool {
-            views
-                .iter()
-                .any(|(_, v)| v.as_ref().is_some_and(|view| view.prover == self.address))
-        };
-
-        for attempt in 1..=MAX_ATTEMPTS {
-            if started.elapsed() >= WALL_CAP {
-                // Speculative batch has held the lane long enough — yield. Recycle the
-                // nonce as a gap: with the distinct-nonce allocator, a deadline-critical
-                // fulfill/release gets its OWN nonce (it no longer needs to displace this
-                // one), and recycling keeps this nonce from wedging higher ones. If the
-                // batch tx actually mines, a reuser hits "nonce too low" and re-syncs.
-                tracing::warn!(
-                    "claimJobBatch wall-time cap ({}s) reached after {} attempt(s) — yielding the nonce lane to deadline-critical txs",
-                    WALL_CAP.as_secs(), attempt - 1
-                );
-                self.abort_nonce(nonce);
-                return Ok(());
-            }
-            // Explicit gas limit — DO NOT rely on eth_estimateGas here (it under-
-            // provisions and silently drops the tail job; see CLAIM_BATCH_PER_JOB_GAS).
-            let gas_limit = CLAIM_BATCH_BASE_GAS + CLAIM_BATCH_PER_JOB_GAS * ids.len() as u64;
-            let mut bid: Option<(u128, u128, u128)> = None;
-            let send_result = {
-                let _guard = self.tx_lock.lock().await;
-                let mut tx = core.claimJobBatch(ids.clone()).nonce(nonce).gas(gas_limit);
-                if base_max_fee > 0 {
-                    let (tip, seed_max_fee) = escalated_fees(base_tip, base_max_fee, attempt);
-                    // Must exceed anything WE already put at this nonce. A recycled nonce
-                    // can carry a give-up claim/release floor, or a heal's >=4x self-transfer,
-                    // and this open-loop ladder can never clear those on its own.
-                    let max_fee = seed_max_fee;
-                    let Some((tip, max_fee)) = fees_over_floor(self, nonce, tip, max_fee) else {
-                        // Cap exhausted: no strictly-higher bid exists, so every send from
-                        // here is rejected "replacement underpriced". Stop now rather than
-                        // burning the attempt ladder against a wall.
-                        if let Some(st) = self.nonce_fee_floor_state(nonce) {
-                            log_fee_cap_exhausted("claimJobBatch", nonce, &st);
-                        }
-                        self.note_nonce_undisplaceable(nonce);
-                        // Leave abort EVIDENCE but do NOT offer the nonce back to
-                        // reservers. `abort` would push it to the HEAD of `freed`, and
-                        // `reserve_locked` hands the lowest freed nonce out first -- so the
-                        // next reserver (preferentially a deadline-critical release) would
-                        // draw this same poisoned nonce and bail again, in a loop.
-                        // `note_unresolved` writes `aborted_at` only: the gap detector's
-                        // branch (B) still nominates the nonce via `recently_aborted`, so
-                        // it stays visible and healable, while nothing is handed it.
-                        //
-                        // BEWARE: the healer this arms is the LIVE watchdog branch (B),
-                        // which is consumed UNGATED (client.rs `hole_we_own` and its
-                        // `frontier_has_executable_tx` gate are on the SHUTDOWN path only).
-                        // So roughly WEDGE_CHECK_TICKS + WEDGE_MIN_PERSIST after this, the
-                        // healer will try to evict the resident tx with a self-transfer --
-                        // and since that bid now lifts over the uncapped high-water, it
-                        // will SUCCEED. That is the intended unwedge, but it does mean a
-                        // live tx of ours at this nonce is deliberately displaced.
-                        self.note_nonce_unresolved(nonce);
-                        bail!("{FEE_CAP_EXHAUSTED} at nonce {nonce} (claimJobBatch)");
-                    };
-                    bid = Some((tip, max_fee, seed_max_fee));
-                    tx = tx.max_priority_fee_per_gas(tip).max_fee_per_gas(max_fee);
-                }
-                tx.send().await
-            };
-
-            let pending = match send_result {
-                Ok(p) => {
-                    // Ratchet on an ACCEPTED send only, so the read above cannot flatten the
-                    // ladder (with a floor present, max() would pin every rung to one bid and
-                    // a self-displacing re-broadcast would be rejected forever).
-                    if let Some((t, m, seed)) = bid {
-                        self.note_broadcast_fee(nonce, t, m, seed);
-                    }
-                    p
-                }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    // [H2] tx pending at this nonce → keep it, escalate; don't walk forward.
-                    if is_same_nonce_pending(&msg) {
-                        tracing::warn!(
-                            "claimJobBatch replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — bumping fee, keeping nonce"
-                        );
-                        // Give the node a moment before re-bidding. Without this the
-                        // whole attempt ladder burns in well under a second, which learns
-                        // nothing (the resident tx has not moved) and, during the
-                        // 2026-08-14 wedge, produced 327 rejected sends in 4h24m. Linear in
-                        // the attempt so a transient collision still clears quickly.
-                        // Named unit, and skipped on the last attempt — the loop is about to
-                        // exit, so that wait buys nothing and only delays the give-up. Both were
-                        // applied to the `is_nonce_error` arms and not to these, so the two arms
-                        // of the same ladder paid different rungs (1..=5 here against 1..=4
-                        // there) and the documented figures described neither.
-                        if attempt < MAX_ATTEMPTS {
-                            tokio::time::sleep(nonce_retry_backoff(
-                                attempt,
-                                false,
-                                NONCE_RETRY_UNIT,
-                            ))
-                            .await;
-                        }
-                        continue;
-                    }
-                    if is_nonce_error(&msg) {
-                        tracing::warn!(
-                            "claimJobBatch nonce error (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — re-syncing nonce"
-                        );
-                        // [nonce-review] Recycle the abandoned nonce so a "nonce too high"
-                        // (a gap below us) doesn't leak it; resync then prunes it from the
-                        // gap set if it was actually consumed ("nonce too low").
-                        let rejected = nonce;
-                        self.abort_nonce(nonce);
-                        self.resync_nonce().await.ok();
-                        let mut progressed = false;
-                        match self.reserve_nonce().await {
-                            Ok(n) => {
-                                progressed = n != rejected;
-                                nonce = n;
-                            }
-                            Err(e) => tracing::warn!(
-                                "claimJobBatch nonce re-reserve failed: {e:#} — retrying"
-                            ),
-                        }
-                        // Not on the last attempt: the loop is about to exit, so the wait buys
-                        // nothing and delays the give-up — and on the fulfil path that delay is
-                        // spent directly against the release margin that follows it.
-                        if attempt < MAX_ATTEMPTS {
-                            tokio::time::sleep(nonce_retry_backoff(
-                                attempt,
-                                progressed,
-                                NONCE_RETRY_UNIT,
-                            ))
-                            .await;
-                        }
-                        continue;
-                    }
-                    self.abort_nonce(nonce); // send failed, tx didn't land → recycle gap
-                    return Err(anyhow::anyhow!("Failed to send claimJobBatch tx: {msg}"));
-                }
-            };
-            let tx_hash = *pending.tx_hash();
-            tracing::info!(
-                "claimJobBatch({} jobs) tx sent (attempt {attempt}/{MAX_ATTEMPTS}): {tx_hash:?}, waiting for receipt..."
-            , ids.len());
-
-            // Bound the receipt wait by the remaining wall budget so one attempt can't
-            // blow past the cap (TX_RECEIPT_TIMEOUT alone is 120s > WALL_CAP).
-            let recv_budget = WALL_CAP
-                .saturating_sub(started.elapsed())
-                .min(TX_RECEIPT_TIMEOUT);
-            // [RPC #1] Poll for the receipt (no heartbeat watcher). None folds the old
-            // timeout + RPC-error arms into the on-chain state poll below.
-            match crate::tx::await_receipt(&*self.provider, tx_hash, recv_budget).await {
-                Some(receipt) => {
-                    if receipt.status() {
-                        self.commit_nonce(nonce);
-                        tracing::info!(
-                            "claimJobBatch mined: {} job(s) submitted, tx {:?}",
-                            ids.len(),
-                            receipt.transaction_hash
-                        );
-                        return Ok(());
-                    }
-                    // Whole-batch revert (EmptyBatch, or an outer-level failure — NOT a
-                    // per-job sub-claim, which is isolated and doesn't revert the tx).
-                    self.commit_nonce(nonce); // mined revert consumed the nonce
-                    anyhow::bail!("claimJobBatch transaction reverted (tx {tx_hash:?})");
-                }
-                None => {
-                    tracing::warn!(
-                        "claimJobBatch receipt not confirmed (attempt {attempt}/{MAX_ATTEMPTS}, tx {tx_hash:?}); \
-                         polling state before re-broadcast"
-                    );
-                    // Poll, but never past the wall cap (yield the nonce lane on time).
-                    let deadline = (std::time::Instant::now() + Duration::from_secs(20))
-                        .min(started + WALL_CAP);
-                    while std::time::Instant::now() < deadline {
-                        if let Ok(views) = self.get_job_status_views_batch(&ids).await {
-                            if any_ours(&views) {
-                                // [nonce-review] state signal (≥1 locked), not a receipt for
-                                // THIS nonce → abort self-heals; commit could wedge the signer.
-                                self.abort_nonce(nonce);
-                                tracing::info!("claimJobBatch confirmed via poll (≥1 job locked)");
-                                return Ok(());
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_secs(4)).await;
-                    }
-                }
-            }
-        }
-
-        // Final on-chain check before declaring failure.
-        if let Ok(views) = self.get_job_status_views_batch(&ids).await {
-            if any_ours(&views) {
-                self.abort_nonce(nonce); // [nonce-review] state signal, not a receipt for THIS nonce
-                return Ok(());
-            }
-        }
-        // Gave up; the batch tx didn't confirm as ours → recycle the nonce as a gap so it
-        // doesn't wedge higher nonces. (With the distinct-nonce allocator a fulfill/release
-        // gets its OWN nonce, so we no longer need to leave this one parked for displacement.)
-        self.abort_nonce(nonce);
-        anyhow::bail!(
-            "claimJobBatch failed after {MAX_ATTEMPTS} attempts (RPC may be dropping txs)"
-        )
-    }
-
-    /// Idempotent claim: pre-checks on-chain state, re-checks after receipt timeout.
-    ///
-    /// - Pre-flight: if `prover == self`, treat as already-claimed success.
-    /// - Pre-flight: if `prover != ZERO && != self`, return `LostRace` without sending a tx.
-    /// - Post-flight: on receipt timeout, poll chain for up to `timeout_check` to
-    ///   see if the claim landed. If `prover == self`, treat as success.
-    ///
-    /// This prevents both double-claim (wasted gas / potential over-commit) and
-    /// false-negative "claim failed" on transient RPC timeouts that actually
-    /// mined successfully.
-    pub async fn claim_job_idempotent(&self, job_id: B256) -> Result<ClaimOutcome> {
-        // Pre-flight: check current state.
-        if let Ok(view) = self.get_job_status_view(job_id).await {
-            if view.prover == self.address {
+    /// - Already locked by us → `Claimed` without a tx. Held by someone else → `LostRace`.
+    /// - A typed [`ClaimFailure`] from the quote or the claim is returned as-is: `Wait` (incl. a live
+    ///   price below our high-water mark), `Paused`, `StakeShort`, `Gone`, `Unknown`.
+    /// - An ambiguous failure (no receipt) is reconciled by reading `jobs(jobId)`.
+    pub async fn claim_job_idempotent(
+        &self,
+        job_id: B256,
+        min_price: u128,
+    ) -> Result<ClaimOutcome> {
+        if let Ok((rec, at)) = self.read_job_record(job_id, None).await {
+            if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED {
+                forget_claim_high_water(job_id);
                 tracing::info!("Job {} already held by us — skipping claim tx", job_id);
-                return Ok(ClaimOutcome::Claimed);
+                return Ok(ClaimOutcome::Claimed(ClaimReceipt {
+                    block: at,
+                    settled_price: None,
+                }));
             }
-            if view.prover != Address::ZERO {
-                tracing::info!(
-                    "Job {} already claimed by {} — skipping claim tx",
-                    job_id,
-                    view.prover
-                );
+            if rec.prover != Address::ZERO && rec.prover != self.address {
+                tracing::info!("Job {} already claimed by {} — skipping claim tx", job_id, rec.prover);
                 return Ok(ClaimOutcome::LostRace);
             }
+            if rec.reopen_count >= MAX_REOPEN_COUNT {
+                forget_claim_high_water(job_id);
+                return Err(ClaimFailure {
+                    class: ClaimClass::Gone,
+                    reason: format!("job at {} reopens (MaxReopenCountReached)", rec.reopen_count),
+                    definitely_not_locked: true,
+                    block: Some(at),
+                }
+                .into());
+            }
         }
 
-        // claim_job self-heals nonce errors, re-broadcasts dropped txs, and polls
-        // state on timeout. On error, do a final on-chain reconciliation so a claim
-        // that actually landed (or a lost race) is reported correctly.
-        match self.claim_job(job_id).await {
-            Ok(()) => Ok(ClaimOutcome::Claimed),
+        let quote = match self.quote_claim(job_id).await {
+            Ok(q) => q,
+            Err(e) => return self.reconcile_claim_refusal(job_id, e).await,
+        };
+        // A quote below our high-water mark is a Wait refusal like any other: it can come from a
+        // replica lagging behind a block where an EARLIER claim of ours already locked the job, so it
+        // gets the same pinned ownership re-read before anyone treats it as "nothing locked".
+        let price_floor = match claim_floor_with_high_water(job_id, quote.price_floor) {
+            Ok(p) => p,
             Err(e) => {
-                if let Ok(view) = self.get_job_status_view(job_id).await {
-                    if view.prover == self.address {
-                        return Ok(ClaimOutcome::Claimed);
+                let e = match e.downcast::<ClaimFailure>() {
+                    Ok(f) => ClaimFailure {
+                        block: Some(quote.block),
+                        ..f
                     }
-                    if view.prover != Address::ZERO {
-                        return Ok(ClaimOutcome::LostRace);
+                    .into(),
+                    Err(e) => e,
+                };
+                return self.reconcile_claim_refusal(job_id, e).await;
+            }
+        };
+        let quote = ClaimQuote { price_floor, ..quote };
+        // Below the price the job was judged at: on a competitive job a bid settled and released in
+        // between resumes the ramp at the winning bid, and claiming there sells the proof below
+        // what was evaluated. (An ascending job's quote only rises.) Wait; the brain decides again.
+        if quote.price_floor < min_price {
+            return self
+                .reconcile_claim_refusal(
+                    job_id,
+                    ClaimFailure {
+                        class: ClaimClass::Wait,
+                        reason: format!(
+                            "quoted {} below the {} it was evaluated at",
+                            quote.price_floor, min_price
+                        ),
+                        definitely_not_locked: true,
+                        block: Some(quote.block),
+                    }
+                    .into(),
+                )
+                .await;
+        }
+
+        match self.claim_job(job_id, &quote).await {
+            Ok(r) => {
+                forget_claim_high_water(job_id);
+                Ok(ClaimOutcome::Claimed(r))
+            }
+            Err(e) => {
+                if let Some(f) = e.downcast_ref::<ClaimFailure>() {
+                    if f.definitely_not_locked {
+                        return self.reconcile_claim_refusal(job_id, e).await;
+                    }
+                }
+                if e.downcast_ref::<ClaimLostRace>().is_some() {
+                    return Ok(ClaimOutcome::LostRace);
+                }
+                // Ambiguous: the claim may have mined unseen. Our lock on a read is proof of it;
+                // another prover on this unpinned read proves nothing, so that stays ambiguous (the
+                // caller keeps the breadcrumb for recovery).
+                if let Ok((rec, at)) = self.read_job_record(job_id, None).await {
+                    if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED {
+                        forget_claim_high_water(job_id);
+                        return Ok(ClaimOutcome::Claimed(ClaimReceipt {
+                            block: at,
+                            settled_price: None,
+                        }));
                     }
                 }
                 Err(e)
@@ -992,16 +1739,71 @@ impl ChainClient {
         }
     }
 
-    /// Fulfill a locked job. Robust to a flaky/inconsistent RPC that drops or
-    /// hides txs: on a receipt timeout it polls on-chain state, and if the job is
-    /// not yet Fulfilled it re-broadcasts with a freshly-fetched nonce and an
-    /// escalating tip (so a re-send can replace a stuck tx), up to a few attempts.
-    /// A job already Fulfilled on-chain (from a prior attempt that landed but whose
-    /// receipt we never saw) is treated as success.
-    /// `budget`, if set, caps the total wall time. [#45] The deadline is enforced HERE
-    /// (not by an external `tokio::time::timeout` that would DROP this future mid-flight)
-    /// so the give-up path always runs and STASHES the pending nonce for `release_job` —
-    /// a dropped future would orphan the nonce (permanent gap) and break the handoff.
+    /// A typed claim refusal does not say WHO holds the job: `JobNotOpen` fires for a job Locked by
+    /// us (an earlier claim of ours mined; a recovered lock), and `EnforcedPause` fires before any
+    /// ownership check. So before a refusal is treated as "nothing of ours is locked" — on which the
+    /// lifecycle drops the claim breadcrumb, the only record of a lock — re-read `jobs(jobId)` at or
+    /// after the block the refusal was evaluated at. Ours → `Claimed`; someone else's → `LostRace`;
+    /// not ours → the refusal stands; unreadable → the refusal is DOWNGRADED to ambiguous
+    /// (`definitely_not_locked = false`), which keeps the breadcrumb for an on-chain reconcile.
+    async fn reconcile_claim_refusal(&self, job_id: B256, e: anyhow::Error) -> Result<ClaimOutcome> {
+        let Some(f) = e.downcast_ref::<ClaimFailure>().cloned() else {
+            return Err(e);
+        };
+        let mut read = self.read_job_record(job_id, f.block).await;
+        if read.is_err() {
+            tokio::time::sleep(LAG_RETRY_WAIT).await;
+            read = self.read_job_record(job_id, f.block).await;
+        }
+        match read {
+            Ok((rec, at)) if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED => {
+                forget_claim_high_water(job_id);
+                tracing::info!(
+                    "Job {job_id}: claim refused ({}) but the job is Locked by us at block {at} — \
+                     treating it as our lock",
+                    f.reason
+                );
+                Ok(ClaimOutcome::Claimed(ClaimReceipt {
+                    block: at,
+                    settled_price: None,
+                }))
+            }
+            // Another prover's lock keeps the mark (handoff/guide: a sybil's settle is such a lock, and
+            // the job can come back at its lower price); only a job that can never be claimed again
+            // drops it.
+            Ok((rec, _)) if rec.prover != Address::ZERO && rec.prover != self.address => {
+                Ok(ClaimOutcome::LostRace)
+            }
+            Ok((rec, _)) => {
+                if rec.reopen_count >= MAX_REOPEN_COUNT
+                    || (rec.status != JOB_STATUS_OPEN && rec.status != JOB_STATUS_LOCKED)
+                {
+                    forget_claim_high_water(job_id);
+                }
+                Err(e)
+            }
+            Err(re) => Err(ClaimFailure {
+                definitely_not_locked: false,
+                reason: format!("{} (ownership unconfirmed: {re:#})", f.reason),
+                ..f
+            }
+            .into()),
+        }
+    }
+
+    /// Fulfil a locked job. Classifies every failure (handoff §9) as a typed [`FulfilFailure`] so the
+    /// lifecycle can choose between fixing/releasing (a proof defect), KEEPING the lock (a pause, a
+    /// disabled adapter, a pending settlement — time is credited), resending with more gas (handled
+    /// here), stopping (the lock is gone, or the window closed) or alerting (anything unclassifiable).
+    ///
+    /// Before EVERY publish it re-reads `jobs(jobId)` at a block at or after `lock_block` (the claim
+    /// receipt's) and refuses to send unless the job is Locked by us, and it holds the send while the
+    /// router or Registry is paused: a reverted fulfil still publishes our unbound seal.
+    ///
+    /// `budget`, if set, caps the total wall time. The deadline is enforced HERE (not by an external
+    /// `tokio::time::timeout` that would DROP this future mid-flight) so the give-up path always runs
+    /// and STASHES the pending nonce — the next fulfil attempt for this job re-publishes AT THAT SAME
+    /// nonce (fee-escalated), and a release displaces it there.
     pub async fn fulfill_job(
         &self,
         job_id: B256,
@@ -1009,42 +1811,158 @@ impl ChainClient {
         public_values: Bytes,
         proof_bytes: Bytes,
         budget: Option<Duration>,
+        lock_block: Option<u64>,
     ) -> Result<()> {
         const MAX_ATTEMPTS: u32 = MAX_TX_ATTEMPTS;
+        const MAX_GAS_BUMPS: u64 = 3;
         let fulfill = IHemiProveFulfill::new(self.hemi_prove, &*self.provider);
         let started = std::time::Instant::now();
-        // Reserve one DISTINCT nonce and own it across re-broadcasts. Committed on
-        // success; recycled (abort) or stashed for release (give-up) at the end.
-        let mut nonce = self.reserve_nonce().await?;
+        let fail = |class: FulfilClass, error_name: String, reason: String, published: bool| -> anyhow::Error {
+            FulfilFailure {
+                class,
+                error_name,
+                reason,
+                published,
+            }
+            .into()
+        };
+        // Held by governance (a pause, a Disabled adapter): do NOT touch the nonce allocator. Reserving
+        // and aborting a nonce on every 30-s round leaves abort evidence at the mined frontier, and the
+        // gap watchdog answers it with a >= 2 gwei self-transfer every ~2 minutes for the whole hold,
+        // which can last days. Any stashed nonce stays stashed. The lock is still re-read, so a third
+        // party's `graceRelease` ends the loop instead of holding for a lock that is gone.
+        if let Ok(Some(hold)) = self.governance_hold(descriptor.proofSystemId).await {
+            let was_published = self.has_abandoned_nonce(job_id);
+            if let Ok((rec, _)) = self.read_job_record(job_id, lock_block).await {
+                if rec.status == JOB_STATUS_FULFILLED && rec.prover == self.address {
+                    return Ok(());
+                }
+                if rec.status != JOB_STATUS_LOCKED || rec.prover != self.address {
+                    return Err(fail(
+                        FulfilClass::Stale,
+                        String::new(),
+                        format!(
+                            "job is no longer Locked by us (status {}, prover {}) while held",
+                            rec.status, rec.prover
+                        ),
+                        was_published,
+                    ));
+                }
+            }
+            return Err(fail(
+                FulfilClass::Keep,
+                GOVERNANCE_HOLD_NAME.to_string(),
+                match hold {
+                    GovernanceHold::Paused => "router or Registry paused — holding the fulfil".into(),
+                    GovernanceHold::AdapterDisabled => {
+                        "the job's adapter is Disabled — holding the fulfil".into()
+                    }
+                },
+                was_published,
+            ));
+        }
+        // Resume the nonce a previous attempt for THIS job left pending (so the re-publish replaces
+        // it at the same nonce instead of queueing behind it), else reserve a fresh one.
+        let (mut nonce, resumed) = match self.take_abandoned_nonce(job_id) {
+            Some(n) => (n, true),
+            None => (self.reserve_nonce().await?, false),
+        };
+        // A resumed nonce means an earlier attempt already broadcast this job's fulfil.
+        let mut published = resumed;
         let (base_tip, base_max_fee) = self.base_fees().await;
+        // Read once per invocation: bounds the fee ladder to what the node will admit (see
+        // `job_path_bid`). Unknown → unbounded (the node's refusal is then the bound).
+        let balance: Option<u128> = self
+            .provider
+            .get_balance(self.address)
+            .await
+            .ok()
+            .map(|b| b.min(U256::from(u128::MAX)).to::<u128>());
+        let calldata_len = IHemiProveFulfill::fulfillJobCall {
+            jobId: job_id,
+            descriptor: descriptor.clone(),
+            publicValues: public_values.clone(),
+            proofBytes: proof_bytes.clone(),
+        }
+        .abi_encode()
+        .len();
+        let mut extra_gas: u64 = 0;
+        let mut gas_bumps: u64 = 0;
 
-        for attempt in 1..=MAX_ATTEMPTS {
-            // [#45] Enforce the deadline budget in-loop so the give-up/stash path runs.
+        let mut attempt: u32 = 0;
+        while attempt < MAX_ATTEMPTS {
+            attempt += 1;
             if budget.is_some_and(|b| started.elapsed() >= b) {
                 tracing::warn!(
-                    "fulfillJob budget reached for {} after {} attempt(s) — giving up to release",
-                    job_id,
+                    "fulfillJob budget reached for {job_id} after {} attempt(s)",
                     attempt - 1
                 );
                 break;
             }
-            // Already Fulfilled? (a prior attempt may have landed on a node whose
-            // receipt was invisible to the one we polled.)
-            if let Ok(view) = self.get_job_status_view(job_id).await {
-                if view.status == 2 {
-                    // Already fulfilled. Our reserved nonce may be unused (job fulfilled
-                    // before we sent) or consumed (our own tx landed) — recycle it as a
-                    // gap either way; if it was actually consumed a reuser hits "nonce too
-                    // low" and re-syncs.
-                    self.abort_nonce(nonce);
-                    tracing::info!("Job {} already Fulfilled on-chain", job_id);
-                    return Ok(());
-                }
+            // Hold while paused or while the job's adapter is Disabled: the send would revert
+            // (EnforcedPause / RegistryPaused / AdapterDisabled) and publish the seal for nothing,
+            // every round, for the whole window; the lock's clock is credited meanwhile.
+            // (Attempt 1 was checked above, before the nonce was touched.)
+            let later_hold = if attempt > 1 {
+                self.governance_hold(descriptor.proofSystemId).await
+            } else {
+                Ok(None)
+            };
+            if let Ok(Some(hold)) = later_hold {
+                self.stash_or_abort(job_id, nonce, published);
+                return Err(fail(
+                    FulfilClass::Keep,
+                    GOVERNANCE_HOLD_NAME.to_string(),
+                    match hold {
+                        GovernanceHold::Paused => "router or Registry paused — holding the fulfil".into(),
+                        GovernanceHold::AdapterDisabled => {
+                            "the job's adapter is Disabled — holding the fulfil".into()
+                        }
+                    },
+                    published,
+                ));
             }
+            // Lock check before publishing: Locked AND ours, at a block >= the claim receipt's.
+            let (rec, _) = match self.read_job_record(job_id, lock_block).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("fulfillJob: lock read for {job_id} failed: {e:#}");
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(SEND_FAILURE_RETRY_WAIT).await;
+                    }
+                    continue;
+                }
+            };
+            if rec.status == JOB_STATUS_FULFILLED && rec.prover == self.address {
+                self.abort_nonce(nonce);
+                tracing::info!("Job {} already Fulfilled on-chain", job_id);
+                return Ok(());
+            }
+            if rec.status != JOB_STATUS_LOCKED || rec.prover != self.address {
+                self.abort_nonce(nonce);
+                return Err(fail(
+                    FulfilClass::Stale,
+                    String::new(),
+                    format!(
+                        "job is no longer Locked by us (status {}, prover {}) — not publishing",
+                        rec.status, rec.prover
+                    ),
+                    published,
+                ));
+            }
+            let gas = self
+                .fulfill_gas_limit
+                .max(fulfill_gas_formula(
+                    rec.callback_gas_limit,
+                    calldata_len,
+                    public_values.len(),
+                ))
+                .saturating_add(extra_gas);
 
-            // Build + send under the nonce lock at the reserved nonce (escalating tip
-            // lets a re-broadcast replace a stuck tx at the same nonce).
             let mut bid: Option<(u128, u128, u128)> = None;
+            // The bid is at its ceiling: a re-publish is byte-identical, so the node answers "already
+            // known" and there is nothing to bump.
+            let mut held = false;
             let send_result = {
                 let _guard = self.tx_lock.lock().await;
                 let mut tx = fulfill
@@ -1055,43 +1973,53 @@ impl ChainClient {
                         proof_bytes.clone(),
                     )
                     .nonce(nonce)
-                    // Explicit gas limit: the router's settlement preflight (~4.6M)
-                    // reverts InsufficientGasForFullSettlement() if eth_estimateGas
-                    // under-provisions it (INTERACTION_GUIDE §9).
-                    .gas(self.fulfill_gas_limit);
+                    // Explicit gas limit (never `eth_estimateGas`: an estimate shows the seal to the
+                    // RPC operator, and the router's settlement preflight reverts
+                    // InsufficientGasForFullSettlement if under-provisioned).
+                    .gas(gas);
                 if base_max_fee > 0 {
                     let (tip, seed_max_fee) = escalated_fees(base_tip, base_max_fee, attempt);
-                    // Must exceed anything WE already put at this nonce. A recycled nonce
-                    // can carry a give-up claim/release floor, or a heal's >=4x self-transfer,
-                    // and this open-loop ladder can never clear those on its own.
-                    let max_fee = seed_max_fee;
-                    let Some((tip, max_fee)) = fees_over_floor(self, nonce, tip, max_fee) else {
-                        // Cap exhausted: no strictly-higher bid exists, so every send from
-                        // here is rejected "replacement underpriced". Stop now rather than
-                        // burning the attempt ladder against a wall.
-                        if let Some(st) = self.nonce_fee_floor_state(nonce) {
-                            log_fee_cap_exhausted("fulfillJob", nonce, &st);
+                    // The fulfil climbs (>= 12.5% per re-publish) toward the key-wide ceiling but
+                    // stops RELEASE_DISPLACE_RUNGS rungs below the cap, then keeps re-publishing at
+                    // that level: the same-nonce release must always be able to out-bid it.
+                    let affordable = balance
+                        .map_or(u128::MAX, |b| (b / 10 * 9).min(TX_FEE_CAP_WEI) / u128::from(gas.max(1)));
+                    let (tip, max_fee) = match job_path_bid(
+                        self.nonce_fee_floor_state(nonce),
+                        tip,
+                        seed_max_fee,
+                        self.fee_ceiling,
+                        RELEASE_DISPLACE_RUNGS,
+                        affordable,
+                    ) {
+                        JobBid::Send(t, m) => (t, m),
+                        JobBid::Hold(t, m) => {
+                            held = true;
+                            (t, m)
                         }
-                        self.note_nonce_undisplaceable(nonce);
-                        // Leave abort EVIDENCE but do NOT offer the nonce back to
-                        // reservers. `abort` would push it to the HEAD of `freed`, and
-                        // `reserve_locked` hands the lowest freed nonce out first -- so the
-                        // next reserver (preferentially a deadline-critical release) would
-                        // draw this same poisoned nonce and bail again, in a loop.
-                        // `note_unresolved` writes `aborted_at` only: the gap detector's
-                        // branch (B) still nominates the nonce via `recently_aborted`, so
-                        // it stays visible and healable, while nothing is handed it.
-                        //
-                        // BEWARE: the healer this arms is the LIVE watchdog branch (B),
-                        // which is consumed UNGATED (client.rs `hole_we_own` and its
-                        // `frontier_has_executable_tx` gate are on the SHUTDOWN path only).
-                        // So roughly WEDGE_CHECK_TICKS + WEDGE_MIN_PERSIST after this, the
-                        // healer will try to evict the resident tx with a self-transfer --
-                        // and since that bid now lifts over the uncapped high-water, it
-                        // will SUCCEED. That is the intended unwedge, but it does mean a
-                        // live tx of ours at this nonce is deliberately displaced.
-                        self.note_nonce_unresolved(nonce);
-                        bail!("{FEE_CAP_EXHAUSTED} at nonce {nonce} (fulfillJob)");
+                        JobBid::Exhausted => {
+                            if let Some(st) = self.nonce_fee_floor_state(nonce) {
+                                log_fee_cap_exhausted("fulfillJob", nonce, &st);
+                            }
+                            // Do NOT hand this nonce to the gap healer: its self-transfer would evict
+                            // OUR OWN pending fulfil (seal already public, lock unsettled). Keep it
+                            // stashed for this job so the next attempt or a release resumes it. A
+                            // nonce we never published at carries someone ELSE's resident: leave it
+                            // unresolved (healable) rather than recycle it into `freed`, where the
+                            // next reserver would draw the same poisoned nonce and bail again.
+                            self.note_nonce_undisplaceable(nonce);
+                            if published {
+                                self.stash_abandoned_nonce(job_id, nonce);
+                            } else {
+                                self.note_nonce_unresolved(nonce);
+                            }
+                            return Err(fail(
+                                FulfilClass::Unknown,
+                                String::new(),
+                                format!("{FEE_CAP_EXHAUSTED} at nonce {nonce} (fulfillJob)"),
+                                published,
+                            ));
+                        }
                     };
                     bid = Some((tip, max_fee, seed_max_fee));
                     tx = tx.max_priority_fee_per_gas(tip).max_fee_per_gas(max_fee);
@@ -1101,33 +2029,44 @@ impl ChainClient {
 
             let pending = match send_result {
                 Ok(p) => {
-                    // Ratchet on an ACCEPTED send only, so the read above cannot flatten the
-                    // ladder (with a floor present, max() would pin every rung to one bid and
-                    // a self-displacing re-broadcast would be rejected forever).
+                    published = true;
                     if let Some((t, m, seed)) = bid {
                         self.note_broadcast_fee(nonce, t, m, seed);
                     }
                     p
                 }
                 Err(e) => {
-                    let msg = format!("{e:#}");
-                    // [H2] A tx is pending at our nonce (our own re-broadcast, or a stuck
-                    // predecessor) → KEEP the nonce so the next attempt's escalated fee
-                    // displaces it. Walking forward here orphans the pending fulfill and,
-                    // worse, breaks the fulfill→release same-nonce displacement the error
-                    // path relies on. The top-of-loop status check confirms if it landed.
-                    if is_same_nonce_pending(&msg) {
+                    let raw = format!("{e:#}");
+                    // Classify on the RAW string, log the SANITIZED form (a hostile callback /
+                    // verifier revert reason can carry terminal escapes).
+                    let msg = crate::programs::sanitize_log(&raw);
+                    if is_same_nonce_pending(&raw) {
+                        if held && published {
+                            // Our fulfil is pending at the ceiling bid: wait for it, as an unconfirmed
+                            // receipt does, rather than burn the remaining attempts (and the shared RPC
+                            // budget) in seconds re-sending the same bytes.
+                            tracing::info!(
+                                "fulfillJob at nonce {nonce} is pending at its fee ceiling (attempt \
+                                 {attempt}/{MAX_ATTEMPTS}) — waiting for it"
+                            );
+                            let mut poll_end = std::time::Instant::now() + FULFIL_HELD_WAIT;
+                            if let Some(b) = budget {
+                                poll_end = poll_end.min(started + b);
+                            }
+                            if self
+                                .poll_fulfilled_until(job_id, poll_end, FULFIL_HELD_POLL)
+                                .await
+                            {
+                                self.abort_nonce(nonce);
+                                tracing::info!(
+                                    "Job {} Fulfilled (confirmed via state poll)",
+                                    job_id
+                                );
+                                return Ok(());
+                            }
+                            continue;
+                        }
                         tracing::warn!("fulfillJob replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — bumping fee, keeping nonce");
-                        // Give the node a moment before re-bidding. Without this the
-                        // whole attempt ladder burns in well under a second, which learns
-                        // nothing (the resident tx has not moved) and, during the
-                        // 2026-08-14 wedge, produced 327 rejected sends in 4h24m. Linear in
-                        // the attempt so a transient collision still clears quickly.
-                        // Named unit, and skipped on the last attempt — the loop is about to
-                        // exit, so that wait buys nothing and only delays the give-up. Both were
-                        // applied to the `is_nonce_error` arms and not to these, so the two arms
-                        // of the same ladder paid different rungs (1..=5 here against 1..=4
-                        // there) and the documented figures described neither.
                         if attempt < MAX_ATTEMPTS {
                             tokio::time::sleep(nonce_retry_backoff(
                                 attempt,
@@ -1138,17 +2077,11 @@ impl ChainClient {
                         }
                         continue;
                     }
-                    // Genuine nonce mismatch ⇒ re-fetch and retry fast.
-                    if is_nonce_error(&msg) {
+                    if is_nonce_error(&raw) {
                         tracing::warn!("fulfillJob nonce error (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — re-syncing");
-                        // [nonce-review] Recycle the abandoned nonce so a "nonce too high"
-                        // (a gap below us) doesn't leak it; resync then prunes it from the
-                        // gap set if it was actually consumed ("nonce too low").
                         let rejected = nonce;
                         self.abort_nonce(nonce);
                         self.resync_nonce().await.ok();
-                        // [M3] Don't abort the deadline-critical fulfill on a single
-                        // transient re-sync failure; keep the attempt budget and retry.
                         let mut progressed = false;
                         match self.reserve_nonce().await {
                             Ok(n) => {
@@ -1157,9 +2090,6 @@ impl ChainClient {
                             }
                             Err(e) => tracing::warn!("fulfillJob nonce re-sync failed (attempt {attempt}/{MAX_ATTEMPTS}): {e:#} — retrying"),
                         }
-                        // Not on the last attempt: the loop is about to exit, so the wait buys
-                        // nothing and delays the give-up — and on the fulfil path that delay is
-                        // spent directly against the release margin that follows it.
                         if attempt < MAX_ATTEMPTS {
                             tokio::time::sleep(nonce_retry_backoff(
                                 attempt,
@@ -1168,172 +2098,266 @@ impl ChainClient {
                             ))
                             .await;
                         }
-                    } else {
-                        tracing::warn!(
-                            "fulfillJob send failed (attempt {attempt}/{MAX_ATTEMPTS}): {msg}"
-                        );
-                        if attempt < MAX_ATTEMPTS {
-                            tokio::time::sleep(SEND_FAILURE_RETRY_WAIT).await;
+                        continue;
+                    }
+                    // A preflighting node rejects a reverting fulfil at SEND, with the revert data.
+                    if let Some(data) = crate::revert::revert_data_of(&e) {
+                        let d = crate::revert::decode(&data);
+                        let class = crate::revert::classify_fulfil(&d);
+                        if class == FulfilClass::Gas && gas_bumps < MAX_GAS_BUMPS {
+                            gas_bumps += 1;
+                            extra_gas += FULFIL_GAS_BUMP;
+                            tracing::warn!("fulfillJob preflight {} — resending with +{FULFIL_GAS_BUMP} gas", d.name());
+                            continue;
                         }
+                        if class == FulfilClass::Stale {
+                            // A preflighting node simulates against ITS head. A load-balanced backend
+                            // below our lock block sees the pre-claim state and answers JobNotLocked /
+                            // NotJobProver for a lock we hold — the lifecycle would then drop it. Only
+                            // a read pinned at or after the lock block may conclude the lock is gone.
+                            match self.read_job_record(job_id, lock_block).await {
+                                Ok((rec, _)) if rec.prover == self.address && rec.status == JOB_STATUS_FULFILLED => {
+                                    self.abort_nonce(nonce);
+                                    return Ok(());
+                                }
+                                Ok((rec, _)) if rec.prover != self.address || rec.status != JOB_STATUS_LOCKED => {
+                                    // Confirmed gone: nothing to displace, so recycle the nonce.
+                                    self.abort_nonce(nonce);
+                                    return Err(fail(
+                                        class,
+                                        d.name(),
+                                        format!("send-time revert: {} (confirmed by jobs())", d.name()),
+                                        published,
+                                    ));
+                                }
+                                other => {
+                                    tracing::warn!(
+                                        "fulfillJob preflight {} for {job_id}, but jobs() at or after the \
+                                         lock block {} — a lagging preflight node; retrying",
+                                        d.name(),
+                                        if other.is_ok() { "still shows our lock" } else { "is unreadable" }
+                                    );
+                                    if attempt < MAX_ATTEMPTS {
+                                        tokio::time::sleep(SEND_FAILURE_RETRY_WAIT).await;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        self.stash_or_abort(job_id, nonce, published);
+                        return Err(fail(class, d.name(), format!("send-time revert: {}", d.name()), published));
+                    }
+                    if is_funds_refusal(&raw) {
+                        self.note_funds_short();
+                    }
+                    tracing::warn!("fulfillJob send failed (attempt {attempt}/{MAX_ATTEMPTS}): {msg}");
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(SEND_FAILURE_RETRY_WAIT).await;
                     }
                     continue;
                 }
             };
             let tx_hash = *pending.tx_hash();
             tracing::info!(
-                "fulfillJob tx sent (attempt {attempt}/{MAX_ATTEMPTS}): {tx_hash:?}, waiting for receipt..."
+                "fulfillJob tx sent (attempt {attempt}/{MAX_ATTEMPTS}, gas {gas}): {tx_hash:?}, waiting for receipt..."
             );
 
-            // [nonce-review] Bound the receipt wait by the remaining budget so a single
-            // 120s TX_RECEIPT_TIMEOUT + 30s poll can't overrun the deadline (the top-of-loop
-            // budget check alone would let one iteration run ~150s past it, starting release
-            // too late to beat the lock deadline).
+            // Short per-attempt wait (FULFIL_RECEIPT_WAIT, ~3 blocks), not the generic 120 s: an
+            // unmined fulfil is re-published at the SAME nonce with both fees bumped (>= 12.5%, via the
+            // escalation ladder and the per-nonce floor) every few blocks (handoff §10), and the
+            // lifecycle keeps re-invoking this — resuming the stashed nonce — until D+G.
             let recv_budget = match budget {
-                Some(b) => b.saturating_sub(started.elapsed()).min(TX_RECEIPT_TIMEOUT),
-                None => TX_RECEIPT_TIMEOUT,
+                Some(b) => b.saturating_sub(started.elapsed()).min(FULFIL_RECEIPT_WAIT),
+                None => FULFIL_RECEIPT_WAIT,
             };
-            // [RPC #1] Poll for the receipt (no heartbeat watcher). None folds the old
-            // timeout + RPC-error arms into the on-chain state poll below — a transient 429
-            // no longer blind-rebroadcasts a fulfill (which, on a mined revert, is a proof
-            // the verifier rejected — only receipt.status() distinguishes that, so we still
-            // read it whenever a receipt IS returned).
             match crate::tx::await_receipt(&*self.provider, tx_hash, recv_budget).await {
                 Some(receipt) => {
-                    if receipt.status() {
-                        self.commit_nonce(nonce);
-                        tracing::info!(
-                            "Job fulfilled: {} tx: {:?}",
-                            job_id,
-                            receipt.transaction_hash
-                        );
-                        return Ok(());
-                    }
-                    // A genuine revert (e.g. verifier rejected the proof) — retrying
-                    // the same proof won't help. The reverted tx consumed the nonce
-                    // on-chain → commit it.
                     self.commit_nonce(nonce);
-                    anyhow::bail!("fulfillJob transaction reverted (tx {tx_hash:?})");
+                    let receipt_block = receipt.block_number.unwrap_or_default();
+                    if receipt.status() {
+                        if receipt_fulfilled_this_job(&receipt, job_id, self.hemi_prove) {
+                            tracing::info!("Job fulfilled: {job_id} tx: {tx_hash:?}");
+                            return Ok(());
+                        }
+                        // On v2 a callback cannot withhold settlement, so a mined fulfil with no
+                        // router-emitted JobFulfilled is unexpected: re-read before concluding.
+                        if let Ok((rec, _)) = self.read_job_record(job_id, Some(receipt_block)).await {
+                            if rec.status == JOB_STATUS_FULFILLED && rec.prover == self.address {
+                                return Ok(());
+                            }
+                        }
+                        return Err(fail(
+                            FulfilClass::Unknown,
+                            String::new(),
+                            format!("fulfillJob {tx_hash:?} mined but emitted no JobFulfilled for {job_id}"),
+                            true,
+                        ));
+                    }
+                    // A mined revert: replay the identical call (same gas) at its block for the
+                    // reason — the calldata is already public, so the replay exposes nothing new.
+                    let sim = fulfill
+                        .fulfillJob(
+                            job_id,
+                            descriptor.clone(),
+                            public_values.clone(),
+                            proof_bytes.clone(),
+                        )
+                        .from(self.address)
+                        .gas(gas)
+                        .block(BlockId::number(receipt_block))
+                        .call()
+                        .await;
+                    let (class, name, reason) = match &sim {
+                        Err(e) => match crate::revert::revert_data_of(e) {
+                            Some(data) => {
+                                let d = crate::revert::decode(&data);
+                                (crate::revert::classify_fulfil(&d), d.name(), d.name())
+                            }
+                            None => (
+                                FulfilClass::Unknown,
+                                String::new(),
+                                "mined revert; replay gave no revert data".to_string(),
+                            ),
+                        },
+                        Ok(_) => (
+                            FulfilClass::Unknown,
+                            String::new(),
+                            format!("fulfillJob {tx_hash:?} reverted but replays cleanly at block {receipt_block}"),
+                        ),
+                    };
+                    if class == FulfilClass::Gas && gas_bumps < MAX_GAS_BUMPS {
+                        gas_bumps += 1;
+                        extra_gas += FULFIL_GAS_BUMP;
+                        tracing::warn!("fulfillJob {tx_hash:?} reverted {reason} — resending with +{FULFIL_GAS_BUMP} gas");
+                        nonce = self.reserve_nonce().await?;
+                        continue;
+                    }
+                    return Err(fail(class, name, format!("mined revert: {reason}"), true));
                 }
                 None => {
                     tracing::warn!(
                         "fulfillJob receipt not confirmed (attempt {attempt}/{MAX_ATTEMPTS}, tx {tx_hash:?}); \
                          polling on-chain state before re-broadcast"
                     );
-                    // Poll, but never past the budget (start release on time).
-                    let mut poll_end = std::time::Instant::now() + Duration::from_secs(30);
+                    let mut poll_end = std::time::Instant::now() + FULFIL_STATE_POLL;
                     if let Some(b) = budget {
                         poll_end = poll_end.min(started + b);
                     }
-                    while std::time::Instant::now() < poll_end {
-                        // [nonce-review r6] Bound the read itself by the remaining poll window
-                        // (already budget-clamped) so a slow RPC can't run ~45s past the deadline
-                        // budget and start release too late.
-                        let call_budget =
-                            poll_end.saturating_duration_since(std::time::Instant::now());
-                        if let Ok(Ok(view)) =
-                            tokio::time::timeout(call_budget, self.get_job_status_view(job_id))
-                                .await
-                        {
-                            if view.status == 2 {
-                                // [nonce-review] status==2 = SOME fulfill of ours landed, not
-                                // necessarily THIS nonce (an is_nonce_error re-reserve may have
-                                // moved us off it). abort self-heals; commit could advance past
-                                // an unmined nonce → permanent gap/wedge. (Matches the top-of-loop
-                                // already-fulfilled arm.)
-                                self.abort_nonce(nonce);
-                                tracing::info!(
-                                    "Job {} Fulfilled (confirmed via state poll)",
-                                    job_id
-                                );
-                                return Ok(());
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    if self
+                        .poll_fulfilled_until(job_id, poll_end, Duration::from_secs(5))
+                        .await
+                    {
+                        self.abort_nonce(nonce);
+                        tracing::info!("Job {} Fulfilled (confirmed via state poll)", job_id);
+                        return Ok(());
                     }
                 }
             }
         }
 
-        // Final state check before declaring failure — [nonce-review r6] skip it once the
-        // budget is spent (go straight to stash+release), and otherwise bound the read by the
-        // remaining budget so it can't run ~45s past the deadline.
+        // Final state check, bounded by the remaining budget.
         let final_budget = budget.map(|b| b.saturating_sub(started.elapsed()));
         if final_budget.is_none_or(|r| !r.is_zero()) {
-            let view = match final_budget {
-                Some(r) => tokio::time::timeout(r, self.get_job_status_view(job_id))
+            let read = match final_budget {
+                Some(r) => tokio::time::timeout(r, self.read_job_record(job_id, None))
                     .await
                     .ok()
                     .and_then(|x| x.ok()),
-                None => self.get_job_status_view(job_id).await.ok(),
+                None => self.read_job_record(job_id, None).await.ok(),
             };
-            if let Some(view) = view {
-                if view.status == 2 {
-                    self.abort_nonce(nonce); // [nonce-review] state signal, not a receipt for THIS nonce
+            if let Some((rec, _)) = read {
+                if rec.status == JOB_STATUS_FULFILLED && rec.prover == self.address {
+                    self.abort_nonce(nonce);
                     return Ok(());
                 }
             }
         }
-        // [#45] Our fulfill tx may still be pending at this nonce. STASH it so the
-        // lifecycle error path's release_job for this job re-broadcasts releaseJob at the
-        // SAME nonce (with a higher fee) to DISPLACE the stuck fulfill. With the distinct-
-        // nonce allocator, release would otherwise reserve a FRESH nonce and queue BEHIND
-        // the stuck fulfill → strand. Do NOT abort/commit here (that would recycle or
-        // advance past a nonce we still need to displace). If the fulfill actually mined,
-        // release's send at N gets "nonce too low" → re-syncs → sees the job Fulfilled.
-        self.stash_abandoned_nonce(job_id, nonce);
-        anyhow::bail!("fulfillJob failed after {MAX_ATTEMPTS} attempts (RPC may be dropping txs)")
+        // Our fulfil may still be pending at this nonce: STASH it so the next fulfil attempt for this
+        // job re-publishes at the SAME nonce, and a release displaces it there.
+        self.stash_or_abort(job_id, nonce, published);
+        Err(fail(
+            FulfilClass::Unknown,
+            String::new(),
+            format!("fulfillJob not confirmed after {attempt} attempt(s) (RPC may be dropping txs)"),
+            published,
+        ))
     }
 
-    /// Fulfill a locked job with hashed descriptor (gas efficient).
-    ///
-    /// UNUSED as of this writing — the lifecycle uses [`Self::fulfill_job`]. Unlike that
-    /// path, this does NOT reserve/commit through the shared `next_nonce` cache and does
-    /// NOT apply `escalated_fees`, so wiring it into a concurrent lifecycle would let the
-    /// gas filler pick a nonce that collides with an in-flight cached one. Before using
-    /// it, port over the `reserve_nonce`/`commit_nonce`/`invalidate_nonce` + `base_fees`/
-    /// `escalated_fees` treatment from `fulfill_job`.
-    pub async fn fulfill_job_hashed(
+    /// Whether `view` (a read showing the job not ours) proves our lock on `job_id` is gone. Only on
+    /// evidence: the reopen count risen past `seen.reopens`; a read pinned at or after `seen.block`
+    /// (a block where it was ours); or, once our release went out at nonce `sent`, a read at a block
+    /// where that nonce is included. An unpinned read alone may come from a replica behind our claim,
+    /// still showing the job's previous holder, or none — and acting on it drops the record of a live
+    /// lock (a 100% slash), or recycles the nonce of a release still pending.
+    async fn lock_gone_on_evidence(
         &self,
         job_id: B256,
-        hashed_descriptor: HashedDescriptor,
-        callback_extra_data: Bytes,
-        extra_verifier_data: Bytes,
-        public_values: Bytes,
-        proof_bytes: Bytes,
-    ) -> Result<()> {
-        let fulfill = IHemiProveFulfill::new(self.hemi_prove, &*self.provider);
-        let tx = fulfill.fulfillJobHashed(
-            job_id,
-            hashed_descriptor,
-            callback_extra_data,
-            extra_verifier_data,
-            public_values,
-            proof_bytes,
-        );
-        let pending = tx
-            .send()
-            .await
-            .context("Failed to send fulfillJobHashed tx")?;
-        let tx_hash = *pending.tx_hash();
-        tracing::info!(
-            "fulfillJobHashed tx sent: {:?}, waiting for receipt...",
-            tx_hash
-        );
-        let receipt = tokio::time::timeout(TX_RECEIPT_TIMEOUT, pending.get_receipt())
-            .await
-            .with_context(|| format!("fulfillJobHashed receipt timed out after {TX_RECEIPT_TIMEOUT:?} (tx {tx_hash:?} may still be pending)"))?
-            .context("Failed to get fulfillJobHashed receipt")?;
-
-        if !receipt.status() {
-            anyhow::bail!("fulfillJobHashed transaction reverted");
+        view: &JobStatusView,
+        seen: LockSeen,
+        sent: Option<u64>,
+    ) -> bool {
+        if view.prover == self.address {
+            return false;
         }
+        if seen.reopens.is_some_and(|r| view.reopenCount > r) {
+            return true;
+        }
+        let mut pin = seen.block;
+        if let Some(n) = sent {
+            if let Ok(head) = self.provider.get_block_number().await {
+                if let Ok(count) = self
+                    .provider
+                    .get_transaction_count(self.address)
+                    .block_id(BlockId::number(head))
+                    .await
+                {
+                    if count > n {
+                        pin = Some(head);
+                    }
+                }
+            }
+        }
+        match pin {
+            Some(b) => matches!(
+                self.read_job_record(job_id, Some(b)).await,
+                Ok((rec, _)) if rec.prover != self.address
+            ),
+            None => false,
+        }
+    }
 
-        tracing::info!(
-            "Job fulfilled (hashed): {} tx: {:?}",
-            job_id,
-            receipt.transaction_hash
-        );
-        Ok(())
+    /// Poll `jobs()` every `every` until `poll_end` for this job Fulfilled by us.
+    async fn poll_fulfilled_until(
+        &self,
+        job_id: B256,
+        poll_end: std::time::Instant,
+        every: Duration,
+    ) -> bool {
+        while std::time::Instant::now() < poll_end {
+            let call_budget = poll_end.saturating_duration_since(std::time::Instant::now());
+            if let Ok(Ok((rec, _))) =
+                tokio::time::timeout(call_budget, self.read_job_record(job_id, None)).await
+            {
+                if rec.status == JOB_STATUS_FULFILLED && rec.prover == self.address {
+                    return true;
+                }
+            }
+            tokio::time::sleep(
+                every.min(poll_end.saturating_duration_since(std::time::Instant::now())),
+            )
+            .await;
+        }
+        false
+    }
+
+    /// After a fulfil gives up: if anything was broadcast at `nonce`, STASH it for this job (it may
+    /// still be pending, and only a same-nonce replacement can displace it); otherwise recycle it.
+    fn stash_or_abort(&self, job_id: B256, nonce: u64, published: bool) {
+        if published {
+            self.stash_abandoned_nonce(job_id, nonce);
+        } else {
+            self.abort_nonce(nonce);
+        }
     }
 
     /// Release a claimed job (voluntary release, incurs penalty).
@@ -1343,14 +2367,15 @@ impl ChainClient {
     /// us it re-broadcasts at the same nonce with an escalating tip (to displace a
     /// stuck tx), up to a few attempts. Because releasing frees collateral before a
     /// missed deadline strands it permanently, giving up after a single receipt
-    /// timeout (the old behaviour) was the exact failure that leaves collateral
+    /// timeout would be the exact failure that leaves collateral
     /// locked — mirroring fulfill_job's rebroadcast/poll closes that gap.
     ///
     /// Success is defined as "our lock is gone" (`view.prover != self.address`):
     /// after a release the job reopens (prover cleared) or is reclaimed by another
     /// prover — in every case our collateral is no longer tied to a lock we hold.
     pub async fn release_job(&self, job_id: B256) -> Result<()> {
-        self.release_job_with_nonce(job_id, None).await
+        self.release_job_with_nonce(job_id, None, LockSeen::default())
+            .await
     }
 
     /// As [`Self::release_job`], but starts from a nonce the CALLER already reserved.
@@ -1365,14 +2390,15 @@ impl ChainClient {
         &self,
         job_id: B256,
         preassigned: Option<u64>,
+        seen: LockSeen,
     ) -> Result<()> {
         const MAX_ATTEMPTS: u32 = MAX_TX_ATTEMPTS;
         let fulfill = IHemiProveFulfill::new(self.hemi_prove, &*self.provider);
-        // [#45] If a fulfill for THIS job gave up with its tx likely still pending, reuse
+        // If a fulfill for THIS job gave up with its tx likely still pending, reuse
         // that EXACT nonce so releaseJob displaces the stuck fulfill (a fresh distinct
         // nonce would queue BEHIND it and strand). Displacing from the start seeds the fee
         // headroom below.
-        // [M7] Otherwise reserve a fresh nonce and apply the fulfill-ceiling fee HEADROOM
+        // Otherwise reserve a fresh nonce and apply the fulfill-ceiling fee HEADROOM
         // only after we actually observe a stuck same-nonce tx — applying it
         // unconditionally ~doubles the fee on every release and can trip the wallet
         // "insufficient funds" precheck during a base-fee spike → release never lands.
@@ -1385,7 +2411,7 @@ impl ChainClient {
                 }
                 (n, true)
             }
-            // [M7] A pre-assigned nonce is a plain reservation, so `displacing` stays false
+            // A pre-assigned nonce is a plain reservation, so `displacing` stays false
             // and the fulfill-ceiling fee headroom is still only applied once we observe a
             // stuck same-nonce tx.
             None => match preassigned {
@@ -1394,7 +2420,16 @@ impl ChainClient {
             },
         };
         let (base_tip, base_max_fee) = self.base_fees().await;
-        // [D1] Have we actually put a releaseJob on the wire yet? Before that, a
+        // What the node will admit for a release (handoff §10). Sized for RELEASE_GAS_BOUND, above what
+        // a releaseJob uses; unknown balance -> unbounded (the node's refusal is then the bound).
+        let affordable = self
+            .provider
+            .get_balance(self.address)
+            .await
+            .ok()
+            .map(|b| b.min(U256::from(u128::MAX)).to::<u128>())
+            .map_or(u128::MAX, |b| (b / 10 * 9).min(TX_FEE_CAP_WEI) / RELEASE_GAS_BOUND);
+        // Have we actually put a releaseJob on the wire yet? Before that, a
         // `prover == ZERO` read (the job reads OPEN) is NOT proof our lock is gone — a claim
         // still pending and a lagging replica are indistinguishable from a real reopen. That
         // is the rule every other reader applies (`release_and_clean`'s own guard,
@@ -1402,16 +2437,19 @@ impl ChainClient {
         // This path is the one that DELETES it: our `Ok(())` makes `release_and_clean` drop
         // the breadcrumb, which is the only record that collateral is locked — after which
         // the drain union, the abandon list and the EX_TEMPFAIL exit gate (all
-        // `active_jobs ∪ journal`) can never see the lock again. Positive evidence (prover
-        // set to a DIFFERENT address) is still accepted immediately.
+        // `active_jobs ∪ journal`) can never see the lock again. So "gone" needs evidence
+        // (`lock_gone_on_evidence`), before a broadcast and after; without it the release is sent,
+        // and its typed revert says what happened.
         let mut broadcast = false;
+        // The nonce our release last went out at (see `lock_gone_on_evidence`).
+        let mut sent: Option<u64> = None;
 
         for attempt in 1..=MAX_ATTEMPTS {
             // Already released? (a prior attempt landed on a node whose receipt we
             // never saw, or the job was reopened/slashed out from under us). Our lock
             // being gone means our collateral is free — treat as success.
             if let Ok(view) = self.get_job_status_view(job_id).await {
-                if view.prover != self.address && (broadcast || view.prover != Address::ZERO) {
+                if self.lock_gone_on_evidence(job_id, &view, seen, sent).await {
                     // Our lock is gone (release landed, or the fulfill we were displacing
                     // actually mined) → success. Recycle the nonce; self-heals if consumed.
                     self.abort_nonce(nonce);
@@ -1426,16 +2464,11 @@ impl ChainClient {
                 let _guard = self.tx_lock.lock().await;
                 let mut tx = fulfill.releaseJob(job_id).nonce(nonce);
                 if base_max_fee > 0 {
-                    // [H2/M5] Once we're displacing a stuck same-nonce tx, seed escalation
+                    // Once we're displacing a stuck same-nonce tx, seed escalation
                     // ABOVE fulfill's ceiling (it can only be evicted by a strictly higher
-                    // fee). Otherwise escalate normally [M7].
-                    let headroom = if displacing {
-                        FULFILL_ESCALATION_HEADROOM
-                    } else {
-                        0
-                    };
+                    // fee). Otherwise escalate normally.
                     let (tip, seed_max_fee) =
-                        escalated_fees(base_tip, base_max_fee, attempt + headroom);
+                        release_rung_fees(base_tip, base_max_fee, attempt, self.fee_ceiling);
                     // Lift over anything WE already broadcast at this nonce — mirroring
                     // claim_job. Without it this ladder is OPEN LOOP: it tops out at
                     // attempt 5 + headroom 5 => 1.15^9 ~= 3.52x base, while a nonce-gap heal
@@ -1445,8 +2478,21 @@ impl ChainClient {
                     // never reached the wire, silently, losing the collateral at the lock
                     // deadline. This is what made every heal-vs-release collision terminal
                     // rather than recoverable.
-                    let max_fee = seed_max_fee;
-                    let Some((tip, max_fee)) = fees_over_floor(self, nonce, tip, max_fee) else {
+                    // Bid against the key-wide ceiling with NO reserved rungs, displacing or not: the
+                    // fulfil ladder stopped RELEASE_DISPLACE_RUNGS rungs below it precisely so this bid
+                    // always exists, and a release held out past D+G is a slash.
+                    let bid_pair = match job_path_bid(
+                        self.nonce_fee_floor_state(nonce),
+                        tip,
+                        seed_max_fee,
+                        self.fee_ceiling,
+                        0,
+                        affordable,
+                    ) {
+                        JobBid::Send(t, m) => Some((t, m)),
+                        JobBid::Hold(..) | JobBid::Exhausted => None,
+                    };
+                    let Some((tip, max_fee)) = bid_pair else {
                         // Cap exhausted: no strictly-higher bid exists, so every send from
                         // here is rejected "replacement underpriced". Stop now rather than
                         // burning the attempt ladder against a wall.
@@ -1503,9 +2549,10 @@ impl ChainClient {
 
             let pending = match send_result {
                 Ok(p) => {
-                    broadcast = true; // [D1] a ZERO read may now legitimately be our release
-                                      // The read above is HALF the mechanism; without this write it is a
-                                      // regression. With a floor present, `max()` pins every attempt to the
+                    broadcast = true; // a ZERO read may now legitimately be our release
+                    sent = Some(nonce);
+                                      // The read above is HALF the mechanism; without this write it is
+                                      // incomplete. With a floor present, `max()` pins every attempt to the
                                       // same bid, so a self-displacing re-broadcast after a receipt timeout is
                                       // rejected `is_same_nonce_pending` and all five rungs burn identically.
                                       // Writing on success restores strict monotonicity — exactly how claim_job
@@ -1527,7 +2574,7 @@ impl ChainClient {
                     // so it could never mine before the deadline — the exact stranding we
                     // are trying to avoid.
                     if is_same_nonce_pending(&msg) {
-                        displacing = true; // [M7] now escalate above fulfill's ceiling
+                        displacing = true; // now escalate above fulfill's ceiling
                         tracing::warn!(
                             "releaseJob replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {msg} \
                              — bumping tip, keeping nonce"
@@ -1549,25 +2596,25 @@ impl ChainClient {
                     }
                     if is_nonce_error(&msg) {
                         tracing::warn!("releaseJob nonce error (attempt {attempt}/{MAX_ATTEMPTS}): {msg} — re-syncing");
-                        // [nonce-review] Recycle the abandoned nonce so a "nonce too high"
+                        // Recycle the abandoned nonce so a "nonce too high"
                         // (a gap below us) doesn't leak it; resync then prunes it from the
                         // gap set if it was actually consumed ("nonce too low").
                         let rejected = nonce;
                         self.abort_nonce(nonce);
                         self.resync_nonce().await.ok();
-                        // [M3] Don't abort the whole deadline-critical release on a single
+                        // Don't abort the whole deadline-critical release on a single
                         // transient re-sync failure; keep the attempt budget and retry.
                         let mut progressed = false;
                         match self.reserve_nonce().await {
                             Ok(n) => {
                                 progressed = n != rejected;
                                 nonce = n;
-                                // [M7] A FRESH nonce has nothing of ours to displace, so the
+                                // A FRESH nonce has nothing of ours to displace, so the
                                 // fulfill-ceiling headroom must not carry over. Leaving it set
                                 // made attempt 2 bid `escalated_fees(base, 2 + 5)` ~= 2.31x
                                 // base against an empty nonce — overpaying on a
-                                // deadline-critical tx for no reason, and exactly what the
-                                // [M7] note at the top of this function forbids. `displacing`
+                                // deadline-critical tx for no reason, and exactly the overpay
+                                // the note at the top of this function forbids. `displacing`
                                 // is re-armed by the `is_same_nonce_pending` arm above if the
                                 // new nonce turns out to be occupied too.
                                 //
@@ -1597,6 +2644,9 @@ impl ChainClient {
                             .await;
                         }
                     } else {
+                        if is_funds_refusal(&msg) {
+                            self.note_funds_short();
+                        }
                         tracing::warn!(
                             "releaseJob send failed (attempt {attempt}/{MAX_ATTEMPTS}): {msg}"
                         );
@@ -1612,9 +2662,11 @@ impl ChainClient {
                 "releaseJob tx sent (attempt {attempt}/{MAX_ATTEMPTS}): {tx_hash:?}, waiting for receipt..."
             );
 
-            // [RPC #1] Poll for the receipt (no heartbeat watcher). None folds the old
-            // timeout + RPC-error arms into the on-chain state poll below.
-            match crate::tx::await_receipt(&*self.provider, tx_hash, TX_RECEIPT_TIMEOUT).await {
+            // Poll for the receipt (no heartbeat watcher). None folds the old
+            // timeout + RPC-error arms into the on-chain state poll below. Short rungs (~3 blocks):
+            // the release window closes at D+G, and several fee-bumped same-nonce rungs must fit in
+            // the margin the lifecycle reserves for it (RELEASE_LADDER_SECS).
+            match crate::tx::await_receipt(&*self.provider, tx_hash, RELEASE_RECEIPT_WAIT).await {
                 Some(receipt) => {
                     if receipt.status() {
                         self.commit_nonce(nonce);
@@ -1625,21 +2677,48 @@ impl ChainClient {
                         );
                         return Ok(());
                     }
-                    // Genuine revert. releaseJob reverts "At or past deadline" once the
-                    // lock deadline passes — retrying won't help, and the reverted tx
-                    // consumed the nonce on-chain, so re-sync and bail.
+                    // Genuine revert — retrying won't help, and the reverted tx consumed the nonce
+                    // on-chain. Replay it at its block for the typed reason: "At or past deadline"
+                    // (job-local time reached D+G — only a slash frees the collateral now) is LATE,
+                    // `JobNotLocked`/`NotJobProver` is STALE (the lock is already gone).
                     self.commit_nonce(nonce); // mined revert consumed the nonce
-                    anyhow::bail!("releaseJob transaction reverted (tx {tx_hash:?})");
+                    let receipt_block = receipt.block_number.unwrap_or_default();
+                    let sim = fulfill
+                        .releaseJob(job_id)
+                        .from(self.address)
+                        .block(BlockId::number(receipt_block))
+                        .call()
+                        .await;
+                    let (class, error_name) = match &sim {
+                        Err(e) => match crate::revert::revert_data_of(e) {
+                            Some(data) => {
+                                let d = crate::revert::decode(&data);
+                                (crate::revert::classify_fulfil(&d), d.name())
+                            }
+                            None => (FulfilClass::Unknown, String::new()),
+                        },
+                        Ok(_) => (FulfilClass::Unknown, String::new()),
+                    };
+                    return Err(FulfilFailure {
+                        class,
+                        reason: format!(
+                            "releaseJob {tx_hash:?} reverted: {}",
+                            if error_name.is_empty() { "reason unavailable" } else { error_name.as_str() }
+                        ),
+                        error_name,
+                        published: true,
+                    }
+                    .into());
                 }
                 None => {
                     tracing::warn!(
                         "releaseJob receipt not confirmed (attempt {attempt}/{MAX_ATTEMPTS}, tx {tx_hash:?}); \
                          polling on-chain state before re-broadcast"
                     );
-                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    let deadline = std::time::Instant::now() + RELEASE_STATE_POLL;
                     while std::time::Instant::now() < deadline {
                         if let Ok(view) = self.get_job_status_view(job_id).await {
-                            if view.prover != self.address {
+                            if self.lock_gone_on_evidence(job_id, &view, seen, sent).await {
                                 // ABORT, not commit: "our lock is gone" is NOT uniquely our
                                 // doing — a keeper's slashAndReopen or another prover's
                                 // reclaim clears it too, in which case our releaseJob at
@@ -1657,104 +2736,192 @@ impl ChainClient {
                         }
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
+                    // A sender's txs mine strictly in nonce order, so a release cannot land behind a
+                    // lower pending nonce of ours whatever it bids — and a hold-out only has to outbid
+                    // that lower tx. From the second unconfirmed rung, displace the blocker with the
+                    // healer's high-fee self-transfer: its owner re-syncs to a fresh nonce on "nonce
+                    // too low", while this lock's release has nothing after it but a slash.
+                    // Only a blocker NO live task owns is displaced (one we abandoned, or a tx a
+                    // previous run left pending): a sibling's live fulfil or release — possibly the
+                    // most urgent lock's — climbs its own ladder and must never be evicted by ours.
+                    if attempt >= 2 {
+                        if let Ok(Some(hole)) = self.nonce_gap_safe_to_fill().await {
+                            if hole < nonce {
+                                tracing::warn!(
+                                    "releaseJob at nonce {nonce} is queued behind our abandoned nonce \
+                                     {hole} — filling it"
+                                );
+                                if let Err(e) = self
+                                    .heal_owned_nonce_gap_at(hole, Duration::from_secs(20))
+                                    .await
+                                {
+                                    tracing::warn!("filling nonce {hole} failed: {e:#}");
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
         // Final state check before declaring failure — our lock may have cleared
-        // on the very last broadcast whose receipt we didn't catch. Same [D1] rule: if every
+        // on the very last broadcast whose receipt we didn't catch. Same rule: if every
         // attempt failed at `send` (persistent 429s) nothing was broadcast, so a ZERO read
         // here is UNKNOWN, not success.
         if let Ok(view) = self.get_job_status_view(job_id).await {
-            if view.prover != self.address && (broadcast || view.prover != Address::ZERO) {
+            if self.lock_gone_on_evidence(job_id, &view, seen, sent).await {
                 self.abort_nonce(nonce);
                 tracing::info!("Job {} released (confirmed on final check)", job_id);
                 return Ok(());
             }
         }
-        self.abort_nonce(nonce); // gave up; release didn't confirm → recycle the gap
+        // Gave up without confirmation. A nonce that carries our broadcast release may still mine it:
+        // leave it visible to the healer but do NOT offer it to reservers, whose next claim or fulfil
+        // would out-bid and evict the very tx that can still save this lock.
+        if broadcast {
+            self.note_nonce_unresolved(nonce);
+        } else {
+            self.abort_nonce(nonce);
+        }
         anyhow::bail!("releaseJob failed after {MAX_ATTEMPTS} attempts (RPC may be dropping txs)")
     }
 
-    /// Atomic claim-and-fulfill with EIP-712 signature.
-    ///
-    /// UNUSED as of this writing (the lifecycle claims and fulfills as separate steps).
-    /// Same caveat as [`Self::fulfill_job_hashed`]: it bypasses the shared `next_nonce`
-    /// cache and the `escalated_fees` re-broadcast logic, so harden it (reserve/commit/
-    /// invalidate + escalated fees) before wiring it into the concurrent lifecycle.
-    pub async fn claim_and_fulfill_job(
-        &self,
-        job_id: B256,
-        descriptor: JobDescriptor,
-        public_values: Bytes,
-        proof_bytes: Bytes,
-        prover: Address,
-        prover_signature: Bytes,
-        deadline: U256,
-    ) -> Result<()> {
-        let fulfill = IHemiProveFulfill::new(self.hemi_prove, &*self.provider);
-        let tx = fulfill.claimAndFulfillJob(
-            job_id,
-            descriptor,
-            public_values,
-            proof_bytes,
-            prover,
-            prover_signature,
-            deadline,
-        );
-        let pending = tx
-            .send()
-            .await
-            .context("Failed to send claimAndFulfillJob tx")?;
-        let tx_hash = *pending.tx_hash();
-        tracing::info!(
-            "claimAndFulfillJob tx sent: {:?}, waiting for receipt...",
-            tx_hash
-        );
-        let receipt = tokio::time::timeout(TX_RECEIPT_TIMEOUT, pending.get_receipt())
-            .await
-            .with_context(|| format!("claimAndFulfillJob receipt timed out after {TX_RECEIPT_TIMEOUT:?} (tx {tx_hash:?} may still be pending)"))?
-            .context("Failed to get claimAndFulfillJob receipt")?;
+}
 
-        if !receipt.status() {
-            anyhow::bail!("claimAndFulfillJob transaction reverted");
-        }
+#[cfg(test)]
+mod h4_tests {
+    use super::{job_fulfilled_topic0, log_is_authentic_fulfilled};
+    use alloy::primitives::{Address, B256};
 
-        tracing::info!(
-            "Job claim+fulfill: {} tx: {:?}",
-            job_id,
-            receipt.transaction_hash
+    #[test]
+    fn job_fulfilled_topic0_matches_binding_signature() {
+        // Pin the hand-computed topic0 to the generated ABI binding's signature hash,
+        // mirroring the monitor's own test. If the JobFulfilled event signature ever drifts, this
+        // fails in CI instead of silently making the fulfilled-event check see every real fulfill as
+        // "not fulfilled" (which would release genuinely-fulfilled jobs).
+        use alloy::sol_types::SolEvent;
+        assert_eq!(
+            job_fulfilled_topic0(),
+            zkminer_contracts::bindings::IHemiProveFulfill::JobFulfilled::SIGNATURE_HASH
         );
-        Ok(())
+    }
+
+    #[test]
+    fn authentic_only_when_router_emitted() {
+        let router = Address::repeat_byte(0xAA);
+        let attacker = Address::repeat_byte(0xBB);
+        let job = B256::repeat_byte(0x11);
+        let good_topics = vec![job_fulfilled_topic0(), job];
+
+        // Router + correct topics → authentic.
+        assert!(log_is_authentic_fulfilled(router, &good_topics, job, router));
+        // The forgery: a submitter callback emits an identical log from ITS OWN address.
+        // Must NOT be accepted.
+        assert!(!log_is_authentic_fulfilled(attacker, &good_topics, job, router));
+        // Router but a different jobId → not for us.
+        assert!(!log_is_authentic_fulfilled(
+            router,
+            &[job_fulfilled_topic0(), B256::repeat_byte(0x22)],
+            job,
+            router
+        ));
+        // Router but wrong event (topic0) → not JobFulfilled.
+        assert!(!log_is_authentic_fulfilled(
+            router,
+            &[B256::repeat_byte(0x99), job],
+            job,
+            router
+        ));
+        // No topics at all → not authentic.
+        assert!(!log_is_authentic_fulfilled(router, &[], job, router));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        escalated_fees, is_nonce_error, is_rate_limit_error, is_same_nonce_pending,
-        nonce_retry_backoff, MAX_TX_ATTEMPTS, NONCE_RETRY_UNIT, RELEASE_NONCE_RETRY_UNIT,
+        escalated_fees, fulfill_gas_formula, is_nonce_error, is_rate_limit_error,
+        is_same_nonce_pending, nonce_retry_backoff, MAX_TX_ATTEMPTS, NONCE_RETRY_UNIT,
+        RELEASE_NONCE_RETRY_UNIT,
     };
+    use super::super::programs::sanitize_log;
     use std::time::Duration;
 
+    // The fulfil gas limit must clear the router's preflight (gasleft() >= 4.6M + callback) with the
+    // repo's documented terms (script/lib/FulfillGas.sol). A 5M flat limit is too low.
+    #[test]
+    fn fulfil_gas_formula_matches_the_repo_and_clears_the_preflight() {
+        // Default callback (stored 0 => 200k), 1 KB calldata, empty journal: the handoff's "~5.6M".
+        let g = fulfill_gas_formula(0, 1024, 0);
+        assert_eq!(g, 4_600_000 + 200_000 + 250_000 + 16 * 1024 + 500_000);
+        assert!(g > 5_000_000, "5,000,000 is too low (handoff §7 step 7)");
+        // The preflight floor (4.6M + callback) is always cleared, for any stored callback limit.
+        for cb in [0u32, 50_000, 500_000] {
+            let eff = if cb == 0 { 200_000 } else { cb as u64 };
+            assert!(fulfill_gas_formula(cb, 0, 0) > 4_600_000 + eff);
+        }
+        // Journal bytes are charged at 8 gas each.
+        assert_eq!(
+            fulfill_gas_formula(0, 0, 32_768) - fulfill_gas_formula(0, 0, 0),
+            8 * 32_768
+        );
+    }
+
+    // A hostile revert reason (surfaced by a preflighting RPC) is logged only through
+    // `sanitize_log`: lock in that it strips escape/CRLF/bidi bytes.
+    #[test]
+    fn hostile_revert_text_is_sanitized_for_the_operator_console() {
+        let hostile = "execution reverted: \x1b[2J\x1b]0;pwned\x07evil\r\nforged log line\u{202e}reversed";
+        let safe = sanitize_log(hostile);
+        assert!(!safe.contains('\x1b'), "ANSI/OSC escapes stripped");
+        assert!(!safe.contains('\r') && !safe.contains('\n'), "CRLF stripped (no forged lines)");
+        assert!(!safe.contains('\u{202e}'), "bidi override stripped (no Trojan-Source reorder)");
+    }
+
+    #[test]
+    fn fulfill_send_error_is_classified_on_raw_but_logged_sanitized() {
+        // The real-send `fulfill_job` error path (like the simulation path) classifies the send
+        // error on the RAW string but LOGS the sanitized form. Sanitizing before classification
+        // must not change the nonce/replacement verdict (those phrases are plain ASCII), and the
+        // logged form must carry no terminal-escape / CRLF / bidi bytes a hostile revert reason
+        // (surfaced by a preflighting RPC) could smuggle in.
+        let hostile_nonce =
+            "nonce too low\x1b[2J\x1b]0;pwned\x07\r\nforged log line\u{202e}reversed";
+        // Classification runs on the raw string and still sees the nonce phrase.
+        assert!(is_nonce_error(hostile_nonce), "classification sees the raw nonce phrase");
+        // The display form is injection-safe.
+        let safe = sanitize_log(hostile_nonce);
+        assert!(!safe.contains('\x1b'), "ANSI/OSC escapes stripped from the logged send error");
+        assert!(!safe.contains('\r') && !safe.contains('\n'), "CRLF stripped (no forged lines)");
+        assert!(!safe.contains('\u{202e}'), "bidi override stripped");
+        assert!(safe.contains("nonce too low"), "the human-readable reason survives");
+        // A crafted catch-all revert reason: not a nonce/replacement phrase, so it falls to the
+        // plain warn! sink — which now logs the sanitized form.
+        let hostile_generic = "execution reverted: \x1b]0;evil\x07\r\nFAKE";
+        assert!(!is_nonce_error(hostile_generic));
+        assert!(!is_same_nonce_pending(hostile_generic));
+        let safe_generic = sanitize_log(hostile_generic);
+        assert!(!safe_generic.contains('\x1b') && !safe_generic.contains('\n'));
+    }
+
     /// The real ladder length and the real units, read from production rather than restated —
-    /// the previous version hard-coded `5` and `100ms`, so lowering either in production was
-    /// invisible to every assertion below.
+    /// hard-coding `5` and `100ms` here would make lowering either in production invisible to
+    /// every assertion below.
     const LADDER: u32 = MAX_TX_ATTEMPTS;
 
     /// The rungs production actually PAYS. The final attempt's wait is skipped (the loop is about
-    /// to exit, so it buys nothing and delays the give-up), and summing `1..=LADDER` therefore
-    /// described a ladder that does not exist — by 1.5x, which was enough to make three of these
-    /// bounds pass against figures 1.5x smaller than they asserted.
+    /// to exit, so it buys nothing and delays the give-up), so summing `1..=LADDER` would describe
+    /// a ladder that does not exist — 1.5x too long — and a bound checked against it would be too
+    /// loose.
     fn paid_rungs() -> impl Iterator<Item = u32> {
         1..LADDER
     }
 
     /// The invariant: a nonce-error ladder cannot complete instantly.
     ///
-    /// This is the measurable property the 2026-08-14 wedge violated — the same-nonce arms
-    /// were fixed and measured (18.85 µs with the bug vs 7.36 s without), and all four
-    /// `is_nonce_error` arms were left on the microsecond side of it.
+    /// This is the measurable property a nonce-retry livelock violates: without a backoff the
+    /// ladder completes in microseconds (measured ~18.85 µs) instead of seconds (~7.36 s),
+    /// burning every attempt against an unchanged node view.
     #[test]
     fn a_nonce_error_ladder_cannot_burn_instantly() {
         let unit = NONCE_RETRY_UNIT;
@@ -1763,15 +2930,15 @@ mod tests {
         let stuck: Duration = paid_rungs()
             .map(|a| nonce_retry_backoff(a, false, unit))
             .sum();
-        // 250+500+750+1000 = 2.5s. The previous bound was 3_500ms, which only held because the
-        // sum included a fifth rung production skips.
+        // 250+500+750+1000 = 2.5s across the four rungs production pays (the final attempt's
+        // wait is skipped).
         assert!(
             stuck >= Duration::from_millis(2_400),
             "a stuck ladder must take seconds, not microseconds: {stuck:?}"
         );
 
         // And the case a lagging RPC actually produces: every attempt moves the nonce on by
-        // one and fails just as fast. Zero backoff here would reproduce the original burn
+        // one and fails just as fast. Zero backoff here would reproduce the microsecond burn
         // while reporting "progress", so this must still be bounded away from instant.
         let walking: Duration = paid_rungs()
             .map(|a| nonce_retry_backoff(a, true, unit))
@@ -1835,8 +3002,8 @@ mod tests {
     }
 
     /// The "progressing" ladder must grow too. A flat delay capped it at ~250ms, which on a
-    /// chain with multi-second blocks gives a lagging replica no chance to catch up — and the
-    /// lagging replica is the case the doc names as the one that actually happens.
+    /// chain with multi-second blocks gives a lagging replica no chance to catch up — and a
+    /// lagging replica is the case that actually happens.
     #[test]
     fn a_progressing_ladder_still_grows() {
         let mut prev = Duration::ZERO;
@@ -1855,34 +3022,6 @@ mod tests {
         );
     }
 
-    /// [cheap-1] A FRESH nonce has nothing of ours to displace, so the fulfill-ceiling
-    /// headroom must not carry over from a previous nonce. Leaving `displacing` set made
-    /// attempt 2 bid `escalated_fees(base, 2 + FULFILL_ESCALATION_HEADROOM)` against an empty
-    /// nonce — the overpay [M7] forbids. This pins the arithmetic that made it visible.
-    #[test]
-    fn headroom_must_not_apply_to_a_fresh_nonce() {
-        let (base_tip, base_max) = (1_000u128, 10_000u128);
-        // attempt 2 on a nonce we ARE displacing: 5 rungs of headroom on top.
-        let (_, displacing_bid) =
-            escalated_fees(base_tip, base_max, 2 + super::FULFILL_ESCALATION_HEADROOM);
-        // attempt 2 on a fresh nonce: no headroom.
-        let (_, fresh_bid) = escalated_fees(base_tip, base_max, 2);
-        // Pin the VALUES, not an inequality. `escalated_fees` increments by at least 1 per
-        // step, so `displacing_bid > fresh_bid` is a theorem of the function under test — it
-        // would hold no matter what FIX 1 did, which is the definition of a tautological
-        // assertion. (The previous `> fresh_bid * 2` was worse still: it passed by 0.56% and
-        // went red at HEADROOM = 4, hard-pinning a constant this test does not own.)
-        assert_eq!(
-            fresh_bid, 11_500,
-            "attempt 2, no headroom: exactly one 15% rung"
-        );
-        assert_eq!(
-            displacing_bid, 23_128,
-            "attempt 2 + 5 rungs of headroom — this is what a fresh nonce would have been \
-             overcharged before `displacing` was reset"
-        );
-    }
-
     /// attempt 1 is the initial send (not a replacement) → base fees unchanged.
     #[test]
     fn escalated_fees_first_attempt_is_base() {
@@ -1891,7 +3030,7 @@ mod tests {
     }
 
     /// Every re-broadcast must clear geth's 12.5% same-nonce replacement floor on BOTH
-    /// fields — including the LAST attempt (the additive schedule failed here at 9.35%).
+    /// fields — including the LAST attempt (an additive schedule would drop to 9.35% here).
     #[test]
     fn escalated_fees_clears_replacement_floor_every_attempt() {
         // Large base so integer truncation is negligible; low tip vs high max_fee is
@@ -1977,7 +3116,7 @@ mod tests {
 
     #[test]
     fn is_rate_limit_error_classification() {
-        // [#4] The recovery chunk classifier must recognize the endpoint's 429s so it
+        // The recovery chunk classifier must recognize the endpoint's 429s so it
         // defers (marks the chunk None) instead of fanning out per-job.
         for msg in [
             "HTTP error 429 with body: ...",
@@ -2005,7 +3144,7 @@ mod tests {
 
     #[test]
     fn is_nonce_error_classification() {
-        // [H2] Only genuine nonce mismatch → is_nonce_error (re-sync). Pending-at-nonce
+        // Only genuine nonce mismatch → is_nonce_error (re-sync). Pending-at-nonce
         // errors are is_same_nonce_pending (keep nonce + escalate), NOT is_nonce_error.
         for msg in [
             "nonce too low",
@@ -2085,7 +3224,7 @@ mod fees_over_floor_tests {
         assert_eq!(got.1, 9_999);
     }
 
-    /// AT the cap: exhausted. This is the boundary the livelock sat on.
+    /// AT the cap: exhausted. This is the boundary where re-bidding would otherwise livelock.
     #[test]
     fn exactly_at_the_cap_is_exhausted() {
         assert_eq!(fees_over_floor_state(st(8_000, 8_000), 0, 100), None);
@@ -2099,7 +3238,7 @@ mod fees_over_floor_tests {
 
     /// THE LIVELOCK, stated as a property: whatever this returns must be strictly
     /// greater than what is already on the wire. Returning an equal bid is precisely
-    /// what produced 327 rejected sends over 4h24m on 2026-08-14.
+    /// what gets rejected forever and produces a run of futile sends that never progress.
     #[test]
     fn a_returned_bid_always_strictly_exceeds_the_resident() {
         for broadcast in [1u128, 999, 1_000, 4_000, 7_999, 8_000, 8_332, 100_000] {
@@ -2113,5 +3252,155 @@ mod fees_over_floor_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod job_path_bid_tests {
+    use super::*;
+    use crate::nonce::FeeFloorState;
+
+    fn st(broadcast: (u128, u128), cap: u128) -> Option<FeeFloorState> {
+        Some(FeeFloorState {
+            floor: (broadcast.0.min(cap), broadcast.1.min(cap)),
+            broadcast,
+            cap,
+            exhausted: broadcast.1 >= cap,
+        })
+    }
+
+    /// The key-wide ceiling lifts the 8x-seed ratchet cap (handoff §10): a fulfil whose nonce cap is
+    /// tiny keeps escalating up to the ceiling's reserved limit.
+    #[test]
+    fn the_ceiling_lifts_a_low_ratchet_cap() {
+        // Nonce cap 8,000 is exhausted by a broadcast of 8,000, but the ceiling is 4,000,000.
+        match job_path_bid(st((1_000, 8_000), 8_000), 1, 2, 4_000_000, RELEASE_DISPLACE_RUNGS, u128::MAX) {
+            JobBid::Send(t, m) => {
+                assert_eq!(m, 9_000, "12.5% over the resident");
+                assert!(t <= m);
+            }
+            other => panic!("expected a raise, got {other:?}"),
+        }
+    }
+
+    /// The fulfil ladder stops RELEASE_DISPLACE_RUNGS rungs below the cap and HOLDS there (re-publishing
+    /// the bid already on the wire) — and from that point the same-nonce release can always out-bid it.
+    #[test]
+    fn a_held_fulfil_always_leaves_the_release_room_to_displace_it() {
+        let cap = 1_000_000u128;
+        let mut resident = (10u128, 1_000u128);
+        let mut held = None;
+        for _ in 0..200 {
+            match job_path_bid(st(resident, 8_000), resident.0, resident.1, cap, RELEASE_DISPLACE_RUNGS, u128::MAX) {
+                JobBid::Send(t, m) => {
+                    assert!(m > resident.1, "every raise strictly exceeds the resident");
+                    resident = (t, m);
+                }
+                JobBid::Hold(t, m) => {
+                    assert_eq!((t, m), resident, "a hold re-publishes exactly what is on the wire");
+                    held = Some(resident);
+                    break;
+                }
+                JobBid::Exhausted => panic!("the fulfil ladder must hold, never exhaust, once it has a resident"),
+            }
+        }
+        let held = held.expect("the ladder reaches its hold point");
+        assert!(held.0 <= cap / 9 * 8 / 9 * 8, "the fulfil's TIP holds below the reserved limit");
+        // The release (no reserved rungs) displaces the held fulfil, and has a second rung too.
+        let JobBid::Send(t1, m1) = job_path_bid(st(held, 8_000), 0, 0, cap, 0, u128::MAX) else {
+            panic!("the release must be able to displace a held fulfil");
+        };
+        assert!(t1 > held.0 && m1 > held.1 && t1 <= cap);
+        assert!(
+            matches!(job_path_bid(st((t1, m1), 8_000), 0, 0, cap, 0, u128::MAX), JobBid::Send(t2, _) if t2 > t1),
+            "a second release rung must fit too"
+        );
+    }
+
+    /// The release itself stops only at the cap: a raise it cannot fit is Exhausted (never a Hold, which
+    /// would re-send a bid the node rejects as underpriced).
+    #[test]
+    fn the_release_exhausts_only_at_the_cap() {
+        assert_eq!(job_path_bid(st((950_000, 960_000), 8_000), 0, 0, 1_000_000, 0, u128::MAX), JobBid::Exhausted);
+    }
+
+    /// A high fresh estimate (a block-filler inflates `eth_maxPriorityFeePerGas`) is clamped to the
+    /// limit: it must neither freeze the ladder at its old bid nor stop a release being sent.
+    #[test]
+    fn a_seed_above_the_limit_is_clamped_not_treated_as_the_ceiling() {
+        let cap = 1_000_000u128;
+        let limit = cap / 9 * 8 / 9 * 8;
+        assert_eq!(
+            job_path_bid(st((10, 1_000), 8_000), 5_000_000, 5_000_000, cap, RELEASE_DISPLACE_RUNGS, u128::MAX),
+            JobBid::Send(limit, 5_000_000)
+        );
+        assert_eq!(
+            job_path_bid(st((10, 1_000), 8_000), 5_000_000, 5_000_000, cap, 0, u128::MAX),
+            JobBid::Send(cap, 5_000_000)
+        );
+    }
+
+    /// The first send on a nonce is clamped too: an unclamped seed is refused by the node (balance or
+    /// txfeecap) on every rung, and a refused send records nothing to climb from.
+    #[test]
+    fn a_first_send_is_clamped_to_the_ceiling_and_the_balance() {
+        let cap = 1_000_000u128;
+        let limit = cap / 9 * 8 / 9 * 8;
+        assert_eq!(
+            job_path_bid(None, 5_000_000, 5_000_000, cap, RELEASE_DISPLACE_RUNGS, u128::MAX),
+            JobBid::Send(limit, 5_000_000)
+        );
+        assert_eq!(
+            job_path_bid(None, 5_000_000, 5_000_000, cap, RELEASE_DISPLACE_RUNGS, 3_000),
+            JobBid::Send(3_000, 3_000)
+        );
+        assert_eq!(job_path_bid(None, 500, 900, cap, 0, 700), JobBid::Send(500, 700));
+        assert_eq!(job_path_bid(None, 5, 9, cap, 0, u128::MAX), JobBid::Send(5, 9));
+    }
+
+    /// The release climbs from the normal start price to the ceiling across its rungs (a hold-out at a
+    /// slightly higher tip stops being cheap), and a release that mines at once pays the start price.
+    #[test]
+    fn release_rungs_climb_from_the_start_price_to_the_ceiling() {
+        let (tip0, max0) = (10_000_000u128, 10_000_506u128);
+        let ceiling = 4_000_000_000u128;
+        assert_eq!(release_rung_fees(tip0, max0, 1, ceiling), (tip0, max0));
+        let mut prev = tip0;
+        for attempt in 2..=MAX_TX_ATTEMPTS {
+            let (t, m) = release_rung_fees(tip0, max0, attempt, ceiling);
+            assert!(t > prev.saturating_add(prev / 8), "each rung clears the replacement margin");
+            assert!(m >= t);
+            prev = t;
+        }
+        let (top, _) = release_rung_fees(tip0, max0, MAX_TX_ATTEMPTS, ceiling);
+        assert!(top >= ceiling / 100 * 99 && top <= ceiling, "the last rung reaches the ceiling: {top}");
+        // A start price at or above the ceiling never panics or inverts.
+        let (t, m) = release_rung_fees(ceiling * 2, ceiling * 2, 3, ceiling);
+        assert!(t <= m);
+    }
+
+    /// A high maxFee from one quote (a fallback after a failed header read) must not freeze the TIP: the
+    /// ceiling bounds the tip, maxFee only the balance.
+    #[test]
+    fn a_high_max_fee_quote_does_not_freeze_the_tip() {
+        let ceiling = 4_000_000_000u128;
+        let mut resident = (10_000_000u128, 2_010_000_000u128);
+        for _ in 0..30 {
+            match job_path_bid(st(resident, 8 * 2_010_000_000), resident.0, resident.1, ceiling, RELEASE_DISPLACE_RUNGS, u128::MAX) {
+                JobBid::Send(t, m) => resident = (t, m),
+                other => panic!("must keep climbing while the tip is far below the ceiling: {other:?}"),
+            }
+        }
+        assert!(resident.0 > 300_000_000, "tip climbed: {}", resident.0);
+    }
+
+    /// A rung the balance cannot fund is refused by the node, never pooled: the fulfil holds at what is
+    /// already on the wire instead (handoff §10: ceiling = min(TIP_CEILING, balance / gasLimit, ...)).
+    #[test]
+    fn the_fulfil_holds_below_what_the_balance_can_fund() {
+        assert_eq!(
+            job_path_bid(st((10, 1_000), 8_000), 0, 0, 4_000_000, RELEASE_DISPLACE_RUNGS, 1_100),
+            JobBid::Hold(10, 1_000)
+        );
     }
 }

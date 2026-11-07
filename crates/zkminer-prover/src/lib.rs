@@ -8,8 +8,6 @@ pub mod memory;
 pub mod registry;
 pub mod worker;
 
-#[cfg(feature = "openvm")]
-pub mod openvm;
 #[cfg(feature = "risc0")]
 pub mod risc0;
 #[cfg(feature = "sp1")]

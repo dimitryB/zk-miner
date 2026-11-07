@@ -10,7 +10,7 @@ use zkminer_chain::staking::ProverStatistics;
 use zkminer_prover::engine::{backend_sources, BackendSource};
 
 use crate::hardware::{fmt_bytes, GpuInfo, GpuVendor};
-use crate::state::{LogLevel, MinerJobStatus, MinerState};
+use crate::state::{LogLevel, MinerJobStatus, MinerState, TrackedJob};
 use crate::theme;
 
 pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
@@ -329,7 +329,7 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &MinerState) {
         Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Length(12),
-        Constraint::Length(6),
+        Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(12),
         Constraint::Min(18),
@@ -340,21 +340,71 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &MinerState) {
     f.render_widget(table, area);
 }
 
+/// The Temp cell: the core reading, then the hottest VRAM sensor as `V<n>°` when the card reports one
+/// (a B580 has twelve VRAM channel sensors, which run hotter than the package under load). Each is
+/// colored on its own scale, GDDR being rated hotter than the core.
+fn temp_cell(gpu: &GpuInfo) -> Line<'static> {
+    let heat = |t: f64, warm: f64, hot: f64| {
+        Style::default().fg(if t >= hot {
+            theme::red()
+        } else if t >= warm {
+            theme::yellow()
+        } else {
+            theme::green()
+        })
+    };
+    let mut spans = vec![match gpu.temp_junction_c.or(gpu.temp_edge_c) {
+        Some(t) if gpu.temp_mem_c.is_some() => {
+            Span::styled(format!("{t:.0}°"), heat(t, 75.0, 90.0))
+        }
+        Some(t) => Span::styled(format!("{t:.0}°C"), heat(t, 75.0, 90.0)),
+        None => Span::styled("N/A", theme::dim()),
+    }];
+    if let Some(m) = gpu.temp_mem_c {
+        spans.push(Span::styled(format!(" V{m:.0}°"), heat(m, 85.0, 95.0)));
+    }
+    Line::from(spans)
+}
+
+/// After a card's name, why it is clocking itself down (`▼ THERMAL,PL1`); nothing when it is not.
+fn throttle_marker(reasons: &[String]) -> String {
+    if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(" ▼ {}", reasons.join(","))
+    }
+}
+
+/// A clock for the GPU table: "—" for 0, which the readers use for "not reported".
+fn fmt_mhz(mhz: u32) -> String {
+    if mhz == 0 {
+        "—".to_string()
+    } else {
+        format!("{mhz}MHz")
+    }
+}
+
+/// The job a card's row shows: the one proving on it, else the one nearest to it among those
+/// attributed to it (submitting, then queued, then any other).
+///
+/// Not the first job attributed to the card. A job keeps its card after its proof ends, through
+/// "Submitting…" and "Done", while look-ahead has the card's next job already proving, so the first
+/// match was often a finished job: the row read "Done" or "Submitting…" over a card at 100%.
+fn card_job<'a>(jobs: &'a [TrackedJob], pci_bus_id: &str) -> Option<&'a TrackedJob> {
+    let rank = |job: &TrackedJob| match job.status {
+        MinerJobStatus::Proving { .. } => 0,
+        MinerJobStatus::Submitting => 1,
+        MinerJobStatus::Queued => 2,
+        MinerJobStatus::Fulfilled { .. } => 4,
+        _ => 3,
+    };
+    jobs.iter()
+        .filter(|j| !pci_bus_id.is_empty() && j.gpu_bus_id.as_deref() == Some(pci_bus_id))
+        .min_by_key(|j| rank(j))
+}
+
 fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
     let gpu_color = theme::usage_color(gpu.gpu_usage_percent);
-    let temp = gpu.temp_junction_c.or(gpu.temp_edge_c).unwrap_or(0.0);
-    let temp_color = if temp >= 90.0 {
-        theme::red()
-    } else if temp >= 75.0 {
-        theme::yellow()
-    } else {
-        theme::green()
-    };
-
-    let temp_str = match gpu.temp_junction_c.or(gpu.temp_edge_c) {
-        Some(t) => format!("{:.0}°C", t),
-        None => "N/A".to_string(),
-    };
 
     let pwr_pct = if gpu.power_cap_watts > 0.0 {
         (gpu.power_watts / gpu.power_cap_watts * 100.0) as u32
@@ -370,7 +420,7 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
         GpuVendor::Unknown => (" GPU ", theme::overlay()),
     };
 
-    // Per-GPU zkOP/s: scale from best GPU throughput relative to best CPU throughput
+    // Per-GPU zkOP/s: the suite's score, scaled by this card's best throughput over the suite's mean
     let zkops_str = if let Some(suite) = &state.benchmark_results {
         // Join on physical identity, NOT on `gpu.index`. `gpu.index` is a display
         // ordinal over all DRM cards; benchmark rows are keyed in the prover's
@@ -389,14 +439,10 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
                     .fold(0.0_f64, f64::max)
             })
             .unwrap_or(0.0);
-        let best_cpu_tp = suite
-            .device_benchmarks
-            .iter()
-            .filter(|d| d.device_id == "cpu")
-            .map(|d| d.throughput)
-            .fold(0.0_f64, f64::max);
-        if best_gpu_tp > 0.0 && best_cpu_tp > 0.0 && suite.zkops > 0.0 {
-            let gpu_zkops = best_gpu_tp / best_cpu_tp * suite.zkops;
+        // The mean the CPU rows used to carry (they were that mean times a per-backend factor).
+        let mean_tp = suite.average_throughput();
+        if best_gpu_tp > 0.0 && mean_tp > 0.0 && suite.zkops > 0.0 {
+            let gpu_zkops = best_gpu_tp / mean_tp * suite.zkops;
             format_compact(gpu_zkops)
         } else {
             "--".to_string()
@@ -405,10 +451,7 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
         "--".to_string()
     };
 
-    // Find active job assigned to this GPU
-    let gpu_job = state.active_jobs.iter().find(|j| {
-        !gpu.pci_bus_id.is_empty() && j.gpu_bus_id.as_deref() == Some(gpu.pci_bus_id.as_str())
-    });
+    let gpu_job = card_job(&state.active_jobs, &gpu.pci_bus_id);
 
     let (job_str, progress_str, progress_style) = if let Some(job) = gpu_job {
         let id = format!("{}", job.info.job_id);
@@ -452,17 +495,20 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
                     .add_modifier(ratatui::style::Modifier::BOLD),
             ),
             Span::styled(format!(" {}", gpu.name), theme::bold()),
+            Span::styled(throttle_marker(&gpu.throttle_reasons), theme::warning()),
         ])),
         Cell::from(zkops_str).style(theme::metric()),
         Cell::from(format!("{:3}%", gpu.gpu_usage_percent)).style(Style::default().fg(gpu_color)),
-        Cell::from(format!("{}MHz", gpu.gpu_clock_mhz)),
-        Cell::from(format!("{}MHz", gpu.mem_clock_mhz)),
+        // 0 is "not reported": xe exposes no memory clock, and an Intel core clock is not read
+        // while the card sleeps (reading it wakes the card).
+        Cell::from(fmt_mhz(gpu.gpu_clock_mhz)),
+        Cell::from(fmt_mhz(gpu.mem_clock_mhz)),
         Cell::from(format!(
             "{}/{}",
             fmt_bytes(gpu.vram_used_bytes),
             fmt_bytes(gpu.vram_total_bytes)
         )),
-        Cell::from(temp_str).style(Style::default().fg(temp_color)),
+        Cell::from(temp_cell(gpu)),
         Cell::from(format!(
             "{:.0}/{:.0}W",
             gpu.power_watts, gpu.power_cap_watts
@@ -966,6 +1012,7 @@ mod headroom_verdict_tests {
             unstake_amount: 0,
             unstake_request_time: 0,
             deposit_block: 0,
+            read_block: None,
         });
         state.collateral_headroom = headroom;
         state
@@ -1123,6 +1170,97 @@ mod headroom_verdict_tests {
             line_with(&rows, "Slots fundable").is_some(),
             "verdict died before the bar:\n{}",
             rows.join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod card_job_tests {
+    use super::*;
+
+    fn job(id: u8, bus: Option<&str>, status: MinerJobStatus) -> TrackedJob {
+        let mut info = zkminer_chain::jobs::JobInfo::default();
+        info.job_id = alloy_primitives::B256::repeat_byte(id);
+        TrackedJob {
+            info,
+            status,
+            current_price: 0,
+            gpu_bus_id: bus.map(str::to_string),
+            prover_backend: String::new(),
+            estimated_cycles: 0,
+        }
+    }
+
+    /// A card's previous job is still being fulfilled, or is done, when look-ahead starts its next
+    /// one: the row must show the job on the card, not the first in the list.
+    #[test]
+    fn the_row_shows_the_job_proving_on_the_card() {
+        let card = "0000:08:0f.0";
+        let proving = MinerJobStatus::Proving {
+            progress: 0.1,
+            elapsed_secs: 3,
+        };
+        let jobs = vec![
+            job(1, Some(card), MinerJobStatus::Fulfilled { payout: 1 }),
+            job(2, Some(card), MinerJobStatus::Submitting),
+            job(3, Some("0000:06:10.0"), proving.clone()),
+            job(4, Some(card), proving),
+            job(5, None, MinerJobStatus::Queued),
+        ];
+        let shown = card_job(&jobs, card).expect("a job on the card");
+        assert_eq!(shown.info.job_id, jobs[3].info.job_id);
+        // Nothing proving there: the job being fulfilled, before the one already done.
+        let shown = card_job(&jobs[..3], card).expect("a job on the card");
+        assert_eq!(shown.info.job_id, jobs[1].info.job_id);
+        // Another card's job, or one not yet on any card, is never shown.
+        assert!(card_job(&jobs[4..], card).is_none());
+        assert!(card_job(&jobs, "").is_none());
+    }
+
+    /// The Temp cell names the hottest VRAM sensor beside the core when there is one, and the name
+    /// cell says why a card is throttled.
+    #[test]
+    fn the_row_shows_vram_heat_and_throttling() {
+        let text = |line: Line<'static>| {
+            line.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        let mut gpu = crate::hardware::GpuInfo {
+            index: 0,
+            name: "Arc B580".into(),
+            vendor: GpuVendor::Intel,
+            pci_id: String::new(),
+            pci_bus_id: "0000:08:0d.0".into(),
+            gpu_clock_mhz: 0,
+            mem_clock_mhz: 0,
+            gpu_usage_percent: 0,
+            mem_usage_percent: 0,
+            vram_used_bytes: 0,
+            vram_total_bytes: 0,
+            temp_edge_c: Some(89.0),
+            temp_junction_c: None,
+            temp_mem_c: Some(94.4),
+            fan_rpm: 0,
+            fan_max_rpm: 0,
+            power_watts: 0.0,
+            power_cap_watts: 0.0,
+            voltage_mv: 0,
+            pcie_speed: String::new(),
+            pcie_width: 0,
+            vbios: String::new(),
+            throttle_reasons: Vec::new(),
+        };
+        assert_eq!(text(temp_cell(&gpu)), "89° V94°");
+        gpu.temp_mem_c = None;
+        assert_eq!(text(temp_cell(&gpu)), "89°C");
+        gpu.temp_edge_c = None;
+        assert_eq!(text(temp_cell(&gpu)), "N/A");
+        assert_eq!(throttle_marker(&[]), "");
+        assert_eq!(
+            throttle_marker(&["PL1".to_string(), "THERMAL".to_string()]),
+            " ▼ PL1,THERMAL"
         );
     }
 }

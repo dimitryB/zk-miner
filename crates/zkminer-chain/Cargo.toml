@@ -20,7 +20,7 @@ reqwest = "0.12"
 dirs = { workspace = true }
 tower = "0.4"
 alloy-json-rpc = "1"
+serde_json = { workspace = true }
 
 [dev-dependencies]
 zkminer-prover = { workspace = true }
-serde_json = { workspace = true }

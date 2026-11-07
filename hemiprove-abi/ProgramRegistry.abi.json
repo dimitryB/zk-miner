@@ -221,6 +221,19 @@
   },
   {
     "type": "function",
+    "name": "clearRevokedProgram",
+    "inputs": [
+      {
+        "name": "programId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "commitProgramKey",
     "inputs": [
       {
@@ -321,30 +334,6 @@
   },
   {
     "type": "function",
-    "name": "findImageByProofSystem",
-    "inputs": [
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "proofSystemId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "getApplicationAdmin",
     "inputs": [
       {
@@ -370,35 +359,6 @@
         "name": "applicationId",
         "type": "bytes32",
         "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "bytes32[]",
-        "internalType": "bytes32[]"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "getApplicationProgramsPaginated",
-    "inputs": [
-      {
-        "name": "applicationId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "offset",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "limit",
-        "type": "uint256",
-        "internalType": "uint256"
       }
     ],
     "outputs": [
@@ -715,118 +675,6 @@
   },
   {
     "type": "function",
-    "name": "getImageHierarchy",
-    "inputs": [
-      {
-        "name": "imageId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "programKey",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "programInfo",
-        "type": "tuple",
-        "internalType": "struct IProgramRegistry.ProgramInfo",
-        "components": [
-          {
-            "name": "programKey",
-            "type": "bytes32",
-            "internalType": "bytes32"
-          },
-          {
-            "name": "admin",
-            "type": "address",
-            "internalType": "address"
-          },
-          {
-            "name": "createdAt",
-            "type": "uint40",
-            "internalType": "uint40"
-          },
-          {
-            "name": "status",
-            "type": "uint8",
-            "internalType": "enum IProgramRegistry.ProgramStatus"
-          },
-          {
-            "name": "successorKey",
-            "type": "bytes32",
-            "internalType": "bytes32"
-          },
-          {
-            "name": "name",
-            "type": "string",
-            "internalType": "string"
-          }
-        ]
-      },
-      {
-        "name": "versionInfo",
-        "type": "tuple",
-        "internalType": "struct IProgramRegistry.VersionInfo",
-        "components": [
-          {
-            "name": "versionId",
-            "type": "bytes32",
-            "internalType": "bytes32"
-          },
-          {
-            "name": "programKey",
-            "type": "bytes32",
-            "internalType": "bytes32"
-          },
-          {
-            "name": "createdAt",
-            "type": "uint40",
-            "internalType": "uint40"
-          },
-          {
-            "name": "status",
-            "type": "uint8",
-            "internalType": "enum IProgramRegistry.ProgramStatus"
-          },
-          {
-            "name": "successorVersion",
-            "type": "bytes32",
-            "internalType": "bytes32"
-          }
-        ]
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "getImageVersion",
-    "inputs": [
-      {
-        "name": "imageId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "getPendingApplicationAdmin",
     "inputs": [
       {
@@ -986,25 +834,6 @@
   },
   {
     "type": "function",
-    "name": "getProgramApplication",
-    "inputs": [
-      {
-        "name": "programKey",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "getProgramBatch",
     "inputs": [
       {
@@ -1139,35 +968,6 @@
   },
   {
     "type": "function",
-    "name": "getProgramVersionsPaginated",
-    "inputs": [
-      {
-        "name": "programKey",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "offset",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "limit",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "bytes32[]",
-        "internalType": "bytes32[]"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "getProgramsByProofSystem",
     "inputs": [
       {
@@ -1268,129 +1068,6 @@
           },
           {
             "name": "contentHash",
-            "type": "bytes32",
-            "internalType": "bytes32"
-          }
-        ]
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "getVersionFieldLayout",
-    "inputs": [
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "schemaKind",
-        "type": "uint8",
-        "internalType": "uint8"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "bytes",
-        "internalType": "bytes"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "getVersionImagesDetailed",
-    "inputs": [
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "imageIds",
-        "type": "bytes32[]",
-        "internalType": "bytes32[]"
-      },
-      {
-        "name": "proofSystemIds",
-        "type": "bytes32[]",
-        "internalType": "bytes32[]"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "getVersionImagesPaginated",
-    "inputs": [
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "offset",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "limit",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "bytes32[]",
-        "internalType": "bytes32[]"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "getVersionInfo",
-    "inputs": [
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "tuple",
-        "internalType": "struct IProgramRegistry.VersionInfo",
-        "components": [
-          {
-            "name": "versionId",
-            "type": "bytes32",
-            "internalType": "bytes32"
-          },
-          {
-            "name": "programKey",
-            "type": "bytes32",
-            "internalType": "bytes32"
-          },
-          {
-            "name": "createdAt",
-            "type": "uint40",
-            "internalType": "uint40"
-          },
-          {
-            "name": "status",
-            "type": "uint8",
-            "internalType": "enum IProgramRegistry.ProgramStatus"
-          },
-          {
-            "name": "successorVersion",
             "type": "bytes32",
             "internalType": "bytes32"
           }
@@ -1926,42 +1603,6 @@
   },
   {
     "type": "function",
-    "name": "transferApplicationAdmin",
-    "inputs": [
-      {
-        "name": "applicationId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "newAdmin",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
-    "name": "transferFamilyAdmin",
-    "inputs": [
-      {
-        "name": "familyId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "newAdmin",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
     "name": "transferOwnership",
     "inputs": [
       {
@@ -2125,69 +1766,6 @@
     ],
     "outputs": [],
     "stateMutability": "nonpayable"
-  },
-  {
-    "type": "event",
-    "name": "AdoptionAccepted",
-    "inputs": [
-      {
-        "name": "imageId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "programKey",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "AdoptionCancelled",
-    "inputs": [
-      {
-        "name": "imageId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "AdoptionProposed",
-    "inputs": [
-      {
-        "name": "imageId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "proposedBy",
-        "type": "address",
-        "indexed": false,
-        "internalType": "address"
-      }
-    ],
-    "anonymous": false
   },
   {
     "type": "event",
@@ -2403,38 +1981,6 @@
   },
   {
     "type": "event",
-    "name": "EncodingModeOverrideCleared",
-    "inputs": [
-      {
-        "name": "proofSystemId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "EncodingModeOverrideSet",
-    "inputs": [
-      {
-        "name": "proofSystemId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "mode",
-        "type": "uint8",
-        "indexed": false,
-        "internalType": "uint8"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
     "name": "ExpiredBondClaimed",
     "inputs": [
       {
@@ -2505,6 +2051,25 @@
         "type": "address",
         "indexed": true,
         "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "FamilyLinkOffered",
+    "inputs": [
+      {
+        "name": "applicationId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "familyId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
       }
     ],
     "anonymous": false
@@ -2586,125 +2151,6 @@
         "name": "schemaHash",
         "type": "bytes32",
         "indexed": false,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "ImageDeprecated",
-    "inputs": [
-      {
-        "name": "imageId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "successorImageId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "ImageRegistered",
-    "inputs": [
-      {
-        "name": "imageId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "proofSystemId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "name",
-        "type": "string",
-        "indexed": false,
-        "internalType": "string"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "ImageRevoked",
-    "inputs": [
-      {
-        "name": "imageId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "registrant",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "reason",
-        "type": "string",
-        "indexed": false,
-        "internalType": "string"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "ImageSuccessorUpdated",
-    "inputs": [
-      {
-        "name": "imageId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "oldSuccessor",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "newSuccessor",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "ImageUnadopted",
-    "inputs": [
-      {
-        "name": "imageId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "indexed": true,
         "internalType": "bytes32"
       }
     ],
@@ -2920,69 +2366,6 @@
   },
   {
     "type": "event",
-    "name": "ProgramLinkCancelled",
-    "inputs": [
-      {
-        "name": "applicationId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "programKey",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "ProgramLinkProposed",
-    "inputs": [
-      {
-        "name": "applicationId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "programKey",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "proposer",
-        "type": "address",
-        "indexed": false,
-        "internalType": "address"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "ProgramLinkedToApplication",
-    "inputs": [
-      {
-        "name": "applicationId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "programKey",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
     "name": "ProgramMetadataUpdated",
     "inputs": [
       {
@@ -3057,25 +2440,6 @@
   },
   {
     "type": "event",
-    "name": "ProgramRetired",
-    "inputs": [
-      {
-        "name": "programKey",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "successorKey",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
     "name": "ProgramRevoked",
     "inputs": [
       {
@@ -3083,31 +2447,6 @@
         "type": "bytes32",
         "indexed": true,
         "internalType": "bytes32"
-      },
-      {
-        "name": "reason",
-        "type": "string",
-        "indexed": false,
-        "internalType": "string"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "ProgramRevoked_v2",
-    "inputs": [
-      {
-        "name": "programKey",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "admin",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
       },
       {
         "name": "reason",
@@ -3145,44 +2484,19 @@
   },
   {
     "type": "event",
-    "name": "ProgramSuccessorUpdated_v2",
+    "name": "RegistrantTransferCancelled",
     "inputs": [
       {
-        "name": "programKey",
+        "name": "programId",
         "type": "bytes32",
         "indexed": true,
         "internalType": "bytes32"
       },
       {
-        "name": "oldSuccessor",
-        "type": "bytes32",
+        "name": "cancelledRegistrant",
+        "type": "address",
         "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "newSuccessor",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "ProgramUnlinkedFromApplication",
-    "inputs": [
-      {
-        "name": "applicationId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "programKey",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
+        "internalType": "address"
       }
     ],
     "anonymous": false
@@ -3252,6 +2566,25 @@
         "type": "uint256",
         "indexed": false,
         "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "RevokedProgramCleared",
+    "inputs": [
+      {
+        "name": "programId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "priorRegistrant",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
       }
     ],
     "anonymous": false
@@ -3372,125 +2705,6 @@
         "type": "address",
         "indexed": true,
         "internalType": "address"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "VersionCreated",
-    "inputs": [
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "programKey",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "versionString",
-        "type": "string",
-        "indexed": false,
-        "internalType": "string"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "VersionDeprecated",
-    "inputs": [
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "successorVersionId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "VersionFieldLayoutSet",
-    "inputs": [
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "schemaKind",
-        "type": "uint8",
-        "indexed": true,
-        "internalType": "uint8"
-      },
-      {
-        "name": "layoutHash",
-        "type": "bytes32",
-        "indexed": false,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "VersionRevoked",
-    "inputs": [
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "admin",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "reason",
-        "type": "string",
-        "indexed": false,
-        "internalType": "string"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "VersionSuccessorUpdated",
-    "inputs": [
-      {
-        "name": "versionId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "oldSuccessor",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "newSuccessor",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
       }
     ],
     "anonymous": false
@@ -3662,6 +2876,22 @@
   },
   {
     "type": "error",
+    "name": "FamilyLinkNotOffered",
+    "inputs": [
+      {
+        "name": "familyId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "applicationId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "FamilyNotLinked",
     "inputs": [
       {
@@ -3732,6 +2962,17 @@
         "name": "length",
         "type": "uint8",
         "internalType": "uint8"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "ImplementationHasNoCode",
+    "inputs": [
+      {
+        "name": "implementation",
+        "type": "address",
+        "internalType": "address"
       }
     ]
   },
@@ -4033,6 +3274,17 @@
   {
     "type": "error",
     "name": "ProgramNotRegistered",
+    "inputs": [
+      {
+        "name": "programId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "ProgramNotRevoked",
     "inputs": [
       {
         "name": "programId",

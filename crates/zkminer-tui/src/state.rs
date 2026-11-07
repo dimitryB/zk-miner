@@ -154,12 +154,11 @@ impl SetupStatus {
         self.has_gas = eth_balance > 0;
         self.has_hemi = hemi_balance > 0;
 
-        // [FIX-V1A3, 2026-07-08] The 1h MIN_STAKING_AGE claim gate was removed
-        // on-chain; a stake is claimable from the next block after it lands
-        // (block.number > depositBlock), which is always satisfied by the time
-        // we evaluate jobs. So maturity simply tracks "has an active stake".
-        // `deposit_block` is a block number (not a wall-clock timestamp), so no
-        // age countdown is computed.
+        // The 1h MIN_STAKING_AGE claim gate was removed on-chain; a stake is
+        // claimable from the next block after it lands (block.number > depositBlock),
+        // which is always satisfied by the time we evaluate jobs. So maturity simply
+        // tracks "has an active stake". `deposit_block` is a block number (not a
+        // wall-clock timestamp), so no age countdown is computed.
         if let Some(stake) = stake_info {
             self.has_stake = stake.total_staked >= MIN_STAKE_WEI;
             self.stake_mature = self.has_stake;
@@ -222,10 +221,13 @@ pub struct RuntimeSettings {
     pub disabled_backends: HashSet<String>,
     /// Per-(device, backend) overrides — disabled combos.
     pub disabled_device_backends: HashSet<(String, String)>,
-    /// Whether advanced mode (po2 overrides) is enabled.
+    /// Whether advanced mode (po2 overrides) is enabled. The overrides apply only while it is.
     pub advanced_mode: bool,
-    /// Per-(device, backend) po2 overrides.
+    /// Per-(device, backend) po2 overrides, for this session.
     pub po2_overrides: HashMap<(String, String), u8>,
+    /// Each card's risc0 job size from the config (`prover.risc0_job_po2`), by benchmark device id;
+    /// a session override wins over it.
+    pub risc0_job_po2_config: HashMap<String, u8>,
     // Tunables
     pub max_concurrent_proofs: usize,
     /// Seconds of work to keep queued ahead per GPU. 0 = look-ahead off (one job per GPU).
@@ -237,11 +239,9 @@ pub struct RuntimeSettings {
     pub deadline_safety_margin: f64,
     pub token_price_usd: f64,
     pub gas_cost_usd: f64,
-    /// Whether to claim jobs carrying a non-zero `expectedJournalHash` (Phase-2
-    /// journal predicate). Default true (claim them). Set false to skip — a
-    /// predicate job whose committed journal our proof can't reproduce reverts
-    /// `JournalMismatch` at fulfill and risks a collateral slash on timeout,
-    /// and zkminer does not yet simulate the predicate before claiming.
+    /// Whether to claim journal-bound jobs (a non-zero `expectedJournalHash`). Each is claimed only
+    /// when the journal its (program, input) measured satisfies its binding. Default TRUE; `false`
+    /// claims only NONE jobs assigned to this prover.
     pub claim_predicate_jobs: bool,
 }
 
@@ -253,6 +253,7 @@ impl Default for RuntimeSettings {
             disabled_device_backends: HashSet::new(),
             advanced_mode: false,
             po2_overrides: HashMap::new(),
+            risc0_job_po2_config: HashMap::new(),
             max_concurrent_proofs: 1,
             queue_horizon_secs: 0, // look-ahead off by default: one job per GPU
             min_profit_threshold: 10.0,
@@ -395,6 +396,10 @@ pub struct MinerState {
 
     // Benchmark
     pub benchmark_results: Option<BenchmarkSuite>,
+    /// Each risc0 card's job segment size (po2), by benchmark device id, as the miner decided it
+    /// (`zkminer_prover::benchmark::risc0_job_po2`): `None` for a card that proves no risc0 job.
+    /// Published by the brain; empty until it runs.
+    pub risc0_job_po2s: Vec<(String, Option<u8>)>,
     pub benchmark_running: bool,
     /// Which device is selected in the benchmark screen (0 = CPU, 1+ = GPUs).
     pub benchmark_selected_device: usize,
@@ -694,6 +699,7 @@ impl Default for MinerState {
             selected_job_index: 0,
             selected_job_id: None,
             benchmark_results: None,
+            risc0_job_po2s: Vec::new(),
             benchmark_running: false,
             benchmark_selected_device: 0,
             benchmark_device_in_progress: None,

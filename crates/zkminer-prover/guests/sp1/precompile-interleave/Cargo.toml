@@ -6,7 +6,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-sp1-zkvm = "6.0"
+sp1-zkvm = "=6.8.1"
 sha2 = "0.10"
 tiny-keccak = { version = "2", features = ["keccak"] }
 

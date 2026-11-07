@@ -13,20 +13,276 @@ use anyhow::Result;
 type CudaPk = <sp1_sdk::blocking::CudaProver as sp1_sdk::blocking::Prover>::ProvingKey;
 
 /// Hash an ELF into a stable cache key (the proving key depends only on the program).
-fn elf_hash(elf: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    elf.hash(&mut h);
-    h.finish()
+///
+/// Uses SHA-256, not a 64-bit `DefaultHasher`: the key selects a GPU proving key that is reused
+/// WITHOUT re-checking the ELF, so a 64-bit digest let a submitter craft two distinct programs with
+/// the same key and make the worker prove program B under program A's key (a wrong proof). A
+/// collision-resistant 256-bit digest removes that.
+fn elf_hash(elf: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(elf);
+    h.finalize().into()
 }
+
+/// Decode a `0x`-prefixed 64-hex-char string (SP1's vkey `bytes32()`) into `[u8; 32]`; `None` on any
+/// malformed input. Used instead of `bytes32_raw()`, which panics for digests that aren't exactly 31
+/// bytes big-endian. No hex-crate dependency.
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        *b = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
+}
+
+/// Largest number of distinct proving keys the worker keeps resident. Each entry is a large
+/// GPU-resident key, so without a bound the cache grows O(distinct ELFs a submitter sends) in host
+/// RAM and VRAM. LRU-evicted beyond this. Override with `ZKMINER_SP1_PK_CACHE_MAX`.
+fn pk_cache_capacity() -> usize {
+    std::env::var("ZKMINER_SP1_PK_CACHE_MAX")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(4)
+}
+
+/// Drop something holding the SP1 client: a proving key, the prover, or several of them.
+///
+/// Their `Drop` impls call `tokio::spawn`, which panics outside a runtime (`there is no reactor
+/// running`), so they are dropped inside one. The last one dropped also ends the `sp1-gpu-server`
+/// (the SDK starts it `kill_on_drop`). Building a runtime is rare enough to do each time.
+///
+/// Only for what is not going to use the client again, as this cancels whatever those drops spawned.
+/// See `evict_key` for a key on a server that lives on.
+///
+/// If no runtime can be built the value is leaked rather than panicking in `Drop`, so a server it
+/// held outlives this worker and is left to the next worker's `reap_orphaned_gpu_servers`.
+fn drop_on_runtime<T>(held: T) {
+    match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt.block_on(async move {
+            drop(held);
+        }),
+        Err(e) => {
+            tracing::warn!("No tokio runtime to release the SP1 client ({e}); leaking it");
+            std::mem::forget(held);
+        }
+    }
+}
+
+/// How long the server may take to answer a key's Destroy, which only removes it from a map, before
+/// the connection is given up on.
+const KEY_DESTROY_WAIT: Duration = Duration::from_secs(30);
+
+/// Free a key evicted from `PkCache`, on a server this worker goes on using, and return once its
+/// Destroy is over. One that failed is only logged, by the SDK, and the next request finds that out.
+///
+/// `drop_on_runtime` is not enough here. Dropping a key spawns its Destroy, on one connection shared
+/// with every later request, and that function ends its runtime at once, which can cancel the Destroy
+/// before it is sent, or between the request and its reply. That leaves the key on the server, or the
+/// stream out of step with its requests.
+fn evict_key(pk: CudaPk) -> Result<()> {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::warn!("No tokio runtime to free an evicted SP1 proving key ({e}); leaking it");
+            std::mem::forget(pk);
+            return Ok(());
+        }
+    };
+    let answered = rt.block_on(async move {
+        drop(pk);
+        let started = Instant::now();
+        while tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+            > 0
+        {
+            if started.elapsed() >= KEY_DESTROY_WAIT {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        true
+    });
+    if answered {
+        Ok(())
+    } else {
+        // Ending the runtime cancels it, so the stream can no longer be trusted.
+        Err(anyhow::Error::new(ServerLost {
+            detail: format!("no answer to a key's Destroy in {KEY_DESTROY_WAIT:?}"),
+        }))
+    }
+}
+
+/// Everything that holds the SP1 client, and through it `sp1-gpu-server`, released when this goes
+/// out of scope, however that happens.
+///
+/// A drop is only safe inside a runtime (`drop_on_runtime`), and a block of code at the end of a
+/// function does not run on every way out of it. An answer that cannot be written, because the miner
+/// died while this worker proved, used to leave through `?` and panic in `Drop`: measured on a real
+/// server with a key held, three panics and SIGABRT.
+struct ServerHolders {
+    prover: Option<sp1_sdk::blocking::CudaProver>,
+    pk_cache: PkCache,
+    /// Keys from benchmarks, held rather than leaked; see `run_benchmarks`.
+    benchmark_keys: Vec<CudaPk>,
+}
+
+impl ServerHolders {
+    fn new() -> Self {
+        Self {
+            prover: None,
+            pk_cache: PkCache::new(pk_cache_capacity()),
+            benchmark_keys: Vec::new(),
+        }
+    }
+}
+
+impl Drop for ServerHolders {
+    fn drop(&mut self) {
+        if self.prover.is_some() || !self.pk_cache.is_empty() || !self.benchmark_keys.is_empty() {
+            drop_on_runtime((
+                std::mem::take(&mut self.benchmark_keys),
+                std::mem::replace(&mut self.pk_cache, PkCache::new(1)),
+                self.prover.take(),
+            ));
+        }
+    }
+}
+
+/// The error type of the SDK's calls to `sp1-gpu-server`.
+type SdkError = <sp1_sdk::blocking::CudaProver as sp1_sdk::blocking::Prover>::Error;
+
+/// `sp1-gpu-server` is gone, or the connection to it can no longer be used.
+///
+/// The SDK makes one connection when the prover is built and never another, so every later call
+/// fails too: measured, killing only the server made the next four proofs fail with `early eof`
+/// and `Broken pipe` while the worker stayed up and answered each with an ordinary error. Nothing
+/// but a new process recovers from that, so a worker that sees this exits (see
+/// `WORKER_EXIT_SERVER_LOST`), and the dispatcher handles it as it does any worker that died.
+#[derive(Debug)]
+struct ServerLost {
+    /// The SDK's error.
+    detail: String,
+}
+
+impl std::fmt::Display for ServerLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lost the connection to sp1-gpu-server: {}", self.detail)
+    }
+}
+
+impl std::error::Error for ServerLost {}
+
+/// Whether the text of a [`SdkError`] says the client can no longer be used: a read or a write on
+/// its one connection failed, which also leaves a part-read reply in the stream, or a reply was
+/// not one its request can have, so replies no longer line up with requests.
+///
+/// `CudaClientError` does not expose its variant, so this reads the start of its `Display`, which
+/// each variant fixes and no message can change: a guest's text, which can reach the server's own
+/// errors, only ever comes after the variant's fixed words. So this must only be given an
+/// [`SdkError`]'s own text (`sdk_error` is why), and it is an anchored match, never `contains`.
+/// `the_server_lost_check_agrees_with_the_real_error_type` holds it to the pinned SDK's wording.
+fn says_server_lost(sdk_error_text: &str) -> bool {
+    [
+        "CudaClientError: Failed to read the response:",
+        "CudaClientError: Failed to write the request:",
+        "CudaClientError: The server returned an unexpected response:",
+    ]
+    .iter()
+    .any(|fixed| sdk_error_text.starts_with(fixed))
+}
+
+/// An SDK error as this worker reports it: [`ServerLost`] if it is that, so callers can tell by
+/// type, and otherwise its text.
+fn sdk_error(e: SdkError) -> anyhow::Error {
+    let detail = e.to_string();
+    if says_server_lost(&detail) {
+        anyhow::Error::new(ServerLost { detail })
+    } else {
+        anyhow::anyhow!("{detail}")
+    }
+}
+
+/// LRU map bounded by capacity. Generic over the value so the eviction-order logic is unit-testable
+/// without a real (unconstructible) `CudaPk`. `insert` returns the values it evicted so the caller
+/// can drop them in whatever context they require (for `CudaPk`, inside a tokio runtime).
+struct LruCache<V> {
+    map: HashMap<[u8; 32], V>,
+    order: std::collections::VecDeque<[u8; 32]>, // front = least-recently-used
+    cap: usize,
+}
+
+impl<V> LruCache<V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn contains(&self, key: &[u8; 32]) -> bool {
+        self.map.contains_key(key)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Mark `key` most-recently-used (call on a cache hit).
+    fn touch(&mut self, key: &[u8; 32]) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            let k = self.order.remove(pos).expect("position just found");
+            self.order.push_back(k);
+        }
+    }
+
+    fn get(&self, key: &[u8; 32]) -> Option<&V> {
+        self.map.get(key)
+    }
+
+    /// Insert `value`, evicting least-recently-used entries until under capacity. Returns evicted
+    /// values (usually zero or one).
+    #[must_use = "evicted proving keys must be dropped in a runtime context via evict_key"]
+    fn insert(&mut self, key: [u8; 32], value: V) -> Vec<V> {
+        let mut evicted = Vec::new();
+        while self.map.len() >= self.cap {
+            match self.order.pop_front() {
+                Some(old) => {
+                    if let Some(v) = self.map.remove(&old) {
+                        evicted.push(v);
+                    }
+                }
+                None => break,
+            }
+        }
+        self.map.insert(key, value);
+        self.order.push_back(key);
+        evicted
+    }
+}
+
+type PkCache = LruCache<CudaPk>;
 use zkminer_prover_protocol::proc::{self, Outcome};
+#[cfg(any(target_os = "linux", test))]
+use zkminer_prover_protocol::sp1_shm::{is_sp1_shm_basename, sp1_shm_mapped_in};
 use zkminer_prover_protocol::types::{
     CUDA_DEVICE_ID_ENV, CUDA_VRAM_AVAILABLE_BYTES_ENV, CUDA_VRAM_BYTES_ENV, HOST_MEM_BUDGET_ENV,
 };
 use zkminer_prover_protocol::{
     is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
     WorkerResponse, BACKEND_SP1, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, PROTOCOL_VERSION,
+    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
+    PROTOCOL_VERSION,
 };
 
 mod bundled_server;
@@ -66,12 +322,55 @@ fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::i
 }
 
 fn main() {
+    // `--export-guest <name> <path>`: write one of the embedded guests to `path` and print its vkey
+    // hash (`bytes32()`), which is the `programId` of an SP1 job for it. For harnesses that submit
+    // jobs this worker can serve (crates/zkminer-cli/tests/localnet.rs). Runs SP1's setup on the CPU
+    // prover: no GPU or server. Speaks no IPC.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--export-guest") {
+        use sp1_sdk::blocking::{Elf, Prover};
+        use sp1_sdk::{HashableKey, ProvingKey};
+        let (Some(name), Some(path)) = (args.get(i + 1), args.get(i + 2)) else {
+            eprintln!("usage: --export-guest <benchmark program> <path>");
+            std::process::exit(2);
+        };
+        let elf = match name.as_str() {
+            BENCH_FIBONACCI => FIBONACCI_SP1_GUEST_ELF,
+            BENCH_SHA256_CHAIN => SHA256_CHAIN_SP1_GUEST_ELF,
+            BENCH_ECDSA_VERIFY => ECDSA_VERIFY_SP1_GUEST_ELF,
+            BENCH_BIGINT_MUL => BIGINT_MUL_SP1_GUEST_ELF,
+            BENCH_MEMORY_MERKLE => MEMORY_MERKLE_SP1_GUEST_ELF,
+            BENCH_CHACHA_MIX => CHACHA_MIX_SP1_GUEST_ELF,
+            other => {
+                eprintln!("unknown guest {other:?} (known: the benchmark programs)");
+                std::process::exit(2);
+            }
+        };
+        let pk = match sp1_sdk::blocking::ProverClient::builder()
+            .cpu()
+            .build()
+            .setup(Elf::from(elf))
+        {
+            Ok(pk) => pk,
+            Err(e) => {
+                eprintln!("setup: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = std::fs::write(path, elf) {
+            eprintln!("write {path}: {e}");
+            std::process::exit(1);
+        }
+        println!("{}", pk.verifying_key().bytes32());
+        return;
+    }
+
     // CRITICAL: Save the real stdout FD for IPC before anything can pollute it.
     // The SP1 SDK's gnark CGO library (Go code) may print to stdout (FD 1),
     // which would corrupt the bincode IPC stream. We dup stdout for IPC,
     // then redirect FD 1 to stderr so any stray prints go to the log.
     #[cfg(unix)]
-    let ipc_stdout = {
+    let mut ipc_stdout = {
         use std::os::unix::io::{AsRawFd, FromRawFd};
         let stdout_fd = io::stdout().as_raw_fd(); // FD 1
         let ipc_fd = dup_cloexec(stdout_fd).expect("dup(stdout) failed");
@@ -80,7 +379,7 @@ fn main() {
         unsafe { std::fs::File::from_raw_fd(ipc_fd) }
     };
     #[cfg(not(unix))]
-    let ipc_stdout = io::stdout();
+    let mut ipc_stdout = io::stdout();
 
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
@@ -96,9 +395,16 @@ fn main() {
         .ok()
         .and_then(|v| v.trim().parse().ok());
 
-    // Direct benchmark mode: run benchmarks and print results to stderr (stdout is redirected)
-    // Before constructing any CudaProver: never adopt a server whose owner is gone.
-    reap_orphaned_gpu_servers(our_cuda_device);
+    // Before constructing any CudaProver: never adopt a server whose owner is gone. Without waiting
+    // for it to finish exiting: this spends the handshake's budget (`HANDSHAKE_TIMEOUT`), and most
+    // workers prove minutes later if at all. `build_prover` waits, when a server is about to start.
+    reap_orphaned_gpu_servers(our_cuda_device, Duration::ZERO);
+
+    // Likewise before any execute: sweep SP1 native-executor /dev/shm trace rings and memory images
+    // orphaned by a worker that died without unlinking (SIGBUS/OOM-kill). Left behind they fill the
+    // tmpfs and make every later execute SIGBUS. Runs at every (re)spawn; a no-op where the native
+    // executor is not in play (non-Linux, or nothing orphaned).
+    reap_orphaned_sp1_shm();
 
     // Then put the server this release ships in the place the SDK runs it from, before anything
     // runs it: `sp1_usability` probes it, and the SDK would otherwise download upstream's.
@@ -107,35 +413,134 @@ fn main() {
     // Then make a CUDA 12 runtime reachable if the host has one anywhere, so the
     // installed toolkit version stops mattering. Must run BEFORE sp1_usability, which
     // execs sp1-gpu-server and is the authority on whether this actually worked.
-    ensure_cuda12_on_library_path();
+    if warmup::drives_cuda() {
+        ensure_cuda12_on_library_path();
+    } else {
+        // The HIP or SYCL build's own libraries (`bundled_server::server_lib_dir`): put them first
+        // on the library path the server inherits from this process.
+        if let Some(lib) = bundled_server::server_lib_dir() {
+            let path = match std::env::var("LD_LIBRARY_PATH") {
+                Ok(p) if !p.is_empty() => format!("{}:{p}", lib.display()),
+                _ => lib.display().to_string(),
+            };
+            std::env::set_var("LD_LIBRARY_PATH", path);
+            // The SYCL build's Level Zero driver, shipped there: the only one its loader opens, not
+            // also a distribution's (see zkminer-prove-risc0's `use_shipped_level_zero_driver`).
+            let driver = lib.join("libze_intel_gpu.so.1");
+            if driver.is_file() && std::env::var_os("ZE_ENABLE_ALT_DRIVERS").is_none() {
+                std::env::set_var("ZE_ENABLE_ALT_DRIVERS", driver);
+            }
+        }
+    }
 
+    // Direct benchmark mode: run benchmarks and print results to stderr (stdout is redirected).
     if std::env::args().any(|a| a == "--benchmark") {
         // Honour the assigned device here too. Without this, benchmarking card 1 by hand silently
         // measured card 0 — a figure that is then persisted as that card's.
-        let prover = {
-            let builder = sp1_sdk::blocking::ProverClient::builder().cuda();
-            match std::env::var(CUDA_DEVICE_ID_ENV)
-                .ok()
-                .and_then(|v| v.trim().parse::<u32>().ok())
-            {
-                Some(id) => builder.with_device_id(id).build(),
-                None => builder.build(),
-            }
-        };
-        let results = run_benchmarks(&prover);
-        for r in &results {
-            eprintln!(
-                "{:<16} {:>12} cycles  {:>8.2}s  {:>12.0} c/s  weight={:.2}  precompile={}",
-                r.program_name, r.cycles, r.duration_secs, r.throughput, r.weight, r.precompile,
-            );
-        }
-        return;
+        std::process::exit(run_benchmarks_by_hand(our_cuda_device));
     }
 
-    if let Err(e) = run_worker_loop(ipc_stdout) {
+    // By reference, so the descriptor closes with the process and not before. The host reads the EOF
+    // as this worker having died and asks at once how it died (`died_of_host_oom`), so a descriptor
+    // closed while it is still exiting gets the answer "still running".
+    if let Err(e) = run_worker_loop(&mut ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
-        std::process::exit(1);
+        std::process::exit(if e.is::<ServerLost>() {
+            zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST
+        } else {
+            1
+        });
     }
+}
+
+/// `--benchmark`: run every benchmark and print a row per program to stderr. Returns the exit code,
+/// which is non-zero unless every program produced its row, so a script can tell.
+fn run_benchmarks_by_hand(device: Option<u32>) -> i32 {
+    // Dropped before returning. That also ends the server, which must not outlive this process: with
+    // no dispatcher to sweep its process group, nothing else would.
+    let mut held = ServerHolders::new();
+    let prover = match build_prover(device) {
+        Ok(prover) => held.prover.insert(prover),
+        Err(message) => {
+            tracing::error!("{message}");
+            return 1;
+        }
+    };
+    let run = run_benchmarks(prover, &mut held.benchmark_keys);
+    for r in &run.results {
+        eprintln!(
+            "{:<16} {:>12} cycles  {:>8.2}s  {:>12.0} c/s  weight={:.2}  precompile={}",
+            r.program_name, r.cycles, r.duration_secs, r.throughput, r.weight, r.precompile,
+        );
+    }
+    for failure in &run.failed {
+        eprintln!("FAILED {failure}");
+    }
+    drop(held);
+    if let Some(lost) = run.server_lost {
+        eprintln!("FAILED: {lost}");
+        return zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST;
+    }
+    if run.failed.is_empty() && !run.results.is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+/// How long `build_prover` waits for an orphaned server it killed to finish exiting.
+///
+/// Well past what was measured, 1.35 s at 29 GB, which is ~20 GB/s. It only runs out on a server
+/// stuck in the kernel, typically in a GPU driver, and then the socket is already unlinked, so the
+/// new server is still the one reached. This runs ahead of the first proof, not in the handshake.
+const ORPHAN_EXIT_WAIT: Duration = Duration::from_secs(10);
+
+/// Build the prover, turning a PANIC into a decline.
+///
+/// The SDK ends `build()` with `.expect("Failed to create the CUDA prover impl")`, so anything that
+/// stops `sp1-gpu-server` coming up kills this process outright. The dispatcher then sees only EOF
+/// and reads it as worker ill-health: it excludes a slot, burns a retry, respawns, and does it all
+/// again on the next job. But the commonest cause is categorical, not transient — the server
+/// refuses a card below its hard VRAM floor — upstream's reads "Unsupported GPU memory: 20, must be
+/// at least 24GB"; the fork this repo pins lowers it to 16 — which will be just as true next time.
+///
+/// Catching it lets us answer the protocol properly. `WORKER_DECLINED` is the dispatcher's existing
+/// signal for "I spoke to you, and I cannot prove here": at the handshake or a respawn it stops the
+/// backend being advertised on this slot. In the answer to a Prove or a Benchmark, where this is
+/// called, nothing reads it yet, and it is a plain error.
+///
+/// `AssertUnwindSafe` is sound here because the panic path leaves nothing of ours half-written: the
+/// prover slot is still `None` (we only assign on success), and the SDK's own state dies with the
+/// server it failed to reach.
+fn build_prover(
+    cuda_device_id: Option<u32>,
+) -> std::result::Result<sp1_sdk::blocking::CudaProver, String> {
+    reap_orphaned_gpu_servers(cuda_device_id, ORPHAN_EXIT_WAIT);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tracing::info!("Initializing SP1 CUDA prover...");
+        let builder = sp1_sdk::blocking::ProverClient::builder().cuda();
+        let builder = match cuda_device_id {
+            Some(id) => builder.with_device_id(id),
+            None => builder,
+        };
+        builder.build()
+    }))
+    .map_err(|e| {
+        let detail = e
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| e.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic with no message".to_string());
+        format!(
+            "{}: could not initialise the SP1 CUDA prover on device {}: {detail}. The most \
+             likely cause is a card below sp1-gpu-server's hard VRAM floor (16 GB in the pinned \
+             fork, 24 GB upstream), which no proving option can change.",
+            zkminer_prover_protocol::types::WORKER_DECLINED,
+            cuda_device_id
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "default".to_string()),
+        )
+    })
 }
 
 /// Parse the parent pid out of a `/proc/<pid>/stat` line.
@@ -148,8 +553,106 @@ fn ppid_from_proc_stat(stat: &str) -> Option<i32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// Kill any ORPHANED `sp1-gpu-server` before this worker starts its own, and remove the
-/// socket it was holding.
+/// True once a process has finished exiting, so that its socket is closed, whether or not anything
+/// ever reaps it.
+///
+/// `Z` alone does not say that. A thread group's leader turns `Z` at once while its other threads
+/// are still releasing what they share: measured on a 24 GB process, `Z` within 0.2 ms, still
+/// accepting connections until 909 ms. Those threads leave the count only after that, so `Z` with
+/// one thread left is the end of it (`Z`, 1 thread, connections refused, 924 ms). Watching for
+/// `/proc/<pid>` to vanish instead would wait out the whole bound wherever nothing reaps zombies,
+/// such as a container whose PID 1 is not an init.
+///
+/// It does not promise the host's memory is back. Whatever is reading the process's `/proc` entry
+/// when it dies holds its address space for that moment, and then frees it itself: measured with a
+/// reader on a 12 GB process, `Z` with one thread and connections refused at 0.3 ms, and the reader
+/// held 580 ms. What this wait is for, the socket, is settled either way, and the dispatcher waits
+/// for memory itself where that matters (`wait_for_reclaim`).
+#[cfg(target_os = "linux")]
+fn has_finished_exiting(stat: &str) -> bool {
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    let mut fields = rest.split_whitespace();
+    // Field 3 is the state and field 20 `num_threads`; `nth` here counts from field 4.
+    let exited = matches!(fields.next(), Some("Z" | "X" | "x"));
+    let threads = fields.nth(16).and_then(|n| n.parse::<i64>().ok());
+    exited && threads.is_some_and(|n| n <= 1)
+}
+
+/// The socket a server named `server_name` listens on for `device`, as the SDK's own `socket_path`
+/// names it (`the_socket_name_is_the_sdks` holds the two together). The SDK's reads this process's
+/// environment, which says nothing about an orphan started by another worker.
+///
+/// `None` for a name no socket could have: this comes from a process's environment and ends up
+/// being unlinked.
+#[cfg(target_os = "linux")]
+fn server_socket_path(server_name: &str, device: u32) -> Option<std::path::PathBuf> {
+    if server_name.contains('/') {
+        return None;
+    }
+    let base = match server_name {
+        "" | "sp1-gpu-server" => "sp1-cuda",
+        name => name,
+    };
+    Some(format!("/tmp/{base}-{device}.sock").into())
+}
+
+/// The socket a running server listens on, read from its own environment (`/proc/<pid>/environ`).
+///
+/// The SDK sets `CUDA_VISIBLE_DEVICES=<id>` on the child it starts, for every build of the server,
+/// and the child inherits `SP1_GPU_SERVER_NAME` from the worker, so this is more reliable than
+/// guessing, and right for a server of another vendor's build. An `environ` is empty once its
+/// process has started exiting, which yields `None`.
+#[cfg(target_os = "linux")]
+fn server_socket_of_environ(environ: &[u8]) -> Option<std::path::PathBuf> {
+    let mut device = None;
+    let mut name = "";
+    for entry in environ.split(|b| *b == 0) {
+        // `continue`, NOT `?`. An `environ` blob is arbitrary bytes, and one non-UTF8 entry
+        // anywhere before ours — a path, LS_COLORS, anything inherited from an operator's shell —
+        // must not abort the whole scan and answer "cannot tell".
+        let Ok(text) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        if let Some(v) = text.strip_prefix("CUDA_VISIBLE_DEVICES=") {
+            device = v.trim().parse::<u32>().ok();
+        } else if let Some(v) = text.strip_prefix("SP1_GPU_SERVER_NAME=") {
+            name = v;
+        }
+    }
+    server_socket_path(name, device?)
+}
+
+/// Whether a server whose parent has this `comm` has outlived its owner, given its `ppid`.
+///
+/// `ppid == 1` is the discriminator: a server owned by a LIVE worker (this one, or a sibling miner
+/// on the same box) has that worker as its parent, so it is never touched. Only a server whose owner
+/// is already gone gets killed.
+///
+/// An orphan goes to its nearest subreaper rather than to PID 1, and `systemd --user` is one: what a
+/// terminal on a desktop, or a user unit, descends from. Measured, an orphan from a user unit had
+/// ppid 3198, comm `systemd`, so a test of `ppid == 1` alone never reaps there. No worker is called
+/// that, and the SDK starts the server as its own child, so such a parent is no worker that lives
+/// on. An operator's own `sp1-gpu-server` unit is killed here too, as one under PID 1 always was.
+#[cfg(target_os = "linux")]
+fn parent_means_orphan(ppid: i32, parent_comm: Option<&str>) -> bool {
+    ppid == 1 || parent_comm.is_some_and(|comm| comm.trim() == "systemd")
+}
+
+/// Whether `pid` is an `sp1-gpu-server` that is still exiting. A pid no longer naming one (it is
+/// gone, or was reused) is not.
+#[cfg(target_os = "linux")]
+fn server_still_exiting(pid: i32) -> bool {
+    let is_server = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .is_ok_and(|comm| comm.trim().starts_with("sp1-gpu-server"));
+    is_server
+        && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|stat| !has_finished_exiting(&stat))
+}
+
+/// Kill any ORPHANED `sp1-gpu-server` before this worker starts its own, remove the socket it was
+/// holding, and wait up to `wait` for it to finish exiting.
 ///
 /// WHY THIS EXISTS. The SDK forks `sp1-gpu-server` as a child of this worker and relies on
 /// `kill_on_drop(true)` to reap it. That only works on a graceful teardown. If the worker
@@ -158,26 +661,32 @@ fn ppid_from_proc_stat(stat: &str) -> Option<i32> {
 /// not apply to the grandchild, and the dispatcher's process-group kill cannot run if the
 /// whole miner is gone.
 ///
-/// The result is not a clean failure, which is what made it hard to spot. Measured
-/// 2026-10-03: SIGKILLing the worker left the server alive at 7.6GB RSS, still listening on
+/// The result is not a clean failure, which is what makes it hard to spot. Measured
+/// behaviour: SIGKILLing the worker left the server alive at 7.6GB RSS, still listening on
 /// `/tmp/sp1-cuda-0.sock`. The NEXT worker's `CudaClient::connect` unconditionally calls
-/// `start_server`, whose new server cannot bind the in-use socket and dies -- so the client
-/// silently CONNECTS TO THE ORPHAN and proves against it. The proof succeeds, and the
-/// orphan's RSS grew 8.5GB -> 19.5GB across one adoption. Nothing ever reaps it, so on a
-/// 28GB host an adopted server drifts upward run after run until the box is out of memory.
+/// `start_server`, whose new server takes hundreds of milliseconds to replace the socket, while
+/// the client connects at once -- so it silently CONNECTS TO THE ORPHAN and proves against it. The
+/// proof succeeds, and the orphan's RSS grew 8.5GB -> 19.5GB across one adoption. Nothing ever reaps
+/// it, so on a 28GB host an adopted server drifts upward run after run until the box is out of memory.
 ///
-/// `ppid == 1` is the discriminator: a server owned by a LIVE worker (this one, or a
-/// sibling miner on the same box) has that worker as its parent, so it is never touched.
-/// Only a server whose owner is already gone gets killed.
-fn reap_orphaned_gpu_servers(our_device: Option<u32>) {
+/// WHY KILLING IS NOT ENOUGH. A SIGKILLed server frees its memory before it closes its descriptors,
+/// so its socket goes on accepting connections for as long as that takes: 98 ms at 2.3 GB, 1,070 ms
+/// at 29.6 GB. The SDK connects before its own new server has bound, within ~400 ms of a worker
+/// starting, so past roughly 10 GB it connected to the dying server, the connection then broke, and
+/// as the SDK never reconnects the worker failed (HIP 6 of 6, SYCL 3 of 3), with a healthy new
+/// server running unused. Waiting for the orphan to finish exiting fixed it, 4 of 4.
+///
+/// `wait` is zero at startup, inside the handshake's budget, and [`ORPHAN_EXIT_WAIT`] just before a
+/// server starts, where the scan finds again whatever is still exiting.
+fn reap_orphaned_gpu_servers(our_device: Option<u32>, wait: Duration) {
+    #[cfg(not(target_os = "linux"))]
+    let _ = (our_device, wait);
     #[cfg(target_os = "linux")]
     {
         let Ok(entries) = std::fs::read_dir("/proc") else {
             return;
         };
-        let mut killed = 0usize;
-        // Devices whose orphaned server we actually killed, so only their sockets are removed.
-        let mut reaped_devices: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut killed: Vec<i32> = Vec::new();
         for e in entries.flatten() {
             let name = e.file_name();
             let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
@@ -187,7 +696,9 @@ fn reap_orphaned_gpu_servers(our_device: Option<u32>) {
             let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
                 continue;
             };
-            if comm.trim() != "sp1-gpu-server" {
+            // Every build: `sp1-gpu-server`, and the HIP/SYCL ones under longer names (`comm` is
+            // truncated to 15 bytes, `sp1-gpu-server-`).
+            if !comm.trim().starts_with("sp1-gpu-server") {
                 continue;
             }
             // Field 4 of /proc/<pid>/stat is ppid, but comm (field 2) can contain spaces
@@ -199,13 +710,19 @@ fn reap_orphaned_gpu_servers(our_device: Option<u32>) {
                 Some(v) => v,
                 None => continue,
             };
-            if ppid != 1 {
+            let parent_comm = std::fs::read_to_string(format!("/proc/{ppid}/comm")).ok();
+            if !parent_means_orphan(ppid, parent_comm.as_deref()) {
                 continue; // still owned by a live worker -- not ours to kill
+            }
+            // Nothing to do or to wait for: a zombie that nothing is reaping, in a container whose
+            // PID 1 is not an init. It would stay and raise the alarm below on every worker's start.
+            if has_finished_exiting(&stat) {
+                continue;
             }
             // Deliberately NOT scoped to our own device.
             //
-            // The `ppid != 1` test above already spares every server a live worker owns — this one's,
-            // a sibling's, another miner's — because such a server has that worker as its parent. So
+            // The check above already spares every server a live worker owns — this one's, a
+            // sibling's, another miner's — because such a server has that worker as its parent. So
             // anything reaching this line is owned by nobody, and killing it is right whichever card
             // it sat on. Scoping the kill by device was a mistake in the other direction: the next
             // thing this process does is `CudaClient::connect`, which ADOPTS a reachable orphan
@@ -213,12 +730,12 @@ fn reap_orphaned_gpu_servers(our_device: Option<u32>) {
             // re-opens the exact bug this function exists to prevent. It is only the SOCKET cleanup
             // that has to be narrowed, because that is the part that can harm a live sibling.
             //
-            // Note the device anyway, so the cleanup below can unlink precisely what was freed.
-            if let Some(d) = server_device_of_pid(pid) {
-                reaped_devices.insert(d);
-            }
+            // Read before the kill: its environment is gone as soon as it starts exiting.
+            let socket = std::fs::read(format!("/proc/{pid}/environ"))
+                .ok()
+                .and_then(|environ| server_socket_of_environ(&environ));
             tracing::warn!(
-                "reaping orphaned sp1-gpu-server pid {pid} (ppid 1) left by an abruptly \
+                "reaping orphaned sp1-gpu-server pid {pid} (ppid {ppid}) left by an abruptly \
                  killed worker; adopting it instead would reuse a server nothing can reap"
             );
             // Count only an ACTUAL kill. Ignoring the return counted an EPERM (a server owned by
@@ -229,67 +746,190 @@ fn reap_orphaned_gpu_servers(our_device: Option<u32>) {
             if rc != 0 {
                 tracing::warn!(
                     "could not SIGKILL orphaned sp1-gpu-server pid {pid}: {}. It may belong to \
-                     another user, or already be a zombie.",
+                     another user, or already be gone.",
                     std::io::Error::last_os_error()
                 );
                 continue;
             }
-            killed += 1;
-        }
-        if killed > 0 {
-            // The orphan held the socket; remove it so our fresh server binds cleanly rather than
-            // racing a dying one. The SDK never unlinks it (CudaClientInner's Drop only shuts the
-            // stream down), and the path is machine-global.
+            killed.push(pid);
+            // The orphan held the socket; remove it so that nothing connects into a dying server.
+            // The SDK never unlinks it (CudaClientInner's Drop only shuts the stream down), and the
+            // path is machine-global. At once, not after the scan, while no new server for that
+            // card should have bound it: `build_prover` starts one only after this wait.
             //
-            // ONLY OUR OWN. This used to sweep `/tmp/sp1-cuda-{0..7}.sock` unconditionally, which
-            // contradicted the `ppid != 1` check a few lines above: that check exists to spare a
-            // server owned by a live worker, and then the cleanup pulled the socket out from under
-            // it, breaking the sibling's reconnect path. With one SP1 worker per card that is no
-            // longer a corner case — it is what happens every time two workers start.
-            // ONLY the sockets whose server we just killed, plus our own.
+            // One way that can still be wrong: an orphan stuck in a driver past `ORPHAN_EXIT_WAIT`
+            // has its card's worker start a new server at this path, and a later scan by another
+            // worker unlinks that. It only matters within the second the SDK takes to connect, and
+            // then costs one proof attempt.
             //
-            // This used to sweep `/tmp/sp1-cuda-{0..7}.sock` unconditionally, which contradicted the
-            // `ppid != 1` check above: that check spares a server a live worker owns, and then the
-            // sweep pulled the socket out from under it, breaking the sibling's reconnect. With one
-            // SP1 worker per card that stopped being a corner case and became what happens on every
-            // startup. (The server also unlinks a stale socket itself before binding, so this is
-            // hygiene rather than the thing that makes a bind succeed.)
-            let mut to_unlink = reaped_devices.clone();
-            to_unlink.insert(our_device.unwrap_or(0));
-            for id in to_unlink {
-                let p = format!("/tmp/sp1-cuda-{id}.sock");
-                if std::path::Path::new(&p).exists() {
-                    let _ = std::fs::remove_file(&p);
-                }
+            // ONLY the socket of the server just killed, and below our own. This used to sweep
+            // `/tmp/sp1-cuda-{0..7}.sock` unconditionally, which contradicted the check above: that
+            // check spares a server a live worker owns, and then the sweep pulled the socket out
+            // from under it, breaking the sibling's reconnect. With one SP1 worker per card that
+            // stopped being a corner case and became what happens on every startup.
+            if let Some(socket) = socket {
+                let _ = std::fs::remove_file(socket);
             }
-            tracing::warn!("reaped {killed} orphaned sp1-gpu-server process(es)");
+        }
+        if killed.is_empty() {
+            return;
+        }
+        // Our own as well: the orphan on our card may have been past telling us its name. A
+        // measure-only worker has none. It starts no server, and it has no device of its own: its
+        // default of 0 would name the live socket of whichever worker proves on card 0.
+        if !sp1_measure_only() {
+            if let Some(own) = server_socket_path(&warmup::server_name(), our_device.unwrap_or(0)) {
+                let _ = std::fs::remove_file(own);
+            }
+        }
+        tracing::warn!(
+            "reaped {} orphaned sp1-gpu-server process(es)",
+            killed.len()
+        );
+        if wait.is_zero() {
+            return;
+        }
+        let started = Instant::now();
+        loop {
+            killed.retain(|pid| server_still_exiting(*pid));
+            if killed.is_empty() {
+                tracing::info!(
+                    "orphaned sp1-gpu-server finished exiting after {:.2?}",
+                    started.elapsed()
+                );
+                return;
+            }
+            if started.elapsed() >= wait {
+                tracing::warn!(
+                    "orphaned sp1-gpu-server pid(s) {killed:?} still exiting after {wait:?}, \
+                     probably stuck in a GPU driver; going ahead, as their sockets are removed"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
 
-/// Which CUDA device a running `sp1-gpu-server` was started for, read from its own environment.
-///
-/// The SDK sets `CUDA_VISIBLE_DEVICES=<id>` on the child it spawns, so the child's `environ` is the
-/// authoritative record of which card it owns — more reliable than guessing from its socket, which we
-/// cannot see from `/proc`. Unreadable `environ` (a server owned by another user, or one that exited
-/// between the two reads) yields `None`, which the caller treats as "cannot tell", and it then leaves
-/// the process alone rather than killing something that may not be ours.
+/// How old an UNmapped `/dev/shm/sp1_*` segment must be before the reaper unlinks it. The
+/// `/proc/*/maps` liveness scan is the primary signal; this floor only covers the brief window
+/// between a live worker's `shm_open`+`ftruncate` and the `mmap` that would make the segment appear
+/// in `maps` — when a genuinely-live segment is momentarily in neither place.
 #[cfg(target_os = "linux")]
-fn server_device_of_pid(pid: i32) -> Option<u32> {
-    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    for entry in raw.split(|b| *b == 0) {
-        // `continue`, NOT `?`. An `environ` blob is arbitrary bytes, and one non-UTF8 entry
-        // anywhere before ours — a path, LS_COLORS, anything inherited from an operator's shell —
-        // used to abort the whole scan and answer "cannot tell".
-        let Ok(text) = std::str::from_utf8(entry) else {
+const SP1_SHM_ORPHAN_MIN_AGE: Duration = Duration::from_secs(30);
+
+/// Unlink `/dev/shm/sp1_*` segments (memory image, trace ring) and their `sem.sp1_*` semaphores
+/// left behind by a native executor that died WITHOUT running its `Drop` — a SIGBUS when /dev/shm
+/// filled, an OOM `SIGKILL`, an abort. A clean or in-band exit already unlinks them (sp1-jit RAII),
+/// so this only ever removes ORPHANS.
+///
+/// WHY THIS EXISTS. Every `execute()` on the native executor (x86-64 Linux) stages a memory image
+/// and a trace ring in /dev/shm. On the graceful path sp1-jit unlinks them; on an abnormal death
+/// they LEAK, and a tmpfs that accumulates leaked segments makes every LATER execute SIGBUS the
+/// instant it touches an unbacked page — a durable, cross-job denial of service (a stale segment
+/// was found in the wild). Running this at worker startup — which is also every respawn, and so the
+/// step right after the dispatcher's watchdog `SIGKILL`s a wedged measure worker — reclaims leaked
+/// segments over time. The age floor defers the segment THIS respawn's death just leaked to a later
+/// pass (it is younger than the floor now); that is fine, because one stale ring does not fill a
+/// correctly-sized tmpfs, and the next pass reaps it once it has aged out of the create→mmap window.
+/// What the dispatcher kills itself it unlinks as it does so (`unlink_group_sp1_shm`), so this is for
+/// deaths it did not cause, and for a dispatcher that died too.
+///
+/// The discriminator is LIVENESS, not a pid (the names are random uuids): a segment that any live
+/// process still maps (`/proc/*/maps`) is spared. The age floor is a second guard for the create→mmap
+/// window. Cross-user safety is explicit: we only ever unlink a segment whose owner uid is our own
+/// euid, so a foreign segment is never ours to reap — independent of the /dev/shm mount's sticky bit
+/// (which would otherwise be the only thing stopping a root miner, or a miner on a non-sticky mount,
+/// from unlinking another uid's file) and independent of whether we can read that uid's `/proc/*/maps`.
+///
+/// Mirrors `reap_orphaned_gpu_servers`: same /proc-walk, same "only touch what is provably orphaned".
+#[cfg(target_os = "linux")]
+fn reap_orphaned_sp1_shm() {
+    let Ok(dir) = std::fs::read_dir("/dev/shm") else {
+        return;
+    };
+    // SP1 segments old enough to be past the create→mmap window: the only reap candidates.
+    let mut candidates: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for e in dir.flatten() {
+        let fname = e.file_name();
+        let Some(name) = fname.to_str() else {
             continue;
         };
-        if let Some(v) = text.strip_prefix("CUDA_VISIBLE_DEVICES=") {
-            return v.trim().parse().ok();
+        if !is_sp1_shm_basename(name) {
+            continue;
+        }
+        let Ok(md) = e.metadata() else {
+            continue;
+        };
+        // Only ever unlink a segment WE own. The /proc/*/maps liveness scan already spares live
+        // foreign segments, and on the normal sticky /dev/shm (mode 1777) a non-root miner cannot
+        // unlink another uid's file at all — but an operator who mounted /dev/shm non-sticky would
+        // lose that backstop, and a root miner never had it. An explicit euid check makes the reaper
+        // safe regardless of mount options or uid: a foreign segment is simply not ours to reap.
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid() is always successful and has no side effects.
+            if md.uid() != unsafe { libc::geteuid() } {
+                continue;
+            }
+        }
+        // An unreadable/younger mtime (racing a concurrent create or unlink) → skip; a later pass
+        // reaps it once it has aged, and never while it may still be a live worker's.
+        let old_enough = md
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= SP1_SHM_ORPHAN_MIN_AGE);
+        if old_enough {
+            candidates.push((e.path(), name.to_string()));
         }
     }
-    None
+    if candidates.is_empty() {
+        return;
+    }
+    // Every SP1 /dev/shm name any live process maps right now: spared whoever owns it.
+    let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for pe in entries.flatten() {
+            let pname = pe.file_name();
+            let is_pid = pname
+                .to_str()
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+            if !is_pid {
+                continue;
+            }
+            // Another user's maps is EACCES — skip it. A non-root miner cannot unlink that process's
+            // /dev/shm files anyway (the tmpfs is sticky, mode 1777, and they are another uid's), so
+            // not seeing its mappings here cannot make us remove a live foreign segment. (A root miner
+            // can read every maps, so it spares foreign live segments via the liveness scan instead.)
+            if let Ok(maps) = std::fs::read_to_string(pe.path().join("maps")) {
+                sp1_shm_mapped_in(&maps, &mut live);
+            }
+        }
+    }
+    let mut reaped = 0usize;
+    for (path, name) in candidates {
+        if live.contains(&name) {
+            continue;
+        }
+        // `remove_file` on the backing /dev/shm file is exactly what `shm_unlink`/`sem_unlink` do:
+        // drop the name. EPERM (another user's) or ENOENT (already gone) is a harmless skip.
+        if std::fs::remove_file(&path).is_ok() {
+            reaped += 1;
+        }
+    }
+    if reaped > 0 {
+        tracing::warn!(
+            "reaped {reaped} orphaned SP1 /dev/shm segment(s) left by an abnormally-killed native \
+             executor; left unlinked they fill the tmpfs and SIGBUS every later execute"
+        );
+    }
 }
+
+/// Non-Linux: the native executor (and its /dev/shm staging) does not exist — the portable executor
+/// runs in-process — so there is nothing to reap.
+#[cfg(not(target_os = "linux"))]
+fn reap_orphaned_sp1_shm() {}
 
 /// The soname `sp1-gpu-server` demands. Fixed at ITS link time, not ours.
 const CUDART_SONAME: &str = "libcudart.so.12";
@@ -458,7 +1098,7 @@ fn find_cuda12_runtime_dir() -> Option<std::path::PathBuf> {
 /// prove is a guaranteed loss." Past the lock deadline it is worse: `releaseJob` reverts
 /// and the collateral is stranded until a keeper slash.
 ///
-/// Measured on a fresh install of the release artifacts (2026-10-03): `sp1-gpu-server`
+/// Measured on a fresh install of the release artifacts: `sp1-gpu-server`
 /// is prebuilt against `libcudart.so.12`, the host had CUDA 13.3 and no CUDA 12 runtime,
 /// and the worker still announced itself ready.
 ///
@@ -470,6 +1110,16 @@ fn find_cuda12_runtime_dir() -> Option<std::path::PathBuf> {
 /// Returns `Err(reason)` only when SP1 provably CANNOT work here. A case we cannot settle
 /// cheaply (the server binary is absent, so the SDK would download it) returns `Ok`: this
 /// must not refuse a host that would in fact work.
+/// True when this worker was launched as the dedicated MEASURE-ONLY slot (see
+/// `SP1_MEASURE_ONLY_ENV`): it only ever sizes cycles on the CPU executor and must never build the
+/// CudaProver / fork `sp1-gpu-server`.
+fn sp1_measure_only() -> bool {
+    std::env::var(zkminer_prover_protocol::types::SP1_MEASURE_ONLY_ENV)
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
 fn sp1_usability() -> Result<(), String> {
     // The SDK does `env::var("HOME").expect(...)` to locate the server, so an unset HOME
     // is a panic rather than an error. Systemd units routinely have no HOME.
@@ -497,8 +1147,10 @@ fn sp1_usability() -> Result<(), String> {
     // the reason: do not report "0 GPUs" from an unparseable probe, because "that would
     // silently skip the CUDA worker". Only treat the GPU as absent when nvidia-smi AND
     // the kernel driver's own /proc entries agree.
+    // An AMD or Intel card's build of the server (`SP1_GPU_SERVER_NAME`) has its own pins and needs no
+    // NVIDIA GPU; its --version is still checked below.
     let (gpu_available, _) = detect_gpu();
-    if !gpu_available && !nvidia_gpu_in_proc() {
+    if warmup::drives_cuda() && !gpu_available && !nvidia_gpu_in_proc() {
         return Err(
             "no NVIDIA GPU detected (neither nvidia-smi nor /proc/driver/nvidia/gpus \
              reports one) and this SP1 worker is CUDA-only -- it has no CPU proving path"
@@ -512,7 +1164,9 @@ fn sp1_usability() -> Result<(), String> {
     //   "error while loading shared libraries: libcudart.so.12: cannot open shared
     //    object file"
     // `--version` is what the SDK itself runs, costs milliseconds, and touches no GPU.
-    let server = std::path::PathBuf::from(&home).join(".sp1/bin/sp1-gpu-server");
+    let server = std::path::PathBuf::from(&home)
+        .join(".sp1/bin")
+        .join(warmup::server_name());
     if !server.exists() {
         // Absent: the SDK downloads it on first use. We cannot verify a binary that does
         // not exist yet, and refusing here would disable SP1 on a host where it works.
@@ -757,12 +1411,19 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     // Lazy-init the CUDA prover on first Prove/Benchmark command, not at startup.
     // CudaProver initialization is expensive (spawns sp1-gpu-server, CUDA context)
     // and would block the handshake response if done before the message loop.
-    let mut prover: Option<sp1_sdk::blocking::CudaProver> = None;
-    // Cache one proving key per unique ELF. The key depends only on the program, so
-    // reusing it across proofs of the same ELF avoids a costly setup() every call AND
-    // stops leaking a fresh GPU-resident key per proof (the old code mem::forget'd the
-    // key each time). VRAM is now bounded to O(unique ELFs) instead of O(proofs).
-    let mut pk_cache: HashMap<u64, CudaPk> = HashMap::new();
+    //
+    // `held.pk_cache` keeps one proving key per unique ELF. The key depends only on the program, so
+    // reusing it across proofs of the same ELF avoids a costly setup() every call AND stops leaking a
+    // fresh GPU-resident key per proof (the old code mem::forget'd the key each time). VRAM is now
+    // bounded to O(unique ELFs) instead of O(proofs).
+    let mut held = ServerHolders::new();
+    // Lazy CPU prover used ONLY for the pre-claim EXECUTE (cycle-measurement) path. SP1 execution is
+    // pure CPU emulation, so measuring on a `CpuProver` yields the identical cycle count the CUDA
+    // prover would while never spinning up `sp1-gpu-server` — keeping the sizing path as cheap as
+    // risc0's. See `run_execute_sp1`.
+    let mut cpu_executor: Option<sp1_sdk::blocking::CpuProver> = None;
+    // Set when the connection to the server is lost, which ends the loop. See `ServerLost`.
+    let mut server_lost: Option<anyhow::Error> = None;
     // Which card this worker drives, chosen by the dispatcher.
     //
     // NOT `CUDA_VISIBLE_DEVICES`. The SDK sets that itself on the `sp1-gpu-server` child from the id
@@ -817,7 +1478,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     // `SP1CoreOpts` never even crosses into the server crate. A card below the floor is refused
     // whatever we set, which is why the dispatcher declines to create a slot there at all.
     //
-    // What it does address is the limit that actually bound on this box, measured on 2026-10-05 with
+    // What it does address is the limit that actually bound on this box, measured with
     // SP1 pinned to the 24,564 MiB RTX 4090. The core proof and the Groth16 witness completed; the
     // worker then died in the wrap at 18.0 GiB of heap plus 7.0 GiB of shared memory — 25.0 GiB
     // against a 25.1 GiB per-worker ceiling, killed by its own cgroup (CONSTRAINT_MEMCG) rather than
@@ -939,52 +1600,6 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
         }
     }
 
-    // Build the prover, turning a PANIC into a decline.
-    //
-    // The SDK ends `build()` with `.expect("Failed to create the CUDA prover impl")`, so anything that
-    // stops `sp1-gpu-server` coming up kills this process outright. The dispatcher then sees only EOF
-    // and reads it as worker ill-health: it excludes a slot, burns a retry, respawns, and does it all
-    // again on the next job. But the commonest cause is categorical, not transient — the server
-    // refuses a card below its hard VRAM floor — upstream's reads "Unsupported GPU memory: 20, must be
-    // at least 24GB"; the fork this repo pins lowers it to 16 — which will be just as true next time.
-    //
-    // Catching it lets us answer the protocol properly. `WORKER_DECLINED` is the dispatcher's existing
-    // signal for "I spoke to you, and I cannot prove here": it stops the backend being advertised on
-    // this slot instead of being rediscovered job after job.
-    //
-    // `AssertUnwindSafe` is sound here because the panic path leaves nothing of ours half-written: the
-    // prover slot is still `None` (we only assign on success), and the SDK's own state dies with the
-    // server it failed to reach.
-    fn build_prover(
-        cuda_device_id: Option<u32>,
-    ) -> std::result::Result<sp1_sdk::blocking::CudaProver, String> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tracing::info!("Initializing SP1 CUDA prover...");
-            let builder = sp1_sdk::blocking::ProverClient::builder().cuda();
-            let builder = match cuda_device_id {
-                Some(id) => builder.with_device_id(id),
-                None => builder,
-            };
-            builder.build()
-        }))
-        .map_err(|e| {
-            let detail = e
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| e.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "panic with no message".to_string());
-            format!(
-                "{}: could not initialise the SP1 CUDA prover on device {}: {detail}. The most \
-                 likely cause is a card below sp1-gpu-server's hard VRAM floor (16 GB in the pinned \
-                 fork, 24 GB upstream), which no proving option can change.",
-                zkminer_prover_protocol::types::WORKER_DECLINED,
-                cuda_device_id
-                    .map(|d| d.to_string())
-                    .unwrap_or_else(|| "default".to_string()),
-            )
-        })
-    }
-
     macro_rules! get_prover {
         ($p:expr) => {
             match $p {
@@ -1021,18 +1636,23 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // Deliberately not a new HelloAck field: the codec is bincode, which is
                 // not self-describing, so adding one is a wire break between a new host
                 // and an older worker. This uses existing protocol surface.
-                if let Err(reason) = sp1_usability() {
-                    tracing::error!(
-                        "SP1 is NOT usable on this host, so this worker will not \
-                         advertise it: {reason}"
-                    );
-                    let resp = WorkerResponse::Error {
-                        request_id: 0,
-                        kind: ErrorKind::ResourceExhausted,
-                        message: format!("sp1 unavailable on this host: {reason}"),
-                    };
-                    write_message(&mut stdout, &resp)?;
-                    return Ok(());
+                // A measure-only worker never proves (it sizes on the CPU executor), so the GPU
+                // usability probe is irrelevant and must not gate — or forkserver-probe from — its
+                // handshake. A normal (proving) worker is still gated by the probe.
+                if !sp1_measure_only() {
+                    if let Err(reason) = sp1_usability() {
+                        tracing::error!(
+                            "SP1 is NOT usable on this host, so this worker will not \
+                             advertise it: {reason}"
+                        );
+                        let resp = WorkerResponse::Error {
+                            request_id: 0,
+                            kind: ErrorKind::ResourceExhausted,
+                            message: format!("sp1 unavailable on this host: {reason}"),
+                        };
+                        write_message(&mut stdout, &resp)?;
+                        return Ok(());
+                    }
                 }
                 let resp = WorkerResponse::HelloAck {
                     protocol_version: PROTOCOL_VERSION,
@@ -1064,11 +1684,47 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
 
             WorkerCommand::Benchmark => {
                 tracing::info!("Running benchmarks...");
-                match get_prover!(prover) {
+                if sp1_measure_only() {
+                    // Benchmarking builds the CudaProver (forks sp1-gpu-server) — exactly what a
+                    // measure-only worker must never do. Refuse on the protocol; the dispatcher never
+                    // sends this to the measure slot, so this is defense in depth against a misroute.
+                    let resp = WorkerResponse::Error {
+                        request_id: 0,
+                        kind: ErrorKind::Internal,
+                        message: "measure-only SP1 worker does not benchmark".to_string(),
+                    };
+                    write_message(&mut stdout, &resp)?;
+                    continue;
+                }
+                match get_prover!(held.prover) {
                     Ok(p) => {
-                        let results = run_benchmarks(p);
-                        let resp = WorkerResponse::BenchmarkResult { results };
+                        let run = run_benchmarks(p, &mut held.benchmark_keys);
+                        // Answered even when the server is gone. What completed stands, and the host
+                        // then recycles this slot as after any benchmark, waiting for its memory to
+                        // come back before the next card's turn. A worker that just exited would
+                        // skip both.
+                        //
+                        // Zero rows is a failure, and an answer of zero rows hides it: the host
+                        // skips an empty result without a word.
+                        let resp = if run.results.is_empty() {
+                            let message =
+                                format!("no SP1 benchmark completed: {}", run.failed.join("; "));
+                            tracing::error!("{message}");
+                            WorkerResponse::Error {
+                                request_id: 0,
+                                kind: ErrorKind::Internal,
+                                message,
+                            }
+                        } else {
+                            WorkerResponse::BenchmarkResult {
+                                results: run.results,
+                            }
+                        };
                         write_message(&mut stdout, &resp)?;
+                        if let Some(lost) = run.server_lost {
+                            server_lost = Some(lost);
+                            break;
+                        }
                     }
                     Err(message) => {
                         tracing::error!("{message}");
@@ -1087,8 +1743,21 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 elf,
                 input_data,
                 po2: _, // SP1 does not use segment sizing
+                program_id,
             } => {
                 tracing::info!("Proving request {request_id} ({} bytes ELF)", elf.len());
+                if sp1_measure_only() {
+                    // Proving builds the CudaProver (forks sp1-gpu-server) — exactly what a
+                    // measure-only worker must never do. Refuse on the protocol; the dispatcher never
+                    // routes a Prove to the measure slot, so this is defense in depth against a misroute.
+                    let resp = WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::Internal,
+                        message: "measure-only SP1 worker does not prove".to_string(),
+                    };
+                    write_message(&mut stdout, &resp)?;
+                    continue;
+                }
                 // Announce proof START so the miner can move the job from Queued to Proving.
                 // Without this the job displays "Queued (waiting for GPU)" for the whole proof.
                 let started = WorkerResponse::Progress {
@@ -1098,7 +1767,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     segments: None,
                 };
                 write_message(&mut stdout, &started)?;
-                let prover_for_proof = match get_prover!(prover) {
+                let prover_for_proof = match get_prover!(held.prover) {
                     Ok(p) => p,
                     Err(message) => {
                         // A DECLINE, answered on the protocol, rather than a panic the dispatcher can
@@ -1113,8 +1782,24 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         continue;
                     }
                 };
-                match run_proof(prover_for_proof, &mut pk_cache, &elf, &input_data) {
-                    Ok((journal, seal, duration_secs, cycles)) => {
+                // `run_proof`'s prove-only SDK calls — `setup` (vkey/pk derivation) and
+                // the GPU `prove` — run on the fully attacker-controlled ELF and are NOT exercised by
+                // the Execute measurement gate, so a crafted ELF that executes cleanly (hence measures
+                // feasible and gets CLAIMED) can still panic here. The Execute arm already wraps its
+                // SDK calls in catch_unwind for exactly this reason; the Prove arm must too, or the
+                // worker dies on a CLAIMED job, the dispatcher charges a healthy slot, the retry loop
+                // crashes every GPU, and the program is never classed bad. A caught panic is a bad job.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_proof(
+                        prover_for_proof,
+                        &mut held.pk_cache,
+                        &elf,
+                        &input_data,
+                        program_id,
+                    )
+                }));
+                match outcome {
+                    Ok(Ok((journal, seal, duration_secs, cycles))) => {
                         let resp = WorkerResponse::ProofResult {
                             request_id,
                             journal,
@@ -1124,9 +1809,40 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(e) => {
+                    Err(_panic) => {
+                        let resp = WorkerResponse::Error {
+                            request_id,
+                            kind: ErrorKind::InvalidInput,
+                            message: "SP1 prover panicked on this ELF (malformed or hostile program)"
+                                .to_string(),
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                    Ok(Err(e)) if e.is::<ServerLost>() => {
+                        // No answer: the host reads the EOF as this worker dying, which it is, and
+                        // retries on a new one. The job is not at fault unless it does this to every
+                        // server it is retried on, which the host's count of failed attempts sees as
+                        // for any other failure.
+                        server_lost = Some(e);
+                        break;
+                    }
+                    Ok(Err(e)) => {
                         let msg = format!("{e:#}");
-                        let kind = if is_gpu_oom(&msg) {
+                        // The vkey-binding bails below are THIS binary's own host-authored strings, not
+                        // guest text (the executor's errors are a typed enum with no free-form guest
+                        // field), so matching them is safe — unlike matching the guest-controlled
+                        // `message` body, which nothing here does. Check them BEFORE is_gpu_oom so a
+                        // permanent program-level mismatch is reported as such and never misread as a
+                        // transient GPU OOM.
+                        let kind = if msg.contains("does not match job programId")
+                            || msg.contains("could not parse SP1 vkey hash")
+                        {
+                            // The served ELF's verifying key cannot match this job's programId. No job
+                            // for this program can ever be proved, so report it as ProgramMismatch: the
+                            // host negative-caches the program and stops claiming its jobs, instead of
+                            // eating a release penalty per submitted job.
+                            ErrorKind::ProgramMismatch
+                        } else if is_gpu_oom(&msg) {
                             // GPU OOM: tag as ResourceExhausted so the dispatcher kills +
                             // respawns this worker (and its gpu-server) with clean VRAM.
                             ErrorKind::ResourceExhausted
@@ -1161,19 +1877,99 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Execute { request_id, .. } => {
-                // Cycle measurement is implemented for risc0 only: it is the backend whose
-                // executor reports the same `total_cycles` the prover does, so the number is
-                // directly comparable to what proving will report. Decline explicitly rather
-                // than returning a fabricated count — a wrong cycle count would size the
-                // deadline check and the look-ahead queue, and silently claiming work we
-                // cannot finish loses collateral outright.
-                let resp = WorkerResponse::Error {
-                    request_id,
-                    kind: ErrorKind::InvalidInput,
-                    message: "cycle measurement not supported by the sp1 backend".to_string(),
+            WorkerCommand::Execute {
+                request_id,
+                elf,
+                input_data,
+                // NOT used on the SP1 sizing path: deriving SP1's vkey needs `setup`,
+                // which is ~minutes on CPU and would blow the host's measure watchdog. The binding is
+                // enforced host-side (registry byte-binding → measure-ELF == prove-ELF) and on the
+                // prove path's vkey gate instead. See `run_execute_sp1`.
+                program_id: _,
+                // risc0's segment size; SP1 shards on its own.
+                po2: _,
+            } => {
+                // Real cycle measurement for SP1, matching risc0's Execute
+                // arm, so the miner sizes SP1 jobs on a measured count rather than the
+                // submitter-declared `expectedCycles`. Runs on a lazily-built CPU executor (no
+                // gpu-server), so it is as cheap as risc0's sizing path.
+                tracing::info!("Execute (sizing) request {request_id} ({} bytes ELF)", elf.len());
+                let cpu = match cpu_executor {
+                    Some(ref c) => c,
+                    None => {
+                        // Build the CPU executor defensively: a panic here must answer the protocol
+                        // (Internal), not vanish and have the dispatcher kill a healthy proving slot.
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            sp1_sdk::blocking::ProverClient::builder().cpu().build()
+                        })) {
+                            Ok(built) => cpu_executor.insert(built),
+                            Err(_) => {
+                                let resp = WorkerResponse::Error {
+                                    request_id,
+                                    kind: ErrorKind::Internal,
+                                    message: "failed to initialise the SP1 CPU executor for sizing"
+                                        .to_string(),
+                                };
+                                write_message(&mut stdout, &resp)?;
+                                continue;
+                            }
+                        }
+                    }
                 };
-                write_message(&mut stdout, &resp)?;
+                // The ELF bytes are fully attacker-controlled, and SP1's parser/executor
+                // (`Elf::from` / `setup` / `execute().run()`) CAN panic on a malformed registered ELF
+                // rather than returning Err. A panic unwinding out of the loop would have the
+                // dispatcher score a HEALTHY proving slot as failed — the very outcome the executor
+                // builder above is wrapped to avoid. Contain the attacker-data path too: a caught
+                // panic is a property of the job (InvalidInput), not of this worker.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_execute_sp1(cpu, &elf, &input_data)
+                }));
+                match outcome {
+                    Ok(Ok((cycles, journal, duration_secs, peak_host_bytes))) => {
+                        tracing::info!(
+                            "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s, peak \
+                             host {} MiB",
+                            peak_host_bytes / (1024 * 1024)
+                        );
+                        let resp = WorkerResponse::ExecuteResult {
+                            request_id,
+                            cycles,
+                            duration_secs,
+                            journal_len: journal.len() as u64,
+                            peak_host_bytes,
+                            // One no fulfil could carry is reported by its length alone.
+                            journal: (journal.len() <= EXECUTE_JOURNAL_MAX_BYTES).then_some(journal),
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                    Ok(Err(e)) => {
+                        let msg = format!("{e:#}");
+                        // Execution failure is NOT proof failure: the guest may trip the cycle cap
+                        // (canonicalized to "exceeded cycle limit …", which the host classifies as
+                        // too-heavy), fail the vkey bind, or simply error on this input. All are
+                        // properties of the job, not of this worker, so report InvalidInput and keep
+                        // the healthy worker alive.
+                        let resp = WorkerResponse::Error {
+                            request_id,
+                            kind: ErrorKind::InvalidInput,
+                            message: msg,
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                    Err(_) => {
+                        // A panic in the attacker-data path: same InvalidInput classification, worker
+                        // stays alive (the loop continues; the slot is not scored failed).
+                        let resp = WorkerResponse::Error {
+                            request_id,
+                            kind: ErrorKind::InvalidInput,
+                            message: "SP1 executor panicked while sizing this ELF (malformed or \
+                                      hostile program)"
+                                .to_string(),
+                        };
+                        write_message(&mut stdout, &resp)?;
+                    }
+                }
             }
 
             WorkerCommand::Warmup { request_id } => {
@@ -1207,28 +2003,13 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
         }
     }
 
-    // Cleanly release GPU resources before exit. Dropping the CudaProver / proving
-    // keys performs async teardown of the sp1-gpu-server, which needs a tokio runtime
-    // context — without one the drops panic and the gpu-server is only reaped by the
-    // parent's process-group kill (and NOT at all on a clean graceful shutdown, where
-    // it would otherwise orphan and leak ~18.6 GB of VRAM). Drop them inside a runtime.
-    if prover.is_some() || !pk_cache.is_empty() {
-        match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt.block_on(async move {
-                drop(pk_cache);
-                drop(prover);
-            }),
-            Err(e) => {
-                // Couldn't build a runtime — forget rather than panic in Drop; the
-                // dispatcher's process-group kill will reap the gpu-server.
-                tracing::warn!("No tokio runtime for GPU teardown ({e}); leaking to parent kill");
-                std::mem::forget(pk_cache);
-                std::mem::forget(prover);
-            }
-        }
+    // `held` is dropped on the way out, which releases the GPU, and ends the server: without that,
+    // a clean exit would leave it running, holding ~18.6 GB of VRAM. After a lost connection too,
+    // as a server can close its connection and live on.
+    match server_lost {
+        Some(lost) => Err(lost),
+        None => Ok(()),
     }
-
-    Ok(())
 }
 
 fn detect_gpu() -> (bool, Option<String>) {
@@ -1255,13 +2036,244 @@ fn detect_gpu() -> (bool, Option<String>) {
     (false, None)
 }
 
-fn run_proof(
-    prover: &sp1_sdk::blocking::CudaProver,
-    pk_cache: &mut HashMap<u64, CudaPk>,
+/// Cycle cap for the pre-claim EXECUTE (sizing) path, mirroring the risc0 worker's
+/// `execute_session_cycle_limit`. The guest here runs UNCLAIMED and submitter-controlled, so a
+/// runaway is a free DoS lever and the result is only a sizing estimate. In the pinned build the cap
+/// surfaces from the executor as the string `"cycle limit reached"` (NOT the `ExceededCycleLimit`
+/// variant), which `canonicalize_sp1_execute_error` rewrites to the canonical "exceeded cycle limit …"
+/// so the host classifies it as "too heavy" and negative-caches it — rather than the guest running
+/// until the host's ~120 s measure watchdog SIGKILLs the worker. (A watchdog SIGKILL is now ALSO
+/// negative-cached host-side — see the dispatcher's `execute_cycles` timeout branch — so a guest too
+/// slow to trip the cap inside the window is still never re-measured forever.) The default (2e9)
+/// matches risc0's and is ~21× the largest proof observed on this market (~9.3e7 cycles), so it cannot
+/// false-cap a real job. Override with `ZKMINER_SP1_EXECUTE_MAX_CYCLES` (0 = unlimited, which removes
+/// this protection — rely on the watchdog-timeout negative-cache instead).
+fn sp1_execute_cycle_limit() -> Option<u64> {
+    parse_sp1_execute_cycle_limit(std::env::var("ZKMINER_SP1_EXECUTE_MAX_CYCLES").ok().as_deref())
+}
+
+/// Pure parser behind [`sp1_execute_cycle_limit`], split out so the cap logic is testable without
+/// mutating process-global env. `None` env → default; `Some("0")` → unlimited; a non-numeric value →
+/// default (fail safe: keep the cap rather than silently removing it).
+fn parse_sp1_execute_cycle_limit(raw: Option<&str>) -> Option<u64> {
+    const DEFAULT: u64 = 2_000_000_000;
+    match raw {
+        Some(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT),
+        },
+        None => Some(DEFAULT),
+    }
+}
+
+/// Execute the guest WITHOUT proving, returning its true cycle count — the pre-claim sizing path for
+/// SP1, the analogue of the risc0 worker's `run_execute`. The count is SP1's `total_instruction_count`,
+/// the SAME quantity `run_proof` reports and the SP1 benchmark suite measures throughput in, so it
+/// feeds the deadline/look-ahead math in matching units. This lets the miner size an SP1 job on a
+/// MEASURED cycle count instead of the submitter-declared `expectedCycles`, closing the input-flood
+/// under-sizing vector for SP1.
+///
+/// Runs on a lightweight `CpuProver`, never the CUDA prover: SP1 execution is pure CPU emulation and
+/// the cycle count is deterministic in (program, input) whichever prover runs it, so routing it to the
+/// CPU keeps the measurement as cheap as risc0's and never spins up `sp1-gpu-server`.
+///
+/// Program-id (vkey) binding is NOT done here, deliberately. For SP1 `programId` is the
+/// verifying-key hash, whose ONLY derivation is `setup` — and `setup` is empirically ~minutes on the
+/// CPU even for a tiny program, so doing it per measurement would blow the host's ~120 s measure
+/// watchdog (every first sighting would time out → the job would be wrongly marked unmeasurable and
+/// never claimed) AND hand a permissionless submitter a trivial CPU-DoS lever. Instead the binding is
+/// split: the HOST refuses to size/claim an SP1 job whose registry entry carries no byte binding
+/// (`elf_hash` + URI `content_hash` both unset), which guarantees measure-ELF == prove-ELF (so the
+/// measured count is the proved cost — no deadline under-size/slash); and the authoritative
+/// `vkey == programId` gate stays on the PROVE path (`run_proof`), where `setup` runs anyway and is
+/// pk-cached. A served-consistent decoy whose vkey != programId therefore still sizes correctly and
+/// at worst fails to prove → collateral release (bounded), never a forged or under-sized claim.
+/// Does this `/proc/<pid>/comm` belong to SP1's native-executor runner child? `/proc/<pid>/comm`
+/// truncates to 15 chars. The runner ships two ways: the DEFAULT embedded build extracts it as
+/// `sp1-native-runner-bin-<hash>` (→ comm `sp1-native-runn`, SP1 `runner/src/lib.rs:65`), and an
+/// operator override (`SP1_CORE_RUNNER_OVERRIDE_BINARY`) runs the `sp1-core-executor-runner-binary`
+/// crate (→ `sp1-core-execut`). Match BOTH — matching only `sp1-core` (as an earlier version did)
+/// silently never fired for the shipped embedded runner. The measure worker is server-less, so its
+/// only `sp1-*` child is this runner; no gpu-server to confuse it.
+fn is_sp1_executor_runner_comm(comm: &str) -> bool {
+    let c = comm.trim_end();
+    c.starts_with("sp1-native") || c.starts_with("sp1-core")
+}
+
+/// Current summed RESIDENT set (VmRSS, in KiB) of this worker's SP1 native-executor runner
+/// child/children — where the guest actually runs. VmRSS (not RssAnon) on purpose: it includes the
+/// /dev/shm-mapped guest image, which is real physical RAM and the balloon the host must account for.
+/// Scoped to OUR direct children (ppid == our pid) so a sibling measure worker's child is never
+/// counted. One process normally; summed for robustness.
+#[cfg(target_os = "linux")]
+fn sp1_executor_child_rss_kb(our_pid: u32) -> u64 {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    let mut sum = 0u64;
+    for e in entries.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            continue;
+        };
+        if !is_sp1_executor_runner_comm(&comm) {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if ppid_from_proc_stat(&stat) != Some(our_pid as i32) {
+            continue;
+        }
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok())
+                    {
+                        sum = sum.saturating_add(kb);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    sum
+}
+
+/// Run `f` while a background thread samples the peak resident footprint of the SP1 executor child
+/// (see `sp1_executor_child_rss_kb`), and return `(f's result, peak_host_bytes)`. The host reserves
+/// this peak PLUS the warm `sp1-gpu-server`'s resident before claiming, so a guest whose execute is
+/// too heavy to prove beside the server is declined at claim time rather than OOM-ing the box at prove
+/// time (finding H1). Off-Linux / portable executor: no child, returns 0 = "unknown, do not gate".
+#[cfg(target_os = "linux")]
+fn with_peak_rss_sampling<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let our_pid = std::process::id();
+    let peak_kb = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let (peak_kb, stop) = (peak_kb.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                peak_kb.fetch_max(sp1_executor_child_rss_kb(our_pid), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // One final sample after the stop flag, to catch a peak reached just before the child exits.
+            peak_kb.fetch_max(sp1_executor_child_rss_kb(our_pid), Ordering::Relaxed);
+        })
+    };
+    // Stop + join via Drop, so a PANIC out of `f` (hostile ELFs panic SP1's parser/executor, which the
+    // caller catches with `catch_unwind`) still tears the sampler down. Without this the unwind would
+    // skip the stop/join and leak one /proc-scanning thread per panic-inducing submission — an
+    // unbounded-thread DoS a permissionless submitter could drive.
+    struct SamplerGuard {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for SamplerGuard {
+        fn drop(&mut self) {
+            self.stop
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+    let mut guard = SamplerGuard {
+        stop: stop.clone(),
+        handle: Some(sampler),
+    };
+    let out = f();
+    // Normal path: stop + join NOW (runs the thread's final sample) so we read the settled peak; the
+    // guard's Drop then no-ops (handle already taken).
+    guard.stop.store(true, Ordering::Relaxed);
+    if let Some(h) = guard.handle.take() {
+        let _ = h.join();
+    }
+    (out, peak_kb.load(Ordering::Relaxed).saturating_mul(1024))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_peak_rss_sampling<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    (f(), 0)
+}
+
+fn run_execute_sp1(
+    cpu: &sp1_sdk::blocking::CpuProver,
     elf: &[u8],
     input_data: &[u8],
+) -> anyhow::Result<(u64, Vec<u8>, f64, u64)> {
+    use sp1_sdk::blocking::{Elf, Prover, SP1Stdin};
+
+    let started = Instant::now();
+
+    let mut stdin = SP1Stdin::new();
+    // One input element, consumed by a single `io::read_vec` in the guest — matching `run_proof`.
+    stdin.write_slice(input_data);
+
+    let mut req = cpu.execute(Elf::from(elf), stdin);
+    if let Some(limit) = sp1_execute_cycle_limit() {
+        req = req.cycle_limit(limit);
+    }
+    // Gas calculation MUST stay enabled (the builder default). With `.calculate_gas(false)`
+    // the pinned SP1 build NEVER sets the executor's final VM state — `GasExecutingWorker::call`
+    // short-circuits (crates/prover/src/worker/prover/execute.rs:92) so `final_vm_state` stays unset
+    // and `execute_with_options`'s `.ok_or(anyhow!("Failed to extract public value digest"))?`
+    // (execute.rs:321) returns Err for EVERY guest. Gas accumulation is also what populates
+    // `opcode_counts`, i.e. `total_instruction_count()`. So we do NOT disable it.
+    let (run_result, peak_host_bytes) = with_peak_rss_sampling(|| req.run());
+    let (public_values, report) =
+        run_result.map_err(|e| canonicalize_sp1_execute_error(&e.to_string()))?;
+    // The public values the guest commits here are byte-identical to the journal the
+    // later Groth16 proof carries (both are a deterministic function of (ELF, input), and the host's
+    // elf_hash gate makes measure-ELF == prove-ELF). The host checks the job's journal binding
+    // against them, and refuses to CLAIM a program whose journal alone would OOG-revert fulfillJob,
+    // instead of learning either only after a full proof is wasted. `.to_vec()` matches how
+    // `run_proof` extracts the journal.
+    Ok((
+        report.total_instruction_count(),
+        public_values.to_vec(),
+        started.elapsed().as_secs_f64(),
+        peak_host_bytes,
+    ))
+}
+
+/// True iff an SP1 `execute().run()` error string denotes the cycle cap being tripped
+/// (the guest is too heavy to size). The pinned build signals the cap from the gas accumulator as the
+/// bare string `"cycle limit reached"` (execute.rs:206) — NOT the `ExceededCycleLimit` variant, which
+/// is only produced on the distributed-controller path — so the host's "exceeded cycle limit" match
+/// would miss it. Match every wording the build and SDK can emit.
+fn is_sp1_cycle_cap_trip(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("cycle limit reached")
+        || m.contains("exceeded cycle limit")
+        || m.contains("exceededcyclelimit")
+}
+
+/// Canonicalize an SP1 execute error so the host's `measure_cycles` classifier recognizes
+/// a cycle-cap trip as "too heavy" (and negative-caches it) regardless of SP1's internal wording. A
+/// non-cap error is passed through unchanged (the host leaves it transient).
+fn canonicalize_sp1_execute_error(raw: &str) -> anyhow::Error {
+    if is_sp1_cycle_cap_trip(raw) {
+        anyhow::anyhow!("exceeded cycle limit (SP1 executor: {raw})")
+    } else {
+        anyhow::anyhow!("{raw}")
+    }
+}
+
+fn run_proof(
+    prover: &sp1_sdk::blocking::CudaProver,
+    pk_cache: &mut PkCache,
+    elf: &[u8],
+    input_data: &[u8],
+    program_id: Option<[u8; 32]>,
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
-    use sp1_sdk::blocking::{Elf, ProveRequest, Prover, SP1Stdin};
+    use sp1_sdk::blocking::{Elf, Prover, ProveRequest, SP1Stdin};
+    use sp1_sdk::HashableKey;
 
     let mut stdin = SP1Stdin::new();
     // NOTE: this pushes the ENTIRE input as ONE SP1 input element (SP1Stdin.buffer
@@ -1271,34 +2283,92 @@ fn run_proof(
     // no element and halt (empty journal). See guests/sp1/*/src/main.rs.
     stdin.write_slice(input_data);
 
-    // Execute first to get cycle count
-    let (_, report) = prover
-        .execute(Elf::from(elf), stdin.clone())
-        .run()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Execute first to get cycle count. Cap the cycles exactly as the MEASURE path does
+    // (`run_execute_sp1`): without it this prove-time execute was the one SP1 run with no cycle bound,
+    // so a claimed-but-hostile guest could spin the executor far past the measured budget on the
+    // prove worker (where it stacks on the warm sp1-gpu-server). The same ELF+input measured feasible,
+    // so the cap never trips a legitimate claimed job.
+    let mut exec = prover.execute(Elf::from(elf), stdin.clone());
+    if let Some(limit) = sp1_execute_cycle_limit() {
+        exec = exec.cycle_limit(limit);
+    }
+    let (public_values, report) = exec.run().map_err(|e| anyhow::anyhow!("{e}"))?;
     let cycles = report.total_instruction_count();
 
     // Get-or-create the proving key for this ELF. The key depends only on the
     // program (not the input), so it's cached and reused across proofs — no per-proof
     // setup() and no per-proof GPU-key leak. See `pk_cache` in run_worker_loop.
     let key = elf_hash(elf);
-    if let std::collections::hash_map::Entry::Vacant(e) = pk_cache.entry(key) {
-        let pk = prover
-            .setup(Elf::from(elf))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        e.insert(pk);
+    if pk_cache.contains(&key) {
+        pk_cache.touch(&key);
+    } else {
+        let pk = prover.setup(Elf::from(elf)).map_err(sdk_error)?;
+        // LRU-evict to bound host RAM + VRAM; free each evicted key's GPU memory in a runtime.
+        for evicted in pk_cache.insert(key, pk) {
+            tracing::info!(
+                "Evicting a cached SP1 proving key (cap {})",
+                pk_cache_capacity()
+            );
+            evict_key(evicted)?;
+        }
     }
-    let pk = pk_cache.get(&key).expect("pk was just inserted");
+    let pk = pk_cache.get(&key).expect("pk was just inserted or touched");
+
+    // Bind the served ELF to the job's on-chain programId. For SP1 the programId IS
+    // the verifying-key hash, so an ELF whose vkey hash != programId can never produce a proof the
+    // on-chain SP1 verifier accepts — proving it just burns a full GPU proof + fulfill gas on a
+    // guaranteed revert. Reject BEFORE proving. The exact byte order of the on-chain programId vs
+    // SP1's vkey hash is deployment-defined, so accept EITHER order (a wrong ELF matches neither; a
+    // legit one never false-rejects). Default-on; ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK=1 disables.
+    if let Some(pid) = program_id {
+        let skip = matches!(
+            std::env::var("ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        );
+        if !skip {
+            // Use bytes32() (a 0x-prefixed 64-hex string, zero-padded) and decode it, NOT
+            // bytes32_raw(): the latter does `result[1..].copy_from_slice(&digest.to_bytes_be())`,
+            // which PANICS unless the big-endian digest is exactly 31 bytes — a condition a
+            // submitter-crafted ELF (hence vkey) can violate, crashing the worker. bytes32() formats
+            // via `format!("0x{:0>64}", …)` and never panics.
+            match decode_hex32(&pk.verifying_key().bytes32()) {
+                Some(vk_hash) => {
+                    let matches =
+                        vk_hash == pid || vk_hash.iter().rev().copied().eq(pid.iter().copied());
+                    if !matches {
+                        anyhow::bail!(
+                            "ELF vkey hash does not match job programId (served ELF is not the \
+                             registered program) — refusing to prove"
+                        );
+                    }
+                }
+                None => {
+                    // The SDK returned a vkey string we can't parse to 32 bytes; refuse rather than
+                    // prove an unverifiable binding (a legit program's vkey always parses).
+                    anyhow::bail!("could not parse SP1 vkey hash for programId binding — refusing to prove");
+                }
+            }
+        }
+    }
 
     // Generate Groth16 proof for on-chain verification.
     // The SP1 on-chain verifier expects: vkey_hash[0..4] || encoded_groth16_proof
     let start = Instant::now();
-    let proof = prover
-        .prove(pk, stdin)
-        .groth16()
-        .run()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let proof = prover.prove(pk, stdin).groth16().run().map_err(sdk_error)?;
     let duration_secs = start.elapsed().as_secs_f64();
+
+    // The proof must be of THIS job's input, which `verify` below cannot say: a valid proof of another
+    // input passes it, and the SDK's requests carry no id. Execution above saw what this input commits.
+    // Before `verify`, because a proof of another program would otherwise read as an invalid one. A
+    // guest that commits differently from run to run fails this too, and its job then fails its
+    // attempts like any other.
+    if proof.public_values.to_vec() != public_values.to_vec() {
+        return Err(anyhow::Error::new(ServerLost {
+            detail: "the proof it returned is not of this job's input".to_string(),
+        }));
+    }
 
     // Verify proof locally before returning — catches GPU output corruption.
     if let Err(e) = prover.verify(&proof, pk.verifying_key(), None) {
@@ -1314,8 +2384,25 @@ fn run_proof(
     Ok((journal, seal, duration_secs, cycles))
 }
 
-fn run_benchmarks(prover: &sp1_sdk::blocking::CudaProver) -> Vec<BenchmarkEntry> {
-    let mut results = Vec::new();
+/// What a benchmark run came to.
+struct BenchmarkRun {
+    /// A row per program that completed.
+    results: Vec<BenchmarkEntry>,
+    /// "program: why", per program that did not.
+    failed: Vec<String>,
+    /// A [`ServerLost`], which ended the run where it happened. `results` still holds what came
+    /// before, and a row whose wrap alone was lost.
+    server_lost: Option<anyhow::Error>,
+}
+
+/// Prove every benchmark program. The keys it sets up go into `keys` and stay resident: each holds
+/// the client, and through it the server, so they belong with whatever releases those.
+fn run_benchmarks(prover: &sp1_sdk::blocking::CudaProver, keys: &mut Vec<CudaPk>) -> BenchmarkRun {
+    let mut run = BenchmarkRun {
+        results: Vec::new(),
+        failed: Vec::new(),
+        server_lost: None,
+    };
 
     let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
         (
@@ -1372,18 +2459,37 @@ fn run_benchmarks(prover: &sp1_sdk::blocking::CudaProver) -> Vec<BenchmarkEntry>
             continue;
         }
         let measure_wrap = Some(idx) == last_runnable;
-        if let Some(entry) =
-            benchmark_program(prover, name, elf, input, weight, precompile, measure_wrap)
-        {
-            results.push(entry);
+        match benchmark_program(
+            prover,
+            name,
+            elf,
+            input,
+            weight,
+            precompile,
+            measure_wrap,
+            keys,
+            &mut run.server_lost,
+        ) {
+            Ok(entry) => run.results.push(entry),
+            Err(e) => {
+                tracing::error!("{name}: {e:#}");
+                run.failed.push(format!("{name}: {e:#}"));
+                if e.is::<ServerLost>() {
+                    run.server_lost = Some(e);
+                }
+            }
+        }
+        if run.server_lost.is_some() {
+            break;
         }
     }
 
-    results
+    run
 }
 
+#[allow(clippy::too_many_arguments)]
 fn benchmark_program(
-    prover: &impl sp1_sdk::blocking::Prover,
+    prover: &sp1_sdk::blocking::CudaProver,
     name: &str,
     elf: &[u8],
     input: &[u8],
@@ -1391,50 +2497,52 @@ fn benchmark_program(
     precompile: bool,
     // Also prove this program in Groth16 mode and report the wrap. See `run_benchmarks`.
     measure_wrap: bool,
-) -> Option<BenchmarkEntry> {
-    use sp1_sdk::blocking::{Elf, ProveRequest, SP1Stdin};
-    // The blocking Prover's `type ProvingKey: ProvingKey` is bound by this trait;
-    // it must be in scope for `pk.verifying_key()` on the generic associated type.
-    use sp1_sdk::ProvingKey;
+    // Where the key goes, as soon as there is one; see `run_benchmarks`.
+    keys: &mut Vec<CudaPk>,
+    // Set if the server is lost in the wrap, when the row itself is still good.
+    server_lost: &mut Option<anyhow::Error>,
+) -> Result<BenchmarkEntry> {
+    use sp1_sdk::blocking::{Elf, ProveRequest, Prover, SP1Stdin};
 
     let mut stdin = SP1Stdin::new();
     stdin.write_slice(input);
 
     // Execute to get real cycle count
-    let (_, report) = prover.execute(Elf::from(elf), stdin.clone()).run().ok()?;
+    let (_, report) = prover
+        .execute(Elf::from(elf), stdin.clone())
+        .run()
+        .map_err(|e| anyhow::anyhow!("execute failed: {e}"))?;
     let cycles = report.total_instruction_count();
 
     // Key setup OUTSIDE the timed region. It is not proving, and production caches the key per ELF
-    // (`pk_cache` in `run_worker_loop`) so never pays it per proof. Measured on 2026-10-06 the cost is
+    // (`pk_cache` in `run_worker_loop`) so never pays it per proof. In practice the cost is
     // almost entirely a FIRST-CALL warm-up, not per-program key generation: 5.37 s and 5.46 s for the
     // first program on each card, then 0.02-0.03 s for every one after. Inside the stopwatch it was
     // most of why a 9,966-cycle fibonacci "took" 6 s, and it landed on whichever program ran first.
     let started = Instant::now();
-    let pk = prover.setup(Elf::from(elf)).ok()?;
+    // At once into `keys`, which is released in a runtime however this ends. A local here would be
+    // dropped outside one by a panic, panicking again while unwinding, which aborts.
+    keys.push(prover.setup(Elf::from(elf)).map_err(sdk_error)?);
+    let pk = keys.last().expect("just pushed");
     let setup_secs = started.elapsed().as_secs_f64();
 
     // STARK: the core shard proofs and the recursion that compresses them into one constant-size
     // proof. This used to run in the SDK's default Core mode, which stops before the recursion — and
     // the recursion scales with shard count, so it belongs here rather than with the wrap.
     let started = Instant::now();
-    let proof = match prover.prove(&pk, stdin.clone()).compressed().run() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("{name}: prove failed: {e}");
-            std::mem::forget(pk);
-            return None;
-        }
-    };
+    let proof = prover
+        .prove(pk, stdin.clone())
+        .compressed()
+        .run()
+        .map_err(|e| sdk_error(e).context("prove failed"))?;
     let duration_secs = started.elapsed().as_secs_f64();
 
     // Verify the proof locally — catches GPU output corruption before polluting
     // the benchmark cache with invalid throughput numbers.
     if let Err(e) = prover.verify(&proof, pk.verifying_key(), None) {
-        tracing::error!(
-            "{name}: proof verification FAILED — benchmark proof is invalid, skipping entry: {e}"
+        anyhow::bail!(
+            "proof verification FAILED — benchmark proof is invalid, skipping entry: {e}"
         );
-        std::mem::forget(pk);
-        return None;
     }
 
     // The Groth16 wrap, by DIFFERENCE. `sp1-gpu-server` runs the whole pipeline as one request —
@@ -1445,7 +2553,7 @@ fn benchmark_program(
     // fixed key (`~/.sp1/circuits/groth16/*/groth16_pk.bin`), so one measurement stands for all.
     let wrap_secs = if measure_wrap {
         let started = Instant::now();
-        match prover.prove(&pk, stdin).groth16().run() {
+        match prover.prove(pk, stdin).groth16().run() {
             Ok(g) => {
                 let total = started.elapsed().as_secs_f64();
                 if let Err(e) = prover.verify(&g, pk.verifying_key(), None) {
@@ -1466,16 +2574,17 @@ fn benchmark_program(
                 }
             }
             Err(e) => {
+                let e = sdk_error(e);
                 tracing::error!("{name}: Groth16 prove failed — not reporting a wrap time: {e}");
+                if e.is::<ServerLost>() {
+                    *server_lost = Some(e);
+                }
                 None
             }
         }
     } else {
         None
     };
-
-    // Leak the proving key to avoid drop panic (SP1 CUDA PK drops require tokio runtime context)
-    std::mem::forget(pk);
 
     let throughput = cycles as f64 / duration_secs;
 
@@ -1490,7 +2599,7 @@ fn benchmark_program(
         ),
     }
 
-    Some(BenchmarkEntry {
+    Ok(BenchmarkEntry {
         program_name: name.to_string(),
         prover_backend: BACKEND_SP1.to_string(),
         cycles,
@@ -1549,6 +2658,286 @@ mod orphan_reap_tests {
         let parsed = ppid_from_proc_stat(&stat).expect("parse");
         let expected = unsafe { libc::getppid() };
         assert_eq!(parsed, expected, "parsed ppid must match getppid()");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod orphan_exit_tests {
+    use super::{
+        has_finished_exiting, parent_means_orphan, server_socket_of_environ, server_socket_path,
+    };
+    use std::path::PathBuf;
+
+    /// A `/proc/<pid>/stat` line with this state and thread count.
+    fn stat(comm: &str, state: &str, threads: u32) -> String {
+        format!(
+            "4242 ({comm}) {state} 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 {threads} 0 99 0 0"
+        )
+    }
+
+    /// The rule the wait depends on, from the trace of a real 24 GB process: a leader is `Z` while
+    /// its threads still hold the socket, which it goes on accepting on until they are done.
+    #[test]
+    fn a_zombie_leader_with_threads_left_is_still_exiting() {
+        assert!(!has_finished_exiting(&stat("sp1-gpu-server", "Z", 8)));
+        assert!(!has_finished_exiting(&stat("sp1-gpu-server", "Z", 2)));
+        assert!(has_finished_exiting(&stat("sp1-gpu-server", "Z", 1)));
+        // The kernel reports 0 threads for a task already being released.
+        assert!(has_finished_exiting(&stat("sp1-gpu-server", "Z", 0)));
+        assert!(has_finished_exiting(&stat("sp1-gpu-server", "X", 1)));
+        // Running, sleeping, or stuck in a driver.
+        for state in ["R", "S", "D"] {
+            assert!(
+                !has_finished_exiting(&stat("sp1-gpu-server", state, 1)),
+                "{state}"
+            );
+        }
+    }
+
+    /// `comm` can contain anything, including what looks like the rest of the line.
+    #[test]
+    fn the_exit_check_is_not_fooled_by_a_hostile_comm() {
+        assert!(!has_finished_exiting(&stat("a) Z 1 1 1", "S", 3)));
+        assert!(has_finished_exiting(&stat("a) S 1 1 1", "Z", 1)));
+    }
+
+    /// What it cannot read it must not call finished: that would skip the wait.
+    #[test]
+    fn a_malformed_stat_is_not_finished() {
+        assert!(!has_finished_exiting(""));
+        assert!(!has_finished_exiting("no parenthesis Z 1"));
+        assert!(!has_finished_exiting("4242 (x) Z"));
+        assert!(!has_finished_exiting(
+            "4242 (x) Z 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 many"
+        ));
+    }
+
+    /// Against the kernel, on a real child that stays a zombie because this test has not reaped it.
+    #[test]
+    fn a_real_zombie_reads_as_finished_and_a_live_process_does_not() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let path = format!("/proc/{}/stat", child.id());
+        assert!(!has_finished_exiting(
+            &std::fs::read_to_string(&path).unwrap()
+        ));
+        unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !has_finished_exiting(&std::fs::read_to_string(&path).unwrap()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never read as finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child.wait().unwrap();
+        // And this multi-threaded process, the test harness, is plainly alive.
+        assert!(!has_finished_exiting(
+            &std::fs::read_to_string("/proc/self/stat").unwrap()
+        ));
+    }
+
+    #[test]
+    fn the_socket_name_is_the_sdks() {
+        let _env = crate::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("SP1_GPU_SERVER_NAME").ok();
+        for name in [
+            "",
+            "sp1-gpu-server",
+            "sp1-gpu-server-hip",
+            "sp1-gpu-server-sycl",
+        ] {
+            std::env::set_var("SP1_GPU_SERVER_NAME", name);
+            for device in [0, 1, 7] {
+                assert_eq!(
+                    server_socket_path(name, device).unwrap(),
+                    sp1_cuda::client::socket_path(device),
+                    "{name:?} {device}"
+                );
+            }
+        }
+        std::env::remove_var("SP1_GPU_SERVER_NAME");
+        assert_eq!(
+            server_socket_path("sp1-gpu-server", 0).unwrap(),
+            sp1_cuda::client::socket_path(0)
+        );
+        match saved {
+            Some(v) => std::env::set_var("SP1_GPU_SERVER_NAME", v),
+            None => std::env::remove_var("SP1_GPU_SERVER_NAME"),
+        }
+    }
+
+    /// The path this makes is then unlinked, and the name came out of a process's environment.
+    #[test]
+    fn a_name_cannot_point_the_unlink_elsewhere() {
+        assert_eq!(server_socket_path("../../home/user/x", 0), None);
+        assert_eq!(server_socket_path("/etc/x", 0), None);
+    }
+
+    #[test]
+    fn an_orphans_socket_is_read_from_its_environment() {
+        let path =
+            |env: &[u8]| server_socket_of_environ(env).map(|p: PathBuf| p.display().to_string());
+        // The bug this replaces: only the CUDA name was ever removed, so the HIP and SYCL servers'
+        // sockets stayed for the next client to connect into.
+        assert_eq!(
+            path(b"A=1\0SP1_GPU_SERVER_NAME=sp1-gpu-server-hip\0CUDA_VISIBLE_DEVICES=2\0B=2\0")
+                .as_deref(),
+            Some("/tmp/sp1-gpu-server-hip-2.sock")
+        );
+        assert_eq!(
+            path(b"CUDA_VISIBLE_DEVICES=0\0SP1_GPU_SERVER_NAME=sp1-gpu-server-sycl\0").as_deref(),
+            Some("/tmp/sp1-gpu-server-sycl-0.sock")
+        );
+        assert_eq!(
+            path(b"CUDA_VISIBLE_DEVICES=1\0").as_deref(),
+            Some("/tmp/sp1-cuda-1.sock")
+        );
+        // One non-UTF-8 entry does not stop the scan.
+        assert_eq!(
+            path(b"LS_COLORS=\xff\xfe\0CUDA_VISIBLE_DEVICES=3\0").as_deref(),
+            Some("/tmp/sp1-cuda-3.sock")
+        );
+        // Cannot tell: nothing is removed. Empty is what an exiting process reads as.
+        assert_eq!(path(b""), None);
+        assert_eq!(path(b"A=1\0"), None);
+        assert_eq!(path(b"CUDA_VISIBLE_DEVICES=GPU-abc\0"), None);
+        assert_eq!(path(b"CUDA_VISIBLE_DEVICES=0,1\0"), None);
+        assert_eq!(
+            path(b"SP1_GPU_SERVER_NAME=a/b\0CUDA_VISIBLE_DEVICES=0\0"),
+            None
+        );
+    }
+
+    /// Spares a server with a live owner, however that owner is named.
+    #[test]
+    fn only_a_gone_owner_makes_an_orphan() {
+        assert!(parent_means_orphan(1, Some("systemd\n")));
+        assert!(parent_means_orphan(1, Some("docker-init\n")));
+        assert!(parent_means_orphan(1, None));
+        // The user manager, which an orphan goes to on a desktop or from a user unit.
+        assert!(parent_means_orphan(3198, Some("systemd\n")));
+        assert!(!parent_means_orphan(4242, Some("zkminer-prove-s\n")));
+        assert!(!parent_means_orphan(4242, Some("my-sp1-app\n")));
+        assert!(!parent_means_orphan(4242, Some("systemd-run\n")));
+        // A parent that exited between the two reads: next time round it reads as an orphan.
+        assert!(!parent_means_orphan(4242, None));
+    }
+
+    /// A worker that waits at startup is SIGKILLed by the host when the wait outlasts what remains
+    /// of `HANDSHAKE_TIMEOUT`, and only by a host with a large enough orphan, so this is easily
+    /// missed. And one that never waits connects to the dying server again.
+    #[test]
+    fn the_wait_is_ahead_of_the_server_and_outside_the_handshake() {
+        let source = include_str!("main.rs");
+        let main_fn = source.split_once("\nfn main() {").unwrap().1;
+        let main_fn = &main_fn[..main_fn.find("\nfn ").unwrap()];
+        assert!(main_fn.contains("reap_orphaned_gpu_servers(our_cuda_device, Duration::ZERO)"));
+        assert!(!main_fn.contains("ORPHAN_EXIT_WAIT"));
+
+        let build = source.split_once("\nfn build_prover(").unwrap().1;
+        let build = &build[..build.find("\nfn ").unwrap()];
+        let wait = build
+            .find("reap_orphaned_gpu_servers(cuda_device_id, ORPHAN_EXIT_WAIT)")
+            .expect("build_prover must wait for orphans");
+        let start = build
+            .find(".build()")
+            .expect("build_prover builds the prover");
+        assert!(
+            wait < start,
+            "the wait must come before the SDK starts a server"
+        );
+    }
+}
+
+#[cfg(test)]
+mod server_lost_tests {
+    use super::{says_server_lost, sdk_error, ServerLost};
+    use sp1_cuda::CudaClientError;
+    use std::io::{Error, ErrorKind};
+
+    /// `CudaClientError` hides its variant, so `says_server_lost` reads its text. This holds that
+    /// reading to the type itself: if an SDK bump rewords a variant, this fails, rather than a dead
+    /// connection going back to being an ordinary error that wedges the worker.
+    #[test]
+    fn the_server_lost_check_agrees_with_the_real_error_type() {
+        let lost = [
+            CudaClientError::Read(Error::new(ErrorKind::UnexpectedEof, "early eof")),
+            CudaClientError::Read(Error::from(ErrorKind::ConnectionReset)),
+            CudaClientError::Write(Error::from(ErrorKind::BrokenPipe)),
+            CudaClientError::UnexpectedResponse("Ok"),
+            CudaClientError::new_read(Error::from(ErrorKind::BrokenPipe), "with a context"),
+        ];
+        for e in lost {
+            let text = e.to_string();
+            assert!(says_server_lost(&text), "{text}");
+            assert!(sdk_error(e).is::<ServerLost>(), "{text}");
+        }
+
+        let not_lost = [
+            CudaClientError::ServerError("proving failed".to_string()),
+            CudaClientError::ProverError("proving failed".to_string()),
+            CudaClientError::Unexpected("something".to_string()),
+            CudaClientError::Connect(Error::from(ErrorKind::NotFound)),
+            CudaClientError::DownloadIO(Error::from(ErrorKind::BrokenPipe)),
+            CudaClientError::Deserialize(Box::new(bincode::ErrorKind::SizeLimit)),
+            CudaClientError::Serialize(Box::new(bincode::ErrorKind::SizeLimit)),
+        ];
+        for e in not_lost {
+            let text = e.to_string();
+            assert!(!says_server_lost(&text), "{text}");
+            assert!(!sdk_error(e).is::<ServerLost>(), "{text}");
+        }
+    }
+
+    /// A guest's text can reach the server's errors. Exiting on it would let a submitter have this
+    /// worker torn down at will, and be charged to the slot, with no failed proof to show for it.
+    #[test]
+    fn a_guests_text_cannot_claim_the_server_is_lost() {
+        let forged = "CudaClientError: Failed to read the response: Custom { kind: UnexpectedEof }";
+        for text in [
+            forged.to_string(),
+            format!("\n{forged}"),
+            format!("guest says {forged}"),
+            "Failed to write the request: Broken pipe".to_string(),
+            "early eof".to_string(),
+            "Broken pipe".to_string(),
+        ] {
+            for e in [
+                CudaClientError::ServerError(text.clone()),
+                CudaClientError::ProverError(text.clone()),
+                CudaClientError::Unexpected(text.clone()),
+            ] {
+                let shown = e.to_string();
+                assert!(!sdk_error(e).is::<ServerLost>(), "{shown}");
+            }
+        }
+    }
+
+    /// The benchmark path adds context, and the worker loop asks by type.
+    #[test]
+    fn the_type_survives_context() {
+        let e = sdk_error(CudaClientError::Write(Error::from(ErrorKind::BrokenPipe)))
+            .context("prove failed");
+        assert!(e.is::<ServerLost>());
+        assert!(format!("{e:#}").contains("lost the connection to sp1-gpu-server"));
+    }
+
+    /// Other errors must read as they did before this: the Prove arm's classification below reads
+    /// them (`is_gpu_oom`, the vkey binding), and so do people.
+    #[test]
+    fn other_errors_keep_their_text() {
+        let e = CudaClientError::ServerError("CUDA_ERROR_OUT_OF_MEMORY".to_string());
+        let text = e.to_string();
+        let reported = sdk_error(e);
+        assert_eq!(format!("{reported:#}"), text);
+        assert!(zkminer_prover_protocol::types::is_gpu_oom(&format!(
+            "{reported:#}"
+        )));
     }
 }
 
@@ -1731,7 +3120,7 @@ mod usability_tests {
         );
     }
 
-    /// FN1. nvidia-smi absent must NOT read as "no GPU" when the kernel driver says
+    /// nvidia-smi absent must NOT read as "no GPU" when the kernel driver says
     /// otherwise. A CUDA container with NVIDIA_DRIVER_CAPABILITIES=compute has libcuda
     /// and the device nodes but no nvidia-smi, and declining there would disable SP1 on a
     /// host where it proves fine. The host-side detector has the same fallback.
@@ -1750,7 +3139,7 @@ mod usability_tests {
         }
     }
 
-    /// FN1, the decisive case: with nvidia-smi made unreachable, the probe must NOT
+    /// The decisive case: with nvidia-smi made unreachable, the probe must NOT
     /// decide the GPU is absent, because /proc still knows better.
     #[test]
     fn an_unreachable_nvidia_smi_does_not_mean_no_gpu() {
@@ -1778,7 +3167,7 @@ mod usability_tests {
         }
     }
 
-    /// FN2. A non-zero `--version` that is NOT a loader failure must NOT be declined:
+    /// A non-zero `--version` that is NOT a loader failure must NOT be declined:
     /// that is the stale/wrong-version state `maybe_download_server` exists to repair,
     /// and the SDK ignores the exit status entirely.
     #[test]
@@ -1818,7 +3207,7 @@ mod usability_tests {
         }
     }
 
-    /// FN2 converse: a LOADER failure is unrepairable (the asset is version-pinned, so a
+    /// The converse: a LOADER failure is unrepairable (the asset is version-pinned, so a
     /// re-download reproduces it) and must still be declined.
     #[test]
     fn a_loader_failure_is_still_declined() {
@@ -1940,7 +3329,7 @@ mod ipc_fd_tests {
     }
 }
 
-/// [D4] What the SP1 worker must guarantee about the handshake. The bounded-runner
+/// What the SP1 worker must guarantee about the handshake. The bounded-runner
 /// behaviour itself (timeout, kill, capture, cap, spawn-retry classification) is tested in
 /// `zkminer_prover_protocol::proc`, which owns it; these are the SP1-specific obligations.
 #[cfg(test)]
@@ -1960,8 +3349,8 @@ mod threshold_tests {
     /// The two bounds are independent and the SMALLER must win.
     ///
     /// `apply_sp1_element_threshold` writes to the process environment, so the arithmetic is asserted
-    /// here rather than the side effect. The combination is what regressed in the first draft: the
-    /// function returned early on `scale >= 1.0`, skipping the VRAM cap in exactly the case it exists
+    /// here rather than the side effect. The combination is the easy case to get wrong: returning
+    /// early on `scale >= 1.0` skips the VRAM cap in exactly the case it exists
     /// for — a roomy host attached to an occupied card.
     #[test]
     fn the_smaller_of_the_host_and_vram_bounds_wins() {
@@ -2017,7 +3406,7 @@ mod threshold_tests {
     /// The threshold must be settled BEFORE the `scale >= 1.0` early return.
     ///
     /// The two bounds are independent, so a host roomy enough to produce no host-derived limit must
-    /// still let an occupied CARD bind. Returning on `scale` first — what the first draft did — skipped
+    /// still let an occupied CARD bind. Returning on `scale` first would skip
     /// the VRAM cap in precisely the configuration it exists for. The arithmetic tests above cannot see
     /// this, because the ordering is control flow and not a value.
     #[test]
@@ -2063,5 +3452,208 @@ mod pin_tests {
             "the SP1 pin moved: re-measure and update the sizing mirror in \
              zkminer_prover_protocol::types, then update this test"
         );
+    }
+}
+
+#[cfg(test)]
+mod pk_cache_tests {
+    use super::*;
+
+    fn k(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    #[test]
+    fn decode_hex32_parses_sp1_bytes32_form() {
+        // The on-chain-form vkey string: 0x + 64 hex, zero-padded.
+        let s = "0x00000000000000000000000000000000000000000000000000000000000000ff";
+        let got = super::decode_hex32(s).expect("parse");
+        assert_eq!(got[31], 0xff);
+        assert!(got[..31].iter().all(|&b| b == 0));
+        // Full-width value with a non-zero top byte (the case bytes32_raw would PANIC on) parses fine.
+        let full = format!("0x{}", "ab".repeat(32));
+        assert_eq!(super::decode_hex32(&full).unwrap(), [0xabu8; 32]);
+        // Malformed inputs → None (never panic).
+        assert!(super::decode_hex32("0x1234").is_none()); // too short
+        assert!(super::decode_hex32(&("0x".to_owned() + &"zz".repeat(32))).is_none()); // non-hex
+    }
+
+    #[test]
+    fn elf_hash_is_deterministic_and_collision_resistant() {
+        // Deterministic.
+        assert_eq!(elf_hash(b"program-a"), elf_hash(b"program-a"));
+        // Distinct programs -> distinct 256-bit keys (no 64-bit truncation).
+        assert_ne!(elf_hash(b"program-a"), elf_hash(b"program-b"));
+        // A one-byte change changes the key.
+        assert_ne!(elf_hash(b"program-a"), elf_hash(b"program-A"));
+        assert_eq!(elf_hash(b"").len(), 32);
+    }
+
+    #[test]
+    fn lru_evicts_least_recently_used() {
+        let mut c: LruCache<u32> = LruCache::new(2);
+        assert!(c.insert(k(1), 1).is_empty());
+        assert!(c.insert(k(2), 2).is_empty());
+        // Touch key 1 so key 2 becomes least-recently-used.
+        assert!(c.contains(&k(1)));
+        c.touch(&k(1));
+        // Inserting a third evicts key 2 (the LRU), not key 1.
+        let evicted = c.insert(k(3), 3);
+        assert_eq!(evicted, vec![2]);
+        assert!(c.contains(&k(1)));
+        assert!(!c.contains(&k(2)));
+        assert!(c.contains(&k(3)));
+    }
+
+    #[test]
+    fn lru_capacity_one_holds_a_single_entry() {
+        let mut c: LruCache<u32> = LruCache::new(1);
+        assert!(c.insert(k(1), 10).is_empty());
+        let evicted = c.insert(k(2), 20);
+        assert_eq!(evicted, vec![10]);
+        assert_eq!(c.get(&k(2)), Some(&20));
+        assert!(!c.contains(&k(1)));
+    }
+
+    #[test]
+    fn lru_cap_floored_at_one() {
+        // A zero capacity must not mean "evict forever / never hold"; it is floored to 1.
+        let mut c: LruCache<u32> = LruCache::new(0);
+        let evicted = c.insert(k(1), 1);
+        assert!(evicted.is_empty());
+        assert!(c.contains(&k(1)));
+    }
+
+    #[test]
+    fn sp1_execute_cap_parses_env_forms() {
+        // Default when unset or garbage (fail safe: keep the cap).
+        assert_eq!(super::parse_sp1_execute_cycle_limit(None), Some(2_000_000_000));
+        assert_eq!(super::parse_sp1_execute_cycle_limit(Some("not-a-number")), Some(2_000_000_000));
+        // Explicit 0 disables the cap.
+        assert_eq!(super::parse_sp1_execute_cycle_limit(Some("0")), None);
+        // A concrete override wins, whitespace tolerated.
+        assert_eq!(super::parse_sp1_execute_cycle_limit(Some(" 5000000 ")), Some(5_000_000));
+    }
+
+    #[test]
+    fn sp1_cycle_cap_trip_recognized_across_wordings() {
+        // The pinned build emits this bare string from the gas accumulator.
+        assert!(super::is_sp1_cycle_cap_trip("cycle limit reached"));
+        assert!(super::is_sp1_cycle_cap_trip("Error: cycle limit reached, stopping execution"));
+        // The SDK variant wording and the type name, for robustness across builds/paths.
+        assert!(super::is_sp1_cycle_cap_trip("exceeded cycle limit of 2000000000"));
+        assert!(super::is_sp1_cycle_cap_trip("ExceededCycleLimit(2000000000)"));
+        // A genuinely transient error must NOT be mistaken for a cap trip (else a legit program
+        // would be permanently negative-cached).
+        assert!(!super::is_sp1_cycle_cap_trip("no idle worker available"));
+        assert!(!super::is_sp1_cycle_cap_trip("Failed to extract public value digest"));
+        assert!(!super::is_sp1_cycle_cap_trip("broken pipe"));
+    }
+
+    #[test]
+    fn sp1_execute_error_canonicalized_only_for_cap_trip() {
+        // A cap trip is rewritten to the canonical phrase the HOST matches as too-heavy...
+        let cap = super::canonicalize_sp1_execute_error("cycle limit reached").to_string();
+        assert!(cap.to_lowercase().contains("exceeded cycle limit"));
+        // ...while a transient error passes through verbatim (stays transient host-side).
+        let transient = super::canonicalize_sp1_execute_error("broken pipe").to_string();
+        assert_eq!(transient, "broken pipe");
+        assert!(!transient.to_lowercase().contains("exceeded cycle limit"));
+    }
+
+    // End-to-end guard against a critical failure mode: with
+    // `.calculate_gas(false)` the pinned SP1 build returns Err("Failed to extract public value
+    // digest") for EVERY guest, so NO SP1 job was ever claimable. Runs a REAL CPU execution of the
+    // embedded fibonacci guest (CPU-only, no sp1-gpu-server, no GPU, no network — and NO `setup`, so
+    // it stays fast, a few seconds). Skips cleanly when guests are stubbed (SP1_SKIP_PROGRAM_BUILD).
+    #[test]
+    fn sp1_execute_measures_real_cycles() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        let elf = super::FIBONACCI_SP1_GUEST_ELF;
+        let input = 1000u32.to_le_bytes(); // the known-good benchmark input
+        let cpu = sp1_sdk::blocking::ProverClient::builder().cpu().build();
+
+        // Gas calculation left at its default (enabled) → a real guest returns a POSITIVE instruction
+        // count. `.calculate_gas(false)` would make this return Err for every guest.
+        let (cycles, _journal, _dur, _peak) = super::run_execute_sp1(&cpu, elf, &input)
+            .expect("executing a valid guest must succeed and yield a cycle count");
+        assert!(cycles > 0, "measured cycle count must be positive, got {cycles}");
+    }
+}
+
+#[cfg(test)]
+mod shm_reaper_tests {
+    use super::{is_sp1_shm_basename, sp1_shm_mapped_in};
+    use std::collections::HashSet;
+
+    #[test]
+    fn basename_matches_every_sp1_segment_and_semaphore() {
+        // The four shapes sp1-jit creates (native.rs id = "sp1_" + base64url(uuid)):
+        assert!(is_sp1_shm_basename("sp1_AAAABBBBCCCCDDDD_m")); // memory image
+        assert!(is_sp1_shm_basename("sp1_AAAABBBBCCCCDDDD_t")); // trace ring
+        assert!(is_sp1_shm_basename("sem.sp1_AAAABBBBCCCCDDDD_t_filled")); // ring sem
+        assert!(is_sp1_shm_basename("sem.sp1_AAAABBBBCCCCDDDD_t_empty")); // ring sem
+    }
+
+    #[test]
+    fn basename_rejects_unrelated_names() {
+        // Never touch another program's tmpfs: the prefix must be anchored at the start.
+        assert!(!is_sp1_shm_basename("foo"));
+        assert!(!is_sp1_shm_basename(""));
+        assert!(!is_sp1_shm_basename("notsp1_x")); // does not START with sp1_
+        assert!(!is_sp1_shm_basename("my.sp1_x")); // nor sem.sp1_
+        assert!(!is_sp1_shm_basename("sem.other")); // a foreign semaphore
+        assert!(!is_sp1_shm_basename("sem.sp1")); // close, but not the sp1_ segment prefix
+    }
+
+    #[test]
+    fn maps_scan_finds_live_sp1_segments_and_nothing_else() {
+        // A realistic /proc/<pid>/maps excerpt: a heap line, a live SP1 image, ring and ring
+        // semaphore, a foreign /dev/shm mapping, and an SP1 image whose fd was unlinked while mapped.
+        let maps = "\
+55a0-55b0 rw-p 00000000 00:00 0                                  [heap]\n\
+7f00-7f10 rw-s 00000000 00:1f 123   /dev/shm/sp1_LIVEuuid_m\n\
+7f20-7f30 rw-s 00000000 00:1f 124   /dev/shm/sp1_LIVEuuid_t\n\
+7f40-7f50 rw-s 00000000 00:1f 125   /dev/shm/sem.sp1_LIVEuuid_t_filled\n\
+7f60-7f70 rw-s 00000000 00:1f 126   /dev/shm/some_other_app_buf\n\
+7f80-7f90 rw-s 00000000 00:1f 127   /dev/shm/sp1_DELETEDuuid_m (deleted)\n";
+        let mut live: HashSet<String> = HashSet::new();
+        sp1_shm_mapped_in(maps, &mut live);
+
+        assert!(live.contains("sp1_LIVEuuid_m"));
+        assert!(live.contains("sp1_LIVEuuid_t"));
+        assert!(live.contains("sem.sp1_LIVEuuid_t_filled"));
+        // The " (deleted)" annotation is dropped, leaving the bare basename.
+        assert!(live.contains("sp1_DELETEDuuid_m"));
+        // A foreign /dev/shm mapping is never recorded.
+        assert!(!live.contains("some_other_app_buf"));
+        assert_eq!(live.len(), 4);
+    }
+
+    #[test]
+    fn maps_scan_tolerates_empty_and_shmless_input() {
+        let mut live: HashSet<String> = HashSet::new();
+        sp1_shm_mapped_in("", &mut live);
+        sp1_shm_mapped_in("55a0-55b0 rw-p 0 00:00 0 [stack]\n", &mut live);
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn executor_runner_comm_matches_both_runner_shapes() {
+        use super::is_sp1_executor_runner_comm;
+        // `/proc/<pid>/comm` is 15-char truncated. The SHIPPED embedded runner (the default) and the
+        // override-binary runner must BOTH match, or the H1 peak sampler never finds the child and the
+        // claim gate silently no-ops (the bug this test guards against).
+        assert!(is_sp1_executor_runner_comm("sp1-native-runn")); // embedded, truncated
+        assert!(is_sp1_executor_runner_comm("sp1-native-runner-bin-abc123")); // untruncated form
+        assert!(is_sp1_executor_runner_comm("sp1-core-execut")); // override binary, truncated
+        assert!(is_sp1_executor_runner_comm("sp1-native-runn\n")); // trailing newline from /proc
+        // Not the runner:
+        assert!(!is_sp1_executor_runner_comm("sp1-gpu-server"));
+        assert!(!is_sp1_executor_runner_comm("zkminer-prove-s"));
+        assert!(!is_sp1_executor_runner_comm(""));
     }
 }

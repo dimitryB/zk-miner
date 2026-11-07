@@ -3,6 +3,30 @@ fn main() {
         embed_macos_guests();
         return;
     }
+    // The Intel worker loads its SYCL kernels from shared libraries the risc0 -sys crates build (and
+    // oneAPI's SYCL runtime), none of which is on the system's search path and none of which the build
+    // gives an rpath. Look for them in `zkminer-intel/lib/` next to the binary, where
+    // `scripts/stage-intel-worker-libs.sh` puts them, so a staged worker runs without
+    // LD_LIBRARY_PATH. DT_RPATH, not DT_RUNPATH: the kernel
+    // libraries load libsycl themselves and have no search path of their own, and only an RPATH on the
+    // executable applies to its libraries' dependencies too.
+    if std::env::var_os("CARGO_FEATURE_INTEL").is_some() {
+        println!(
+            "cargo:rustc-link-arg-bin=zkminer-prove-risc0-intel=-Wl,--disable-new-dtags,-rpath,$ORIGIN/zkminer-intel/lib:$ORIGIN"
+        );
+    }
+    // The ROCm worker's HIP runtime: the release ships the one it is compiled against (ROCm 7.1) in
+    // `zkminer-rocm/lib/` next to the binary (Dockerfile.build, build-rocm), so a host needs only the
+    // amdgpu kernel driver, and a distribution's own ROCm is never picked up instead.
+    // DT_RPATH, which ld.so searches before LD_LIBRARY_PATH and the system directories; the runtime's
+    // own libraries find each other through their $ORIGIN-relative RUNPATHs. Without that directory
+    // (a development build) the system's HIP runtime is used, as before.
+    if std::env::var_os("CARGO_FEATURE_ROCM").is_some() {
+        println!(
+            "cargo:rustc-link-arg-bin=zkminer-prove-risc0-rocm=-Wl,--disable-new-dtags,-rpath,$ORIGIN/zkminer-rocm/lib"
+        );
+    }
+
     // Skip guest compilation when RISC0_SKIP_BUILD is set (for CI/fast dev builds).
     if std::env::var("RISC0_SKIP_BUILD").is_ok() {
         // Generate empty stubs so the binary still compiles.

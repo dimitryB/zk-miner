@@ -14,14 +14,12 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
 /// Set to `0` to leave `~/.sp1/bin/sp1-gpu-server` alone.
 pub(crate) const INSTALL_ENV: &str = zkminer_prover_protocol::types::SP1_SERVER_INSTALL_ENV;
-/// The shipped server's name, beside this worker's executable.
-const BUNDLED_NAME: &str = "sp1-gpu-server";
 
 /// Installs the server shipped beside this executable, if there is one; see the module docs.
 /// Never fails the worker: without it the SDK runs whatever is installed, as before.
@@ -29,9 +27,11 @@ pub(crate) fn install_bundled_server() {
     if std::env::var(INSTALL_ENV).is_ok_and(|value| value.trim() == "0") {
         return;
     }
+    // The build for this worker's card (`warmup::server_name`), shipped under its own name.
+    let name = crate::warmup::server_name();
     let Some(bundled) = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(BUNDLED_NAME)))
+        .and_then(|exe| exe.parent().map(|dir| dir.join(&name)))
         .filter(|path| path.is_file())
     else {
         // Not a release layout (a development build, say): nothing shipped to install.
@@ -44,6 +44,8 @@ pub(crate) fn install_bundled_server() {
             return;
         }
     };
+    // A build with libraries of its own ships them in `<name>-lib/` beside it, which is used where it
+    // is (`server_lib_dir`), not copied: it is the whole ROCm or Intel runtime, in subdirectories.
     match install(&bundled, &target) {
         Ok(true) => tracing::info!("installed {} as {}", bundled.display(), target.display()),
         Ok(false) => tracing::debug!("{} is already installed", bundled.display()),
@@ -56,6 +58,42 @@ pub(crate) fn install_bundled_server() {
     }
 }
 
+/// The directory of libraries the server for this worker's card needs and a host does not have, if
+/// there is one: the HIP build's ROCm runtime, or the SYCL build's `libsp1_gpu_sycl.so`, oneAPI
+/// runtime and Intel driver stack. `main` puts it first on the library path the server inherits.
+///
+/// The release ships it beside this worker as `<name>-lib/` (for SYCL, a link to
+/// `zkminer-intel/lib`, which the risc0 Intel worker loads from too); it is used in place. Without one, or
+/// with installing turned off (a server managed by hand), it is `<name>-lib/` beside the installed
+/// server.
+pub(crate) fn server_lib_dir() -> Option<PathBuf> {
+    let installing = !std::env::var(INSTALL_ENV).is_ok_and(|value| value.trim() == "0");
+    let exe = std::env::current_exe().ok();
+    lib_dir_for(
+        &crate::warmup::server_name(),
+        exe.as_deref().and_then(Path::parent),
+        crate::warmup::server_path().ok().as_deref(),
+        installing,
+    )
+}
+
+/// [`server_lib_dir`] for a server called `name`, a worker in `worker_dir` and the server installed
+/// at `server`.
+fn lib_dir_for(
+    name: &str,
+    worker_dir: Option<&Path>,
+    server: Option<&Path>,
+    installing: bool,
+) -> Option<PathBuf> {
+    let lib = format!("{name}-lib");
+    let shipped = worker_dir.filter(|_| installing).map(|dir| dir.join(&lib));
+    let installed = server.map(|server| server.with_file_name(&lib));
+    shipped
+        .into_iter()
+        .chain(installed)
+        .find(|dir| dir.is_dir())
+}
+
 /// Copies `from` to `to`, executable, unless `to` already has the same contents. Whether it
 /// copied.
 pub(crate) fn install(from: &Path, to: &Path) -> Result<bool> {
@@ -66,7 +104,10 @@ pub(crate) fn install(from: &Path, to: &Path) -> Result<bool> {
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent directory", to.display()))?;
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let temp = dir.join(format!(".{BUNDLED_NAME}.{}.tmp", std::process::id()));
+    let base = to
+        .file_name()
+        .map_or_else(|| "sp1-gpu-server".into(), |n| n.to_string_lossy());
+    let temp = dir.join(format!(".{base}.{}.tmp", std::process::id()));
     let copied = (|| -> Result<()> {
         fs::copy(from, &temp).with_context(|| format!("cannot copy to {}", temp.display()))?;
         {
@@ -114,6 +155,35 @@ mod tests {
     use super::*;
     use crate::warmup::TestDir;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_shipped_lib_dir_is_used_in_place_unless_installing_is_off() {
+        let root = TestDir::new();
+        let worker = root.path().join("provers");
+        let sp1_bin = root.path().join(".sp1/bin");
+        let server = sp1_bin.join("sp1-gpu-server-sycl");
+        std::fs::create_dir_all(&worker).unwrap();
+        std::fs::create_dir_all(&sp1_bin).unwrap();
+        let find = |installing| {
+            lib_dir_for(
+                "sp1-gpu-server-sycl",
+                Some(&worker),
+                Some(&server),
+                installing,
+            )
+        };
+
+        assert_eq!(find(true), None, "no directory anywhere");
+        std::fs::create_dir(sp1_bin.join("sp1-gpu-server-sycl-lib")).unwrap();
+        assert_eq!(find(true), Some(sp1_bin.join("sp1-gpu-server-sycl-lib")));
+        // The release's SYCL one: a link to the libraries the risc0 Intel worker uses.
+        std::fs::create_dir_all(worker.join("zkminer-intel/lib")).unwrap();
+        std::os::unix::fs::symlink("zkminer-intel/lib", worker.join("sp1-gpu-server-sycl-lib"))
+            .unwrap();
+        assert_eq!(find(true), Some(worker.join("sp1-gpu-server-sycl-lib")));
+        // A server managed by hand keeps its own libraries.
+        assert_eq!(find(false), Some(sp1_bin.join("sp1-gpu-server-sycl-lib")));
+    }
 
     #[test]
     fn installs_when_missing_or_different_and_not_otherwise() {

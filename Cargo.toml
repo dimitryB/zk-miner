@@ -11,7 +11,6 @@ members = [
     "crates/zkminer-cli",
     "crates/zkminer-prove-risc0",
     "crates/zkminer-prove-sp1",
-    "crates/zkminer-prove-openvm",
     "crates/zkminer-e2e",
 ]
 default-members = [
@@ -26,6 +25,10 @@ default-members = [
 ]
 exclude = [
     "crates/zkminer-prover/guests",
+    # Its own workspace and lockfile: OpenVM 1.5.0-rc.1 pins p3-field =0.4.1 and SP1 6.8.1's slop
+    # crates =0.4.3-succinct, and one workspace can hold only one 0.4.x. Build it with
+    # `--manifest-path crates/zkminer-prove-openvm/Cargo.toml`.
+    "crates/zkminer-prove-openvm",
 ]
 
 [workspace.package]
@@ -85,72 +88,120 @@ zkminer-config = { path = "crates/zkminer-config" }
 
 # Patch risc0 crates to use hemilabs fork (AMD + NVIDIA GPU support)
 #
-# Pinned by REV to branch `release-3.0` @ f8dcbdf8 (hemilabs/risc0 #18): upstream v3.0.6 plus the Intel port
-# (#11) and the GPU work zk-miner runs on: the `max/cdna` fixes, including the release of cached GPU memory
-# around the Groth16 wrap that a real risc0 Groth16 proof needs to finish on a 16 GB card (see
-# crates/zkminer-prover/tests/risc0_groth16_vram.rs), the Windows CUDA build, RISC Zero 3.0's keccak circuit
-# and protocol with an eval_check that fits cards smaller than ~26 GB (so stock 3.0 guests can use the keccak
-# accelerator), the prover self-checks, #14's fixes to GPU stream ordering, build-cache keys, the rv32im
-# header, recursion caches and Groth16 release locking, and #18's fixes for a deadlock when proving on
-# several threads and for the ROCm build on machines without an AMD GPU.
+# Pinned by REV to branch `zkminer/intel-aot` @ 68b3eacbb: two Intel commits on top of branch
+# `zkminer/release-3.0-8007a99` @ 8b16ef0c8 (tag `zkminer-pin-2026-11-02b`), so that an Intel card the
+# build targets compiles almost nothing at its first proof:
+# - 0bb393f6e (branch `zkminer/witgen-scan-width`) sizes the rv32im witgen scans from the card's
+#   architecture instead of a SYCL kernel bundle, for which oneAPI 2026.0's runtime picked an
+#   ahead-of-time image built for another card: on an Arc B580 the driver rejected it and recompiled
+#   the whole witgen module from SPIR-V, about 10 minutes of the first proof;
+# - 68b3eacbb compiles the Poseidon2 OpenCL kernels (with ocloc, loaded through Level Zero) and the
+#   Groth16 prover ahead of time for RISC0_INTEL_SYCL_TARGETS, which the B580 compiled on the card for
+#   about 7.5 minutes. What is left is the zkp library's ESIMD images, about 75 s (see risc0-sys
+#   build.rs for why they stay SPIR-V).
+# 8b16ef0c8 is `release-3.0` @ 8007a997 (through hemilabs/risc0 #28) plus the commits zk-miner needs on
+# top of it. The first seven are carried unchanged from `zkminer/measure-matches-prove` @ d7847647c (which stays
+# tagged `zkminer-pin-2026-11-02`), most of them so that the risc0 worker's pre-claim measurement
+# executes a guest exactly as its proof will (a guest that measures clean must not fail every proof,
+# after the claim):
+# - `ExecutorEnv::random_seed`, which answers the guest's `sys_rand` from a seed instead of fresh host
+#   entropy (see `sys_rand_seed` in crates/zkminer-prove-risc0);
+# - execution runs a bigint2 ecall's verify program as the prover's preflight does (its checks, memory
+#   writes and cycle count), where it used to trust the program's declared size, in exact arithmetic,
+#   with the circuit's address checks and a bound on its work;
+# - execution refuses a guest that halts with an output digest other than its journal's and
+#   assumptions' (which the prover proves);
+# - execution refuses what no proof can verify: sys_poseidon2, encodings the circuit does not decode,
+#   misaligned sha2 pointers, traps, host writes, a misaligned pc and an out-of-reach bigint offset;
+# - nttq's L2 `discard` compiled out below sm_80, without which the sm_75 target in Dockerfile.build and
+#   build-windows.yml fails in ptxas (upstream's ntt_q.cuh still emits it unguarded);
+# - the rv32im exec cache's persisting-L2 carve-out clamped to what the card allows, with its errors
+#   cleared: a fixed 24 MB failed on a card that allows less (an RTX 5060 Ti; every card before Ampere),
+#   and the pending error then failed the first proof of every fresh worker in witness generation.
+# release-3.0 is upstream v3.0.6 plus the Intel port (#11, #25) and the GPU work zk-miner runs on: the
+# `max/cdna` fixes, including the release of cached GPU memory around the Groth16 wrap that a real risc0
+# Groth16 proof needs to finish on a 16 GB card (see crates/zkminer-prover/tests/risc0_groth16_vram.rs),
+# Intel and ROCm proving on Windows, RISC Zero 3.0's keccak circuit and protocol with an eval_check that
+# fits cards smaller than ~26 GB (so stock 3.0 guests can use the keccak accelerator), the prover
+# self-checks, #14's fixes to GPU stream ordering, build-cache keys, the rv32im header, recursion caches
+# and Groth16 release locking, #18's fixes for a deadlock when proving on several threads and for the
+# ROCm build on machines without an AMD GPU, #19's sppark shared-memory barriers and Groth16
+# witness-upload ordering, the CUDA speed stacks (#20, #21), the CUDA speedups ported to HIP (#22),
+# sppark from the hemilabs fork (#23), #24's rv32im accum fix, #26's fixes that make the Windows CUDA
+# build work, #27's memory fixes for small Intel cards, and #28's AMD RDNA3/RDNA4 speedups, which
+# rewrite most of the ROCm proving path (validated upstream on ROCm 7.2; prove on an AMD card before
+# trusting a new ROCm toolchain with it).
+# Build at -j 4 or more: from #21, three -sys build scripts can deadlock on cargo's jobserver at -j 1..3.
 # A rev and not a branch for the reason given on `sppark` below: a branch pin follows a moved head on
 # the next `cargo update` without anyone choosing to.
 [patch.crates-io]
-risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
-risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "f8dcbdf8" }
+risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
+risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "68b3eacbbdb163e60afb07c02d463d2264f9f83f" }
 # Pinned by immutable REV, not a branch: a branch head can silently move the build
 # off a validated commit (which is why the risc0/sp1 patches below carry a
-# do-not-cargo-update warning). 8860917 = hemilabs/risc0-sppark main after #5, the
-# merge of upstream sppark up to 9e5c795 (0.1.15). It includes the gpu_ptr_t
-# destructor leak fix (upstream #81), and keeps the 16-byte alignment of 254-bit
-# fields that risc0's GPU Groth16 prover relies on (upstream's a8bf573/eff682c
-# change it and every Groth16 proof then fails; see that PR).
-sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "8860917" }
+# do-not-cargo-update warning). 5f68eb3 = hemilabs/risc0-sppark `zkminer/windows-amd`
+# (tag `zkminer-pin-2026-11-02`): main @ 725d3af (#7: #5's merge of upstream sppark
+# up to 9e5c795 (0.1.15) plus the GS NTT shared-memory barrier, upstream 6b931f3)
+# plus four commits for the Windows CUDA and HIP builds, each gated to Windows/MSVC
+# or the same code on Linux. The risc0 pin above builds against this same commit
+# (its own [patch], which doesn't reach this workspace), and its HIP kernels rely
+# on this fork's cuda2hip.hpp aliasing cudaEventSynchronize. It includes the
+# gpu_ptr_t destructor leak fix (upstream #81), and keeps the 16-byte alignment of
+# 254-bit fields that risc0's GPU Groth16 prover relies on (upstream's
+# a8bf573/eff682c change it and every Groth16 proof then fails; see that PR).
+sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "5f68eb3eb9e4e06c9837d22aade07ed40432889f" }
 
 # Patch SP1 crates to use hemilabs fork (AMD GPU + PLONK optimizations)
 #
-# Pinned by commit: the head of branch `zkminer/sp1-gpu-fixes`, which is `max/optimizations_and_amd` @
-# 676290bb8 plus four out-of-bounds GPU fixes that crash Blackwell (sm_120) and the changes that let a
-# 16 GB card finish a Groth16 proof. Those commits touch only the `sp1-gpu` crates, which zkminer does
-# not compile: they take effect in `sp1-gpu-server`, which must be BUILT FROM THIS COMMIT (the server
-# the SDK downloads is upstream's and has neither the fixes nor the 16 GB tier). Dockerfile.build
-# builds it from the commit Cargo.lock records here, and the release ships it beside
-# `zkminer-prove-sp1`, which installs it. A commit rather than a branch, so that a moved branch can
-# never pair an SDK with a different server. Keep `crates/zkminer-cli/Cargo.toml`, which names the
-# commit directly, in step with this.
-sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-build = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-cuda = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-prover = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-prover-types = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-core-executor = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-core-machine = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-curves = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-derive = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-hypercube = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-jit = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-primitives = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
-sp1-verifier = { git = "https://github.com/hemilabs/sp1", rev = "64e895cb300679e5731bb0eb59e30be4c9f16c1d" }
+# Pinned by commit: hemilabs/sp1 `zkminer/sycl-record-events` @ 9a0de7462, one SYCL fix on top of
+# #19 (`perf/windows-gpu-cpu`) @ 23a275ccd (tagged `zkminer-pin-2026-11-02`, so a rebased or deleted
+# branch cannot orphan it). The fix: on Linux the Intel server aborted about every other benchmark
+# run on an Arc B580 ("ur_die: urEventWait must not be called for an internal event"), from Level
+# Zero's legacy adapter over-releasing barrier events across threads. Events are now recorded from
+# each queue's latest command, at the same speed. 23a275ccd is SP1 6.8.1 (circuit v6.1.0, the circuit
+# 743111's SP1 verifier accepts) with the proof-nonce fix, the CUDA build fix and the fork's CUDA, HIP
+# and SYCL GPU backends. The previous pin, `zkminer/sp1-gpu-fixes` @ 64e895cb3 (v6.0.2), stays tagged
+# `zkminer-pin-2026-10-11`. The `sp1-gpu` crates, which zkminer does not compile, take effect in
+# `sp1-gpu-server`, which must be BUILT FROM THIS COMMIT, once per GPU vendor (SP1_GPU_BACKEND=cuda,
+# hip, sycl; the HIP and SYCL builds are installed as `sp1-gpu-server-hip` / `-sycl`): the server the
+# SDK downloads is upstream's CUDA build without the fork's fixes. Dockerfile.build builds the CUDA
+# one from the commit Cargo.lock records here, and the release ships it beside `zkminer-prove-sp1`,
+# which installs it. A commit rather than a branch, so that a moved branch can never pair an SDK with
+# a different server. Keep `crates/zkminer-cli/Cargo.toml`, which names the commit directly, in step
+# with this.
+sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-build = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-cuda = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-prover = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-prover-types = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-core-executor = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-core-machine = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-curves = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-derive = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-hypercube = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-jit = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-primitives = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+sp1-verifier = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
 
 [profile.release]
 opt-level = 3
@@ -182,6 +233,4 @@ codegen-units = 1
 [profile.release.package.zkminer-prove-risc0]
 codegen-units = 1
 [profile.release.package.zkminer-prove-sp1]
-codegen-units = 1
-[profile.release.package.zkminer-prove-openvm]
 codegen-units = 1

@@ -79,6 +79,9 @@ pub struct GpuInfo {
     pub pcie_speed: String,
     pub pcie_width: u32,
     pub vbios: String,
+    /// Why the card is clocking itself down right now (e.g. `THERMAL`, `PL1`); empty when it is not, or
+    /// when the driver does not say. Intel only so far (xe `freq0/throttle`).
+    pub throttle_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -100,12 +103,18 @@ pub struct CpuStatSnapshot {
     pub total: u64,
 }
 
-/// Snapshot for computing Intel GPU power from energy counter deltas.
+/// Snapshot for computing Intel GPU power from energy counter deltas, and its utilization from the
+/// engine-busy cycles of its DRM clients (`drm_engine_cycles`).
 #[derive(Debug, Clone, Default)]
 pub struct IntelGpuEnergySnapshot {
     pub energy_uj: u64,
     pub timestamp: Option<std::time::Instant>,
+    pub engine_cycles: EngineCycles,
 }
+
+/// Per DRM client (`drm-client-id`), per engine class (`ccs`, `rcs`, ...): `(busy, total)` cycles.
+pub type EngineCycles =
+    std::collections::HashMap<u64, std::collections::HashMap<String, (u64, u64)>>;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -647,6 +656,7 @@ fn detect_gpus() -> Vec<GpuInfo> {
                 pcie_speed,
                 pcie_width,
                 vbios,
+                throttle_reasons: Vec::new(),
             };
 
             gpu.gpu_clock_mhz = 0; // will be set in refresh
@@ -696,6 +706,7 @@ fn detect_gpus() -> Vec<GpuInfo> {
                 pcie_speed,
                 pcie_width,
                 vbios: String::new(),
+                throttle_reasons: Vec::new(),
             };
 
             refresh_intel_gpu(&mut gpu, &base, &hwmon, None);
@@ -743,6 +754,7 @@ fn detect_gpus() -> Vec<GpuInfo> {
                 pcie_speed,
                 pcie_width,
                 vbios: nv.vbios.clone(),
+                throttle_reasons: Vec::new(),
             };
 
             refresh_nvidia_gpu(&mut gpu);
@@ -807,6 +819,7 @@ fn detect_gpus() -> Vec<GpuInfo> {
                 pcie_speed: nv.pcie_speed.clone(),
                 pcie_width: nv.pcie_width,
                 vbios: nv.vbios.clone(),
+                throttle_reasons: Vec::new(),
             };
             refresh_nvidia_gpu(&mut gpu);
             gpus.push(gpu);
@@ -1139,7 +1152,16 @@ fn is_intel_discrete_gpu(base: &str) -> bool {
 /// Detect Intel GPU VRAM size. The xe driver exposes this via tile0/physical_vram_size_bytes
 /// or the hwmon/i915 driver can expose it via other paths.
 fn detect_intel_vram(base: &str) -> u64 {
-    // xe driver: tile0/physical_vram_size_bytes
+    // xe driver: its own memory-regions query, the only answer on current kernels. BAR2 below is the
+    // aperture, not the memory (16 GiB on a 12 GB Arc B580).
+    if let Some((total, _)) = fs::canonicalize(base)
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .and_then(|bus| zkminer_prover::discovery::intel_vram(&bus))
+    {
+        return total;
+    }
+    // older xe: tile0/physical_vram_size_bytes
     if let Some(vram) = read_u64(&format!("{}/tile0/physical_vram_size_bytes", base)) {
         return vram;
     }
@@ -1183,7 +1205,7 @@ fn refresh_intel_gpu(
     gpu: &mut GpuInfo,
     base: &str,
     hwmon: &Option<PathBuf>,
-    energy_snap: Option<&mut IntelGpuEnergySnapshot>,
+    mut energy_snap: Option<&mut IntelGpuEnergySnapshot>,
 ) {
     // GPU clock — reading act_freq or cur_freq triggers a GuC firmware query
     // that wakes the GPU from C6 idle, causing a ~7 second kernel stall.
@@ -1199,30 +1221,62 @@ fn refresh_intel_gpu(
         gpu.gpu_clock_mhz = 0;
     }
 
+    // Throttling, read only while awake like the clock: a sleeping card is not being held back.
+    gpu.throttle_reasons = if gpu_active {
+        intel_throttle_reasons(Path::new(&format!("{}/tile0/gt0/freq0/throttle", base)))
+    } else {
+        Vec::new()
+    };
+
+    // Utilization. xe has no busy-percent file; what it has is each DRM client's engine-busy
+    // cycles in fdinfo, the source `intel_gpu_top` and nvtop read. Only while the GT is awake, like
+    // the clock above (reading them takes forcewake); asleep it is idle, and the snapshot restarts so
+    // the next reading is not averaged over the nap. Only processes of our own user are readable,
+    // which every worker of ours is: anyone else's use of the card does not show.
+    if let Some(snap) = energy_snap.as_deref_mut() {
+        if gpu_active && !gpu.pci_bus_id.is_empty() {
+            let (now, capacity) = drm_engine_cycles(Path::new("/proc"), &gpu.pci_bus_id);
+            gpu.gpu_usage_percent =
+                engine_busy_percent(&snap.engine_cycles, &now, &capacity).unwrap_or(0);
+            snap.engine_cycles = now;
+        } else {
+            gpu.gpu_usage_percent = 0;
+            snap.engine_cycles.clear();
+        }
+    }
+
+    // VRAM in use, from the same xe memory-regions query that sizes the card (`intel_vram`).
+    if let Some((total, used)) = zkminer_prover::discovery::intel_vram(&gpu.pci_bus_id) {
+        gpu.vram_used_bytes = used;
+        if gpu.vram_total_bytes == 0 {
+            gpu.vram_total_bytes = total;
+        }
+    }
+
     // Memory clock — xe driver does not expose VRAM clock via sysfs.
     gpu.mem_clock_mhz = 0;
 
     if let Some(ref hwmon_path) = hwmon {
-        // Temperatures (millidegrees → degrees)
-        // The xe driver numbers vary (e.g. temp2=pkg, temp3=vram with no temp1).
-        // Use labels to find the right sensors.
-        gpu.temp_edge_c = None;
-        gpu.temp_mem_c = None;
+        // Temperatures, by label. xe numbers them sparsely and has many: a B580 reports pkg, vram,
+        // mctrl, pcie and twelve VRAM channels (temp2..temp17), so every sensor is scanned, not the
+        // first few. The package is the core reading; the memory reading is the hottest VRAM sensor,
+        // which under load runs well above the package (94 against 89 °C seen on a B580).
+        let temps = hwmon_temperatures(hwmon_path);
+        gpu.temp_edge_c = temps
+            .iter()
+            .find(|(label, _)| label.as_deref() == Some("pkg"))
+            .or_else(|| temps.iter().find(|(label, _)| label.is_none()))
+            .map(|(_, c)| *c);
+        gpu.temp_mem_c = temps
+            .iter()
+            .filter(|(label, _)| {
+                label
+                    .as_deref()
+                    .is_some_and(|l| l == "vram" || l.starts_with("vram_ch"))
+            })
+            .map(|(_, c)| *c)
+            .reduce(f64::max);
         gpu.temp_junction_c = None;
-        for i in 1..=6 {
-            let label = read_hwmon_str(hwmon_path, &format!("temp{}_label", i));
-            let value = read_u64_from_hwmon_path(hwmon_path, &format!("temp{}_input", i))
-                .map(|v| v as f64 / 1000.0);
-            match label.as_deref() {
-                Some("pkg") => gpu.temp_edge_c = value,
-                Some("vram") => gpu.temp_mem_c = value,
-                _ if gpu.temp_edge_c.is_none() && value.is_some() => {
-                    // No label — use first available as package temp
-                    gpu.temp_edge_c = value;
-                }
-                _ => {}
-            }
-        }
 
         // Fan
         gpu.fan_rpm = read_u32_from_hwmon_path(hwmon_path, "fan1_input").unwrap_or(0);
@@ -1266,6 +1320,155 @@ fn refresh_intel_gpu(
         gpu.pcie_speed = speed;
     }
     gpu.pcie_width = read_u32(&format!("{}/current_link_width", base)).unwrap_or(gpu.pcie_width);
+}
+
+/// Every temperature an hwmon directory reports, in °C, in sensor order, each with its label
+/// (`temp<N>_label`) when it has one. A sensor reading exactly 0 is left out: xe reports `pcie` as 0 on
+/// a B580, which has no such sensor.
+fn hwmon_temperatures(hwmon_path: &Path) -> Vec<(Option<String>, f64)> {
+    let mut sensors: Vec<(u32, Option<String>, f64)> = fs::read_dir(hwmon_path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let n: u32 = name
+                .strip_prefix("temp")?
+                .strip_suffix("_input")?
+                .parse()
+                .ok()?;
+            let millideg = read_u64_from_hwmon_path(hwmon_path, &name)?;
+            let label = read_hwmon_str(hwmon_path, &format!("temp{n}_label"));
+            (millideg > 0).then(|| (n, label, millideg as f64 / 1000.0))
+        })
+        .collect();
+    sensors.sort_by_key(|(n, _, _)| *n);
+    sensors.into_iter().map(|(_, l, c)| (l, c)).collect()
+}
+
+/// Why an xe GT is throttled, from its `freq0/throttle` directory: nothing while `status` is 0, else
+/// each `reason_<name>` reading 1, named for display (`THERMAL`, `PL1`, `VR TDC`, ...).
+fn intel_throttle_reasons(throttle_dir: &Path) -> Vec<String> {
+    let status = read_trimmed(&throttle_dir.join("status").to_string_lossy());
+    if status.as_deref().is_none_or(|s| s == "0") {
+        return Vec::new();
+    }
+    let mut reasons: Vec<String> = fs::read_dir(throttle_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let reason = name.strip_prefix("reason_")?.to_string();
+            let set = read_trimmed(&entry.path().to_string_lossy()).is_some_and(|v| v == "1");
+            set.then(|| match reason.as_str() {
+                "vr_tdc" => "VR TDC".to_string(),
+                "vr_thermalert" => "VR THERMAL".to_string(),
+                other => other.to_ascii_uppercase(),
+            })
+        })
+        .collect();
+    reasons.sort();
+    reasons
+}
+
+/// Engine-busy counters of every DRM client on the card at `pci_bus_id` that this process may read,
+/// from `<proc_root>/<pid>/fdinfo/<fd>` of open `/dev/dri` nodes (`drm-cycles-<class>` and
+/// `drm-total-cycles-<class>`, keyed by `drm-client-id`, each client once however many fds share
+/// it), and each engine class's engine count (`drm-engine-capacity-<class>`, 1 when absent).
+fn drm_engine_cycles(
+    proc_root: &Path,
+    pci_bus_id: &str,
+) -> (EngineCycles, std::collections::HashMap<String, u64>) {
+    let card = pci_bus_id.to_ascii_lowercase();
+    let mut clients = EngineCycles::new();
+    let mut capacity = std::collections::HashMap::new();
+    for pid in fs::read_dir(proc_root).into_iter().flatten().flatten() {
+        if pid
+            .file_name()
+            .to_str()
+            .and_then(|p| p.parse::<u32>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        let Ok(fds) = fs::read_dir(pid.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if !fs::read_link(fd.path()).is_ok_and(|to| to.starts_with("/dev/dri/")) {
+                continue;
+            }
+            let Ok(info) = fs::read_to_string(pid.path().join("fdinfo").join(fd.file_name()))
+            else {
+                continue;
+            };
+            let mut client = None;
+            let mut on_card = false;
+            let mut busy = std::collections::HashMap::new();
+            let mut total = std::collections::HashMap::new();
+            for line in info.lines() {
+                let Some((key, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let value = value.trim();
+                let number = || value.split_whitespace().next()?.parse::<u64>().ok();
+                match key.trim() {
+                    "drm-pdev" => on_card = value.eq_ignore_ascii_case(&card),
+                    "drm-client-id" => client = number(),
+                    key => {
+                        if let Some(class) = key.strip_prefix("drm-total-cycles-") {
+                            total.insert(class.to_string(), number().unwrap_or(0));
+                        } else if let Some(class) = key.strip_prefix("drm-cycles-") {
+                            busy.insert(class.to_string(), number().unwrap_or(0));
+                        } else if let Some(class) = key.strip_prefix("drm-engine-capacity-") {
+                            capacity.insert(class.to_string(), number().unwrap_or(1).max(1));
+                        }
+                    }
+                }
+            }
+            let (Some(client), true) = (client, on_card) else {
+                continue;
+            };
+            let classes = busy
+                .into_iter()
+                .filter_map(|(class, b)| Some((class.clone(), (b, *total.get(&class)?))))
+                .collect();
+            clients.entry(client).or_insert(classes);
+        }
+    }
+    (clients, capacity)
+}
+
+/// The busiest engine class's share (0..=100) between two `drm_engine_cycles` readings: its busy
+/// cycles summed over the clients present in both, over the GPU cycles that passed times its engine
+/// count. `None` with nothing to compare (no client in both, or no time passed).
+fn engine_busy_percent(
+    before: &EngineCycles,
+    now: &EngineCycles,
+    capacity: &std::collections::HashMap<String, u64>,
+) -> Option<u32> {
+    let mut busy: std::collections::HashMap<&str, (u64, u64)> = std::collections::HashMap::new();
+    for (client, classes) in now {
+        let Some(prev) = before.get(client) else {
+            continue;
+        };
+        for (class, &(b, t)) in classes {
+            let Some(&(pb, pt)) = prev.get(class) else {
+                continue;
+            };
+            let entry = busy.entry(class.as_str()).or_default();
+            entry.0 = entry.0.saturating_add(b.saturating_sub(pb));
+            entry.1 = entry.1.max(t.saturating_sub(pt));
+        }
+    }
+    busy.into_iter()
+        .filter(|(_, (_, elapsed))| *elapsed > 0)
+        .map(|(class, (b, elapsed))| {
+            let engines = capacity.get(class).copied().unwrap_or(1).max(1);
+            (b.saturating_mul(100) / elapsed.saturating_mul(engines)).min(100) as u32
+        })
+        .max()
 }
 
 /// Find an energy counter by label (e.g. "card", "pkg").
@@ -1419,6 +1622,133 @@ mod tests {
         }
     }
 
+    /// xe fdinfo in a fake `/proc`: a client counted once across the fds and processes that share it,
+    /// other cards and non-DRM fds ignored, then the busy share between two readings.
+    #[cfg(unix)]
+    #[test]
+    fn intel_utilization_comes_from_drm_engine_cycles() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("zkminer-tui-fdinfo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let write = |pid: u32,
+                     fd: u32,
+                     to: &str,
+                     client: u64,
+                     pdev: &str,
+                     busy: u64,
+                     total: u64| {
+            let dir = root.join(pid.to_string());
+            fs::create_dir_all(dir.join("fd")).unwrap();
+            fs::create_dir_all(dir.join("fdinfo")).unwrap();
+            let _ = fs::remove_file(dir.join("fd").join(fd.to_string()));
+            symlink(to, dir.join("fd").join(fd.to_string())).unwrap();
+            fs::write(
+                dir.join("fdinfo").join(fd.to_string()),
+                format!(
+                    "drm-driver:\txe\ndrm-client-id:\t{client}\ndrm-pdev:\t{pdev}\n\
+                     drm-cycles-ccs:\t{busy}\ndrm-total-cycles-ccs:\t{total}\n\
+                     drm-engine-capacity-ccs:\t1\ndrm-cycles-bcs:\t0\ndrm-total-cycles-bcs:\t{total}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let card = "0000:08:0d.0";
+        write(10, 3, "/dev/dri/renderD129", 7, card, 1_000, 10_000);
+        write(11, 4, "/dev/dri/renderD129", 7, card, 1_000, 10_000); // the same client, forked
+        write(11, 5, "/dev/dri/renderD129", 8, card, 0, 10_000);
+        write(
+            12,
+            3,
+            "/dev/dri/renderD128",
+            9,
+            "0000:08:0f.0",
+            5_000,
+            10_000,
+        );
+        write(13, 3, "/tmp/not-a-gpu", 10, card, 5_000, 10_000);
+        let (before, capacity) = drm_engine_cycles(&root, "0000:08:0D.0");
+        assert_eq!(before.len(), 2, "{before:?}");
+        // 10,000 GPU cycles later client 7 was busy 6,000 of them and client 8 another 1,500: 75%.
+        write(10, 3, "/dev/dri/renderD129", 7, card, 7_000, 20_000);
+        write(11, 4, "/dev/dri/renderD129", 7, card, 7_000, 20_000);
+        write(11, 5, "/dev/dri/renderD129", 8, card, 1_500, 20_000);
+        let (now, _) = drm_engine_cycles(&root, card);
+        assert_eq!(engine_busy_percent(&before, &now, &capacity), Some(75));
+        // No earlier reading, or no time passed: nothing to say.
+        assert_eq!(
+            engine_busy_percent(&EngineCycles::new(), &now, &capacity),
+            None
+        );
+        assert_eq!(engine_busy_percent(&now, &now, &capacity), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A B580's hwmon in miniature: sparse numbering, a zero (absent) `pcie` sensor, more than six.
+    #[test]
+    fn every_hwmon_temperature_is_read_by_label() {
+        let dir = std::env::temp_dir().join(format!("zkminer-tui-hwmon-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for (n, label, millideg) in [
+            (2, Some("pkg"), 89_000),
+            (3, Some("vram"), 92_000),
+            (5, Some("pcie"), 0),
+            (6, Some("vram_ch_0"), 94_000),
+            (17, Some("vram_ch_11"), 86_000),
+            (20, None, 40_000),
+        ] {
+            fs::write(dir.join(format!("temp{n}_input")), format!("{millideg}\n")).unwrap();
+            if let Some(l) = label {
+                fs::write(dir.join(format!("temp{n}_label")), format!("{l}\n")).unwrap();
+            }
+        }
+        fs::write(dir.join("fan1_input"), "1362\n").unwrap();
+        let temps = hwmon_temperatures(&dir);
+        let labels: Vec<Option<&str>> = temps.iter().map(|(l, _)| l.as_deref()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                Some("pkg"),
+                Some("vram"),
+                Some("vram_ch_0"),
+                Some("vram_ch_11"),
+                None
+            ]
+        );
+        assert_eq!(temps[2].1, 94.0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// xe's `freq0/throttle`: nothing while `status` is 0 whatever the reason files say, else each set
+    /// reason by display name.
+    #[test]
+    fn intel_throttle_reasons_come_from_the_set_reason_files() {
+        let dir = std::env::temp_dir().join(format!("zkminer-tui-throttle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for (file, value) in [
+            ("status", "0"),
+            ("reasons", "none"),
+            ("reason_pl1", "1"),
+            ("reason_thermal", "1"),
+            ("reason_vr_tdc", "1"),
+            ("reason_prochot", "0"),
+        ] {
+            fs::write(dir.join(file), format!("{value}\n")).unwrap();
+        }
+        assert!(
+            intel_throttle_reasons(&dir).is_empty(),
+            "status 0 is not throttled"
+        );
+        fs::write(dir.join("status"), "1\n").unwrap();
+        assert_eq!(
+            intel_throttle_reasons(&dir),
+            vec!["PL1", "THERMAL", "VR TDC"]
+        );
+        assert!(intel_throttle_reasons(&dir.join("missing")).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn test_fmt_bytes() {
         assert_eq!(fmt_bytes(0), "0B");
@@ -1552,6 +1882,7 @@ mod gpu_identity_tests {
             pcie_speed: String::new(),
             pcie_width: 0,
             vbios: String::new(),
+            throttle_reasons: Vec::new(),
         }
     }
 

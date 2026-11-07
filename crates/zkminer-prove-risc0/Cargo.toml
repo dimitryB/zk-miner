@@ -18,6 +18,11 @@ name = "zkminer-prove-risc0-rocm"
 path = "src/main.rs"
 required-features = ["rocm"]
 
+[[bin]]
+name = "zkminer-prove-risc0-intel"
+path = "src/main.rs"
+required-features = ["intel"]
+
 [features]
 macos = ["risc0-zkvm/disable-dev-mode", "dep:serde_json", "dep:sha2"]
 # Deprecated compatibility name: compilation emits migration guidance.
@@ -30,6 +35,9 @@ macos-recursion-metal = ["macos-native-wrap", "dep:metal"]
 macos-rv32im-metal = ["macos-recursion-metal", "dep:risc0-zkp"]
 cuda = ["risc0-zkvm/cuda", "risc0-groth16/cuda"]
 rocm = ["risc0-zkvm/rocm", "risc0-groth16/rocm"]
+# Intel Arc / Data Center GPUs through SYCL on Level Zero. Built with oneAPI's `icpx` (see the README's
+# Intel section); the kernels' shared libraries are found next to the binary (`$ORIGIN`, set in build.rs).
+intel = ["risc0-zkvm/intel", "risc0-groth16/intel"]
 
 [dependencies]
 zkminer-prover-protocol = { workspace = true }
@@ -38,10 +46,23 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 bincode = "1"
+libc = "0.2"
+# The host key and per-(ELF, input) seed for the guest's `sys_rand`: see `sys_rand_seed`.
+dirs = { workspace = true }
+getrandom = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
 risc0-zkvm = { version = "3.0", default-features = false, features = ["prove"] }
+# Directly, to check a measured guest's keccak proof requests as the prover will (`KeccakAudit`).
+risc0-circuit-keccak = { version = "4.0", features = ["prove"] }
 # Directly, for `prove::release_srs`: the Groth16 SRS cache on the GPU has to be freed after each proof
 # on a card too small to hold it beside the next STARK. See `release_groth16_cache_if_tight`.
 risc0-groth16 = { version = "3.0" }
+# Installing the risc0-groth16 component on a host without rzup (`groth16_component`): the download
+# (rustls with its own roots, so neither OpenSSL nor the host's CA store is needed) and the tar.xz.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+liblzma = { version = "0.4", features = ["parallel"] }
+tar = "0.4"
 
 [package.metadata.risc0]
 methods = [
@@ -59,6 +80,9 @@ methods = [
     "../zkminer-prover/guests/risc0/babybear-stress",
     "../zkminer-prover/guests/risc0/minimal-proof",
 ]
+
+[dev-dependencies]
+tempfile = "3"
 
 [build-dependencies]
 risc0-build = "3.0"

@@ -97,6 +97,7 @@ pub fn detect_all_gpus() -> Vec<DetectedGpu> {
             .map(|g| format!("[{}] {} ({})", g.device_index, g.name, g.pci_bus_id))
             .collect();
         tracing::info!("Detected {} AMD GPU(s): {}", amd.len(), names.join(", "));
+        warn_if_inaccessible(&[Path::new("/dev/kfd")], "AMD");
         gpus.extend(amd);
     }
 
@@ -111,11 +112,52 @@ pub fn detect_all_gpus() -> Vec<DetectedGpu> {
             intel.len(),
             names.join(", ")
         );
+        let render_nodes: Vec<PathBuf> = std::fs::read_dir("/dev/dri")
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("renderD"))
+            .map(|e| e.path())
+            .collect();
+        let render_nodes: Vec<&Path> = render_nodes.iter().map(PathBuf::as_path).collect();
+        warn_if_inaccessible(&render_nodes, "Intel");
         gpus.extend(intel);
     }
 
     gpus
 }
+
+/// Says so, once, when this user cannot open the device nodes an AMD (`/dev/kfd`) or Intel
+/// (`/dev/dri/renderD*`) worker needs. They are `root:render`, mode 0660: a desktop session's user
+/// is let in by its seat, but a service, a cron job or an SSH session needs the user in `render`,
+/// and without it every worker on those cards fails to start, with only the runtime's own error.
+#[cfg(unix)]
+fn warn_if_inaccessible(nodes: &[&Path], vendor: &str) {
+    use std::os::unix::ffi::OsStrExt;
+    let denied: Vec<String> = nodes
+        .iter()
+        .filter(|node| {
+            let Ok(path) = std::ffi::CString::new(node.as_os_str().as_bytes()) else {
+                return false;
+            };
+            // access(2) checks the real user and all its groups, as opening the node would.
+            let status = unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) };
+            status != 0
+        })
+        .map(|node| node.display().to_string())
+        .collect();
+    if !denied.is_empty() && denied.len() == nodes.len() {
+        tracing::warn!(
+            "{vendor} GPU(s) found, but this user cannot open {}: their workers will fail to \
+             start. Add the user to the `render` group (`sudo usermod -aG render $USER`, then log \
+             in again): a desktop session is let in, a service or SSH session is not.",
+            denied.join(", ")
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_inaccessible(_nodes: &[&Path], _vendor: &str) {}
 
 /// Detect NVIDIA GPUs via nvidia-smi, falling back to /proc/driver/nvidia/gpus/.
 fn detect_nvidia_gpus() -> Vec<DetectedGpu> {
@@ -167,6 +209,9 @@ fn detect_nvidia_via_smi() -> Option<Vec<DetectedGpu>> {
     }
     let mut gpus = Vec::new();
     let mut saw_nonempty_line = false;
+    // Cards `ZKMINER_GPU_NAME_FILTER` left out: an empty list because of them is the operator's
+    // choice, not an unparseable probe, and must not fall back to /proc (which would bring them back).
+    let mut filtered_out = 0usize;
 
     for line in stdout.lines() {
         let line = line.trim();
@@ -192,10 +237,9 @@ fn detect_nvidia_via_smi() -> Option<Vec<DetectedGpu>> {
         // Optional operator override to restrict which physical GPUs are used — e.g.
         // to isolate a single card for testing, or to exclude one in a bad driver
         // state. Case-insensitive substring match on the GPU name; unset = all GPUs.
-        if let Ok(filter) = std::env::var("ZKMINER_GPU_NAME_FILTER") {
-            if !filter.is_empty() && !name.to_lowercase().contains(&filter.to_lowercase()) {
-                continue;
-            }
+        if !passes_gpu_name_filter(&name) {
+            filtered_out += 1;
+            continue;
         }
         // nvidia-smi outputs an 8-digit domain ("00000000:01:00.0"); sysfs uses 4.
         // Normalize so both sides of the cross-crate join produce the same string.
@@ -215,7 +259,7 @@ fn detect_nvidia_via_smi() -> Option<Vec<DetectedGpu>> {
     // If nvidia-smi ran but we couldn't parse a single GPU out of non-empty output
     // (e.g. a future column change or all-error lines), do NOT report "0 GPUs" —
     // that would silently skip the CUDA worker. Fall through to the /proc fallback.
-    if gpus.is_empty() && saw_nonempty_line {
+    if gpus.is_empty() && saw_nonempty_line && filtered_out == 0 {
         tracing::warn!(
             "nvidia-smi produced output but no GPUs were parsed; falling back to /proc detection"
         );
@@ -223,6 +267,15 @@ fn detect_nvidia_via_smi() -> Option<Vec<DetectedGpu>> {
     }
 
     Some(gpus)
+}
+
+/// `ZKMINER_GPU_NAME_FILTER` (a case-insensitive substring of the GPU name; unset or empty keeps every
+/// card): whether an NVIDIA card named `name` is kept.
+fn passes_gpu_name_filter(name: &str) -> bool {
+    match std::env::var("ZKMINER_GPU_NAME_FILTER") {
+        Ok(filter) if !filter.is_empty() => name.to_lowercase().contains(&filter.to_lowercase()),
+        _ => true,
+    }
 }
 
 /// Enumerate /proc/driver/nvidia/gpus/*/information as fallback.
@@ -260,6 +313,11 @@ fn detect_nvidia_via_proc() -> Vec<DetectedGpu> {
         if bus_location.is_empty() {
             // Use directory name as PCI bus ID
             bus_location = entry.file_name().to_string_lossy().to_string();
+        }
+        // The same filter as the nvidia-smi path, which this one stands in for. The index stays the
+        // card's position among them all, as there.
+        if !model.is_empty() && !passes_gpu_name_filter(&model) {
+            continue;
         }
 
         gpus.push(DetectedGpu {
@@ -376,6 +434,96 @@ fn detect_intel_gpus() -> Vec<DetectedGpu> {
     gpus
 }
 
+/// An Intel discrete card's device memory as the xe driver reports it: `(total, used)` in bytes over
+/// its VRAM regions.
+///
+/// sysfs has no answer on current xe kernels (`tile0/physical_vram_size_bytes` is gone, and BAR2 is the
+/// aperture, not the memory: 16 GiB on a 12 GB Arc B580), so this asks the driver directly, through
+/// `DRM_IOCTL_XE_DEVICE_QUERY` / `DRM_XE_DEVICE_QUERY_MEM_REGIONS` on the card's render node, which any
+/// user that may compute on the card can open. `None` for a card the xe driver does not drive (i915
+/// has another query), a card with no render node, or a query that fails.
+#[cfg(target_os = "linux")]
+pub fn intel_vram(pci_bus_id: &str) -> Option<(u64, u64)> {
+    use std::os::fd::AsRawFd;
+
+    /// `struct drm_xe_device_query` (uapi/drm/xe_drm.h).
+    #[repr(C)]
+    struct DeviceQuery {
+        extensions: u64,
+        query: u32,
+        size: u32,
+        data: u64,
+        reserved: [u64; 2],
+    }
+    // _IOWR('d', DRM_COMMAND_BASE + DRM_XE_DEVICE_QUERY, struct drm_xe_device_query)
+    const DRM_IOCTL_XE_DEVICE_QUERY: u64 = (3 << 30) | (40 << 16) | ((b'd' as u64) << 8) | 0x40;
+    const DRM_XE_DEVICE_QUERY_MEM_REGIONS: u32 = 1;
+    const _: () = assert!(std::mem::size_of::<DeviceQuery>() == 40);
+
+    let dev = Path::new("/sys/bus/pci/devices").join(pci_bus_id.to_ascii_lowercase());
+    let driver = std::fs::read_link(dev.join("driver")).ok()?;
+    if driver.file_name()? != "xe" {
+        return None;
+    }
+    let render = std::fs::read_dir(dev.join("drm"))
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("renderD"))?;
+    let node = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(Path::new("/dev/dri").join(render))
+        .ok()?;
+    let mut q = DeviceQuery {
+        extensions: 0,
+        query: DRM_XE_DEVICE_QUERY_MEM_REGIONS,
+        size: 0,
+        data: 0,
+        reserved: [0; 2],
+    };
+    // SAFETY: `q` is a live, correctly laid out `drm_xe_device_query`; with `size == 0` the driver
+    // only writes the size it needs into it.
+    if unsafe { libc::ioctl(node.as_raw_fd(), DRM_IOCTL_XE_DEVICE_QUERY as _, &mut q) } != 0 {
+        return None;
+    }
+    if q.size == 0 || q.size > 1 << 16 {
+        return None;
+    }
+    let mut buf = vec![0u64; (q.size as usize).div_ceil(8)];
+    q.data = buf.as_mut_ptr() as u64;
+    // SAFETY: `data` points at `buf`, which holds at least the `size` bytes the driver asked for.
+    if unsafe { libc::ioctl(node.as_raw_fd(), DRM_IOCTL_XE_DEVICE_QUERY as _, &mut q) } != 0 {
+        return None;
+    }
+    // SAFETY: `buf` is `size.div_ceil(8) * 8 >= size` initialized bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), q.size as usize) };
+    parse_xe_mem_regions(bytes)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn intel_vram(_pci_bus_id: &str) -> Option<(u64, u64)> {
+    None
+}
+
+/// `(total, used)` over the VRAM regions of a `struct drm_xe_query_mem_regions`: a `u32` count and a
+/// `u32` pad, then that many 88-byte `struct drm_xe_mem_region` (`u16 mem_class`, `u16 instance`,
+/// `u32 min_page_size`, `u64 total_size`, `u64 used`, ...). `None` when it is cut short or has no VRAM.
+fn parse_xe_mem_regions(b: &[u8]) -> Option<(u64, u64)> {
+    const REGION: usize = 88;
+    const DRM_XE_MEM_REGION_CLASS_VRAM: u16 = 1;
+    let n = u32::from_ne_bytes(b.get(0..4)?.try_into().ok()?) as usize;
+    let (mut total, mut used) = (0u64, 0u64);
+    for i in 0..n {
+        let r = b.get(8 + i * REGION..8 + (i + 1) * REGION)?;
+        if u16::from_ne_bytes(r[0..2].try_into().ok()?) == DRM_XE_MEM_REGION_CLASS_VRAM {
+            total += u64::from_ne_bytes(r[8..16].try_into().ok()?);
+            used += u64::from_ne_bytes(r[16..24].try_into().ok()?);
+        }
+    }
+    (total > 0).then_some((total, used))
+}
+
 /// Read Intel GPU name from sysfs, with fallbacks.
 fn read_intel_gpu_name(device_dir: &Path) -> String {
     // Try product_name (available on some cards via xe driver)
@@ -447,7 +595,9 @@ fn detect_amd_gpus() -> Vec<DetectedGpu> {
         return Vec::new();
     }
 
-    // Query rocm-smi for proper product names AND the authoritative HIP device index.
+    // HIP device indices from the kernel's KFD topology, which needs no ROCm install; rocm-smi's
+    // where that cannot be read (and product names, where rocm-smi is installed).
+    let kfd_index = kfd_hip_indices(Path::new("/sys/class/kfd/kfd/topology"));
     let rocm_info = query_rocm_smi_info();
 
     let mut entries: Vec<_> = match std::fs::read_dir(drm_base) {
@@ -515,15 +665,15 @@ fn detect_amd_gpus() -> Vec<DetectedGpu> {
             .cloned()
             .unwrap_or_else(|| read_amd_gpu_name(&device_dir));
 
-        // HIP_VISIBLE_DEVICES must use the ROCm/HIP device index, which is what
-        // rocm-smi's GPU[N] reports. The DRM cardN walk order need not match it
+        // HIP_VISIBLE_DEVICES must use the ROCm/HIP device index: KFD's GPU order, which
+        // rocm-smi's GPU[N] also reports. The DRM cardN walk order need not match it
         // (an skipped iGPU or non-PCI ordering would shift the index and mis-pin
         // the worker onto the wrong AMD GPU — the same failure class as the CUDA
-        // PCI-bus-id bug). Fall back to a positional counter only if rocm-smi
-        // didn't give us an index for this bus.
-        let device_index = rocm_info
-            .index_by_bus
+        // PCI-bus-id bug). Fall back to a positional counter only if neither
+        // gave us an index for this bus.
+        let device_index = kfd_index
             .get(&pci_bus_id)
+            .or_else(|| rocm_info.index_by_bus.get(&pci_bus_id))
             .copied()
             .unwrap_or_else(|| {
                 let i = fallback_index;
@@ -542,6 +692,85 @@ fn detect_amd_gpus() -> Vec<DetectedGpu> {
     }
 
     gpus
+}
+
+/// The GPU nodes of the kernel's KFD topology (`<topology>/nodes/<n>/properties`), which a host
+/// with only the amdgpu driver has, in node order: each one's PCI bus id and target (`gfx1100`).
+/// CPU nodes, which have no SIMDs, are left out. A node's `location_id` is its PCI address,
+/// `bus << 8 | device << 3 | function`, in PCI domain `domain`; its `gfx_target_version` is
+/// `major * 10000 + minor * 100 + stepping`, the target named `gfx<major><minor:x><stepping:x>`.
+///
+/// `None` when the topology cannot be read whole: a GPU node missing from the list would shift
+/// every later HIP index, and pin a worker onto the wrong card.
+fn kfd_gpu_nodes(topology: &Path) -> Option<Vec<(String, Option<String>)>> {
+    let mut nodes: Vec<(u32, PathBuf)> = std::fs::read_dir(topology.join("nodes"))
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| Some((e.file_name().to_str()?.parse().ok()?, e.path())))
+        .collect();
+    nodes.sort();
+    let mut gpus = Vec::new();
+    for (_, dir) in nodes {
+        let properties = std::fs::read_to_string(dir.join("properties")).ok()?;
+        let value = |key: &str| {
+            properties.lines().find_map(|line| {
+                let (k, v) = line.split_once(' ')?;
+                (k == key).then(|| v.trim().parse::<u64>().ok()).flatten()
+            })
+        };
+        if value("simd_count").unwrap_or(0) == 0 {
+            continue;
+        }
+        let (location, domain) = (value("location_id")?, value("domain")?);
+        let bus = format!(
+            "{domain:04x}:{:02x}:{:02x}.{:x}",
+            (location >> 8) & 0xff,
+            (location >> 3) & 0x1f,
+            location & 0x7
+        );
+        let gfx = value("gfx_target_version")
+            .filter(|v| *v > 0)
+            .map(|v| format!("gfx{}{:x}{:x}", v / 10_000, (v / 100) % 100, v % 100));
+        gpus.push((normalize_pci_bus_id(&bus), gfx));
+    }
+    Some(gpus)
+}
+
+/// Each AMD GPU's HIP device index, by PCI bus id: HIP numbers the GPUs in the order of their KFD
+/// nodes, counting every GPU node (an APU's too). Empty when the topology cannot be read whole.
+fn kfd_hip_indices(topology: &Path) -> HashMap<String, u32> {
+    kfd_gpu_nodes(topology)
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(index, (bus, _))| (bus, index as u32))
+        .collect()
+}
+
+/// The target of the AMD GPU at `pci_bus_id` (`gfx1100` for an RX 7900 XTX), from the KFD topology,
+/// for checking a HIP binary carries code for it (`gpu_code::EmbeddedHipCode`).
+pub fn amd_gfx_target(pci_bus_id: &str) -> Option<String> {
+    let bus = normalize_pci_bus_id(pci_bus_id);
+    kfd_gpu_nodes(Path::new("/sys/class/kfd/kfd/topology"))?
+        .into_iter()
+        .find(|(b, _)| *b == bus)?
+        .1
+}
+
+/// The binary holding a backend's HIP device code, for `gpu_code::EmbeddedHipCode` to read: the
+/// risc0 worker itself, or the SP1 HIP server the SP1 worker will run.
+pub fn hip_code_binary(backend: &str, worker: &Path) -> Option<PathBuf> {
+    if backend != "sp1" {
+        return Some(worker.to_path_buf());
+    }
+    let install = std::env::var(zkminer_prover_protocol::types::SP1_SERVER_INSTALL_ENV)
+        .map_or(true, |v| v.trim() != "0");
+    sp1_named_server_for(
+        sp1_server_name("rocm")?,
+        worker,
+        install,
+        dirs::home_dir().as_deref(),
+    )
 }
 
 /// Parse the numeric suffix of a DRM node name like "card10" -> 10.
@@ -597,14 +826,41 @@ fn read_amd_gpu_name(device_dir: &Path) -> String {
             return name;
         }
     }
+    let read = |file: &str| {
+        std::fs::read_to_string(device_dir.join(file))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    let (device_id, revision) = (read("device"), read("revision"));
+    // The marketing name from libdrm's table, which Mesa installs (libdrm-common): a host with only
+    // the GPU driver has no rocm-smi to ask.
+    if let Some(name) = [
+        "/usr/share/libdrm/amdgpu.ids",
+        "/usr/local/share/libdrm/amdgpu.ids",
+    ]
+    .iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .find_map(|ids| amdgpu_ids_name(&ids, &device_id, &revision))
+    {
+        return name;
+    }
     // Fallback: device ID
-    if let Ok(device_id) = std::fs::read_to_string(device_dir.join("device")) {
-        let device_id = device_id.trim().to_string();
-        if !device_id.is_empty() {
-            return format!("AMD GPU ({})", device_id);
-        }
+    if !device_id.is_empty() {
+        return format!("AMD GPU ({})", device_id);
     }
     "AMD GPU".to_string()
+}
+
+/// The product name libdrm's `amdgpu.ids` gives a device id and revision (sysfs's `0x744c` and
+/// `0xc8`), from its `744C,\tC8,\tAMD Radeon RX 7900 XTX` lines.
+fn amdgpu_ids_name(ids: &str, device_id: &str, revision: &str) -> Option<String> {
+    let hex = |s: &str| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    let (device, revision) = (hex(device_id)?, hex(revision)?);
+    ids.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ',');
+        let (d, r, name) = (fields.next()?, fields.next()?, fields.next()?);
+        (hex(d)? == device && hex(r)? == revision).then(|| name.trim().to_string())
+    })
 }
 
 /// rocm-smi enumeration info, keyed by lowercase PCI bus id.
@@ -704,7 +960,9 @@ pub fn discover_workers(
                 let gpu_tag = infer_gpu_tag(path);
                 let cuda_cards: Vec<&DetectedGpu> =
                     if gpu_tag == "generic" && drives_cuda_without_visibility_pin(backend) {
-                        gpus.iter().filter(|g| g.gpu_tag == "cuda").collect()
+                        gpus.iter()
+                            .filter(|g| sp1_serves_card(&g.gpu_tag, path))
+                            .collect()
                     } else {
                         Vec::new()
                     };
@@ -722,7 +980,7 @@ pub fn discover_workers(
                     for gpu in cuda_cards {
                         found.push(DiscoveredWorker {
                             backend: backend.to_string(),
-                            gpu_tag: "cuda".to_string(),
+                            gpu_tag: gpu.gpu_tag.clone(),
                             device_index: Some(gpu.device_index),
                             pci_bus_id: Some(gpu.pci_bus_id.clone()),
                             gpu_name: Some(gpu.name.clone()),
@@ -768,7 +1026,9 @@ pub fn discover_workers(
             // can be routed to. See `drives_cuda_without_visibility_pin`.
             let cuda_tags: Vec<&DetectedGpu> =
                 if *gpu_tag == "generic" && drives_cuda_without_visibility_pin(backend) {
-                    gpus.iter().filter(|g| g.gpu_tag == "cuda").collect()
+                    gpus.iter()
+                        .filter(|g| sp1_serves_card(&g.gpu_tag, &path))
+                        .collect()
                 } else {
                     Vec::new()
                 };
@@ -776,10 +1036,10 @@ pub fn discover_workers(
                 for gpu in cuda_tags {
                     found.push(DiscoveredWorker {
                         backend: backend.to_string(),
-                        // `cuda`, not `generic`: this is the occupancy fact, and every consumer of
-                        // `gpu_tag` (`physical_gpu_id`, `gpu_device_id`, `proving_gpu_count`) wants
-                        // it. The pin is withheld separately, in `gpu_env`.
-                        gpu_tag: "cuda".to_string(),
+                        // The card's vendor, not `generic`: this is the occupancy fact, and every
+                        // consumer of `gpu_tag` (`physical_gpu_id`, `gpu_device_id`,
+                        // `proving_gpu_count`) wants it. The pin is withheld separately, in `gpu_env`.
+                        gpu_tag: gpu.gpu_tag.clone(),
                         device_index: Some(gpu.device_index),
                         pci_bus_id: Some(gpu.pci_bus_id.clone()),
                         gpu_name: Some(gpu.name.clone()),
@@ -974,7 +1234,44 @@ pub fn gpu_code_binary(backend: &str, worker: &Path) -> Option<PathBuf> {
 /// installed now, is the one the worker will use. Without either, the SDK downloads upstream's
 /// build later, whose GPU code nothing here can see in advance.
 fn sp1_server_for(worker: &Path, install: bool, home: Option<&Path>) -> Option<PathBuf> {
-    const SERVER: &str = "sp1-gpu-server";
+    sp1_named_server_for("sp1-gpu-server", worker, install, home)
+}
+
+/// The `sp1-gpu-server` build an SP1 worker runs on a card of `gpu_tag`, or `None` for a card no
+/// SP1 build drives. The CUDA build keeps the SDK's default name; hemilabs/sp1's HIP and SYCL builds
+/// (#19) are installed beside it under their own names and chosen with `SP1_GPU_SERVER_NAME`.
+pub fn sp1_server_name(gpu_tag: &str) -> Option<&'static str> {
+    match gpu_tag {
+        "cuda" => Some("sp1-gpu-server"),
+        "rocm" => Some("sp1-gpu-server-hip"),
+        "intel" => Some("sp1-gpu-server-sycl"),
+        _ => None,
+    }
+}
+
+/// Whether the SP1 worker at `worker` can drive a card of `gpu_tag`: always a CUDA card (the SDK
+/// downloads a CUDA server when none is shipped); an AMD or Intel card only when its vendor's server
+/// is shipped beside the worker or installed in `~/.sp1/bin`, since nothing downloads those.
+fn sp1_serves_card(gpu_tag: &str, worker: &Path) -> bool {
+    match gpu_tag {
+        "cuda" => true,
+        "rocm" | "intel" => {
+            let install = std::env::var(zkminer_prover_protocol::types::SP1_SERVER_INSTALL_ENV)
+                .map_or(true, |v| v.trim() != "0");
+            sp1_server_name(gpu_tag).is_some_and(|name| {
+                sp1_named_server_for(name, worker, install, dirs::home_dir().as_deref()).is_some()
+            })
+        }
+        _ => false,
+    }
+}
+
+fn sp1_named_server_for(
+    server: &str,
+    worker: &Path,
+    install: bool,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
     if install {
         // The worker looks beside its own executable, which for a symlinked worker is the target's
         // directory; a wrapper script sits beside the binary it runs, so its own directory works too.
@@ -982,13 +1279,13 @@ fn sp1_server_for(worker: &Path, install: bool, home: Option<&Path>) -> Option<P
         let shipped = [real.as_deref().and_then(Path::parent), worker.parent()]
             .into_iter()
             .flatten()
-            .map(|dir| dir.join(SERVER))
+            .map(|dir| dir.join(server))
             .find(|path| path.is_file());
         if shipped.is_some() {
             return shipped;
         }
     }
-    let installed = home?.join(".sp1").join("bin").join(SERVER);
+    let installed = home?.join(".sp1").join("bin").join(server);
     installed.is_file().then_some(installed)
 }
 
@@ -1019,9 +1316,15 @@ fn sp1_server_for(worker: &Path, install: bool, home: Option<&Path>) -> Option<P
 /// empty `--version` reads as a version mismatch — this constant becomes too permissive and SP1 will
 /// fail on the 5080 again. `strings ~/.sp1/bin/sp1-gpu-server | grep 'must be at least'` is the check;
 /// `--version` cannot tell them apart, both print 6.0.2.
+///
+/// **hemilabs/sp1 #19 (6.8.1):** its server, on every backend, refuses only below
+/// `ceil(GiB) + 4 = 16`, so a 12 GB card (11.x GiB) runs, in the same element tier as a 16 GB one; an
+/// RTX 4070 and an Arc B580 proved SP1 Groth16 fibonacci on it. The floor is therefore 11 GB, the
+/// server's own. Whether a card has ROOM for a job is still [`min_available_vram_bytes_for_backend`]'s
+/// measured question, which keeps 12 GB cards out by default until their peaks are measured.
 pub fn min_vram_bytes_for_backend(backend: &str) -> Option<u64> {
     match backend {
-        "sp1" => Some(16_000_000_000),
+        "sp1" => Some(11_000_000_000),
         _ => None,
     }
 }
@@ -1053,9 +1356,8 @@ pub const MIN_AVAILABLE_VRAM_MB_ENV: &str = "ZKMINER_MIN_AVAILABLE_VRAM_MB";
 /// itself is the smaller tier's measured peak plus margin — 15,604 MiB — so a card that clears the
 /// floor has room for the configuration it will actually be given.
 ///
-/// risc0 and openvm have no floor here because they size per segment from `po2`, and that is a knob
-/// the dispatcher sets per run: see `find_optimal_po2`, which is given the available figure rather
-/// than the card's total so the segment shrinks instead of the work being refused.
+/// risc0 and openvm have no floor here: a risc0 card proves jobs at its own segment size
+/// (`benchmark::risc0_job_po2`), and one too small for any proves none.
 pub fn min_available_vram_bytes_for_backend(backend: &str) -> Option<u64> {
     let default = match backend {
         // Derived from the MEASURED tier table rather than from the installed-VRAM floor, so this and
@@ -1173,6 +1475,121 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amd_names_come_from_libdrm_without_rocm() {
+        let ids = "# comment\n1.0.0\n744C,\tC8,\tAMD Radeon RX 7900 XTX\n744C,\tCC,\tAMD Radeon RX 7900 XT\n7550,\tC0,\tAMD Radeon RX 9070 XT\n";
+        assert_eq!(
+            amdgpu_ids_name(ids, "0x744c", "0xc8").as_deref(),
+            Some("AMD Radeon RX 7900 XTX")
+        );
+        assert_eq!(
+            amdgpu_ids_name(ids, "0x7550", "0xc0").as_deref(),
+            Some("AMD Radeon RX 9070 XT")
+        );
+        assert_eq!(amdgpu_ids_name(ids, "0x744c", "0xff"), None);
+        assert_eq!(amdgpu_ids_name(ids, "", "0xc8"), None);
+    }
+
+    #[test]
+    fn gfx_targets_are_named_from_their_version() {
+        let root = std::env::temp_dir().join(format!("zkminer-kfd-gfx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (n, version) in [(1, 110001), (2, 120001), (3, 90010), (4, 90402)] {
+            let dir = root.join(format!("nodes/{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("properties"),
+                format!(
+                    "simd_count 64\nlocation_id {}\ndomain 0\ngfx_target_version {version}\n",
+                    n << 8
+                ),
+            )
+            .unwrap();
+        }
+        let gfx: Vec<String> = kfd_gpu_nodes(&root)
+            .unwrap()
+            .into_iter()
+            .filter_map(|g| g.1)
+            .collect();
+        assert_eq!(gfx, ["gfx1101", "gfx1201", "gfx90a", "gfx942"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hip_indices_follow_the_kfd_topology_without_rocm() {
+        let root = std::env::temp_dir().join(format!("zkminer-kfd-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let node = |n: u32, properties: &str| {
+            let dir = root.join(format!("nodes/{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("properties"), properties).unwrap();
+        };
+        // A CPU node, an APU, then two discrete cards, listed out of order (node 10 after 2).
+        node(
+            0,
+            "cpu_cores_count 16\nsimd_count 0\nlocation_id 0\ndomain 0\n",
+        );
+        node(1, "simd_count 24\nlocation_id 1280\ndomain 0\n");
+        node(10, "simd_count 128\nlocation_id 49152\ndomain 1\n");
+        node(
+            2,
+            "simd_count 192\nlocation_id 2168\ndomain 0\ngfx_target_version 110000\n",
+        );
+
+        let gpus = kfd_gpu_nodes(&root).unwrap();
+        assert_eq!(
+            gpus[1],
+            ("0000:08:0f.0".to_string(), Some("gfx1100".to_string()))
+        );
+        assert_eq!(gpus[0].1, None, "a node without its target version");
+        let indices = kfd_hip_indices(&root);
+        // 1280 = 0x500: 05:00.0; 2168 = 0x878: 08:0f.0; 49152 = 0xc000: c0:00.0.
+        assert_eq!(indices.get("0000:05:00.0"), Some(&0), "the APU counts");
+        assert_eq!(indices.get("0000:08:0f.0"), Some(&1));
+        assert_eq!(
+            indices.get("0001:c0:00.0"),
+            Some(&2),
+            "node 10 sorts after node 2"
+        );
+        assert_eq!(indices.len(), 3);
+
+        // A GPU node without its address: no index is trusted.
+        node(11, "simd_count 64\n");
+        assert!(kfd_hip_indices(&root).is_empty());
+        assert!(kfd_hip_indices(&root.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The layout an Arc B580 returned on xe (kernel 7.0): system memory, then one VRAM region.
+    #[test]
+    fn xe_mem_regions_sum_only_vram() {
+        fn region(class: u16, instance: u16, total: u64, used: u64) -> Vec<u8> {
+            let mut r = Vec::new();
+            r.extend(class.to_ne_bytes());
+            r.extend(instance.to_ne_bytes());
+            r.extend(4096u32.to_ne_bytes());
+            r.extend(total.to_ne_bytes());
+            r.extend(used.to_ne_bytes());
+            r.extend([0u8; 88 - 24]);
+            r
+        }
+        let mut b = Vec::new();
+        b.extend(2u32.to_ne_bytes());
+        b.extend(0u32.to_ne_bytes());
+        b.extend(region(0, 0, 98_776_000_000, 0));
+        b.extend(region(1, 1, 12_809_404_416, 20 << 20));
+        assert_eq!(b.len(), 184);
+        assert_eq!(parse_xe_mem_regions(&b), Some((12_809_404_416, 20 << 20)));
+        // Cut short: no answer rather than a partial sum.
+        assert_eq!(parse_xe_mem_regions(&b[..100]), None);
+        // System memory only (an integrated GPU): no VRAM, no answer.
+        let mut igpu = Vec::new();
+        igpu.extend(1u32.to_ne_bytes());
+        igpu.extend(0u32.to_ne_bytes());
+        igpu.extend(region(0, 0, 1 << 34, 0));
+        assert_eq!(parse_xe_mem_regions(&igpu), None);
+    }
 
     #[test]
     fn worker_binary_names() {
@@ -1307,12 +1724,16 @@ mod tests {
             16_303u64 * 1024 * 1024 >= floor,
             "the 5080 must qualify: the installed server's floor is 16 GB"
         );
-        // But a genuinely small card must not. A 12 GB card slips past the server's OWN guard
-        // (`ceil(11.x) + 4 = 16` is not `< 16`) and would then OOM in the 16 GB tier, so ours is
-        // deliberately the stricter of the two.
+        // A 12 GB card runs on hemilabs/sp1 #19's server (an RTX 4070 and an Arc B580 proved on it);
+        // whether it has room for a job is the available-VRAM floor's question.
         assert!(
-            12_288u64 * 1024 * 1024 < floor,
-            "a 12 GB card must be refused here even though the server would admit it"
+            12_288u64 * 1024 * 1024 >= floor,
+            "a 12 GB card must qualify: #19's server admits it"
+        );
+        // But a genuinely small card must not: below `ceil(GiB) + 4 = 16` the server refuses it.
+        assert!(
+            10_240u64 * 1024 * 1024 < floor,
+            "a 10 GB card must be refused, as the server refuses it"
         );
         // Nothing else has a floor: risc0 degrades by lowering po2 instead of refusing.
         assert_eq!(min_vram_bytes_for_backend("risc0"), None);

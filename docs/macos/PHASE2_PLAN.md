@@ -1,5 +1,31 @@
 # Phase 2: Metal proving performance on macOS
 
+## Upstream merge after WP6b — 2026-11-06
+
+WP6b was merged into the Phase 2 branches before this sync. The engine merge
+commit `881513e022d98ac7c07460ba090a5f6a5657334a` brings
+`hemilabs/risc0` `release-3.0` at `54921e770bcb62578d4ffb7a7f70131b611bda2a`
+into the Mac engine. The miner merge brings `hemilabs/zk-miner` `main` at
+`af44acc9b5f3cf15d93395d54407eb5382561404`; its `Cargo.toml` keeps
+upstream's `risc0` pin, while the local engine override names the reviewed
+merged engine SHA. The root `Cargo.lock` retains Git-source pins after local
+worker builds.
+
+Every merge conflict and resolution:
+
+| Repository | File | Resolution |
+| --- | --- | --- |
+| engine | `risc0/circuit/rv32im/src/execute/tests.rs` | Kept upstream #33 execution refusal tests first and the Mac branch's two final-padding tests afterward. The combined 37 execute tests passed with `--features prove`. |
+| miner | `Cargo.lock` | Kept upstream dependency and Git-source updates, adding the Mac worker's `metal`, `risc0-binfmt`, and `serde_json` edges; no local path-source lock is committed. |
+| miner | `crates/zkminer-cli/src/commands/run.rs` | Took upstream claim-window, measured-cycle, and backend sizing checks. Dropped the older Mac CPU-row cost and timeout overrides because upstream removes fabricated CPU benchmark rows. |
+| miner | `crates/zkminer-prove-risc0/build.rs` | Kept upstream Intel/ROCm runtime search paths and the separate Mac embedded-guest early return. |
+| miner | `crates/zkminer-prove-risc0/src/main.rs` | Kept upstream IPC isolation, panic containment, program binding, deterministic `sys_rand`, and execute/prove validation; retained Mac probes, preflight, direct proof and warmup paths. The Mac proof environment now uses the same program/input seed as pre-claim execution. |
+| miner | `crates/zkminer-prover/src/benchmark.rs` | Took upstream's measured GPU-only rows and removed the local row merge that depended on its old CPU-row shape. |
+| miner | `crates/zkminer-prover/src/engine.rs` | Kept the Mac-specific po2 calibration guard; upstream added no competing implementation in that location. |
+| miner | `crates/zkminer-prover/src/memory.rs` | Kept upstream's Linux `/dev/shm` capacity check and the Mac-specific reserve, footprint and pressure functions. The shared floor uses the platform reserve on Mac. |
+
+Validation and the controlled reading for this new sealed worker are pending.
+
 ## WP7 admission estimator — 2026-11-06
 
 The revised spec export SHA-256 is

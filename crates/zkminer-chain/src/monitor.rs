@@ -50,6 +50,9 @@ pub enum MonitorEvent {
     /// A job was cancelled by its submitter (terminal — prover stays ZERO, so a
     /// per-tick prover check alone never evicts it from the candidate set).
     JobCancelled { job_id: B256, caller: Address },
+    /// Every event up to the startup head has been delivered: events received BEFORE this one are
+    /// the startup backfill (HISTORY — mostly settled jobs), events after it are live. Sent once.
+    BackfillComplete,
     /// Monitor error (non-fatal).
     Error(String),
 }
@@ -67,7 +70,7 @@ static JOB_CLAIMED_TOPIC0: std::sync::LazyLock<B256> = std::sync::LazyLock::new(
     alloy::primitives::keccak256("JobClaimed(bytes32,address,address,uint96,uint96,uint40)")
 });
 static JOB_CANCELLED_TOPIC0: std::sync::LazyLock<B256> = std::sync::LazyLock::new(|| {
-    alloy::primitives::keccak256("JobCancelled(bytes32,address,uint256,bool)")
+    alloy::primitives::keccak256("JobCancelled(bytes32,address,uint256,uint256)")
 });
 
 /// Canonical topic0 for JobSubmitted.
@@ -138,7 +141,7 @@ impl JobMonitor {
     /// Runs until the sender is dropped or an unrecoverable error occurs.
     pub async fn run(self, tx: mpsc::Sender<MonitorEvent>) -> Result<()> {
         let mut poll_timer = interval(self.poll_interval);
-        // [H4 #52] Do NOT seed last_block from a failed head fetch. `unwrap_or(0)` would
+        // Do NOT seed last_block from a failed head fetch. `unwrap_or(0)` would
         // make last_block ≈ 0, so the first get_logs queries a genesis..head range that
         // every provider rejects on size — immediate, permanent blindness. Retry the
         // head read until it succeeds so backfill anchors to the real head.
@@ -152,27 +155,36 @@ impl JobMonitor {
             }
         };
         // Rewind so the first poll backfills jobs already Open at startup.
-        let mut last_block = head.saturating_sub(self.backfill_blocks);
-        // [review must-fix] The head at startup: JobClaimed events at or below this block
+        // ...but never below the deployment's first block (no HemiProve log exists there). A
+        // "rewind to the deployment" default (u64::MAX) on a chain with NO known first block would mean
+        // scanning from genesis: cap it at a bounded window instead.
+        const UNKNOWN_DEPLOYMENT_BACKFILL: u64 = 5_000;
+        let backfill = if self.backfill_blocks == u64::MAX && self.client.scan_from_block == 0 {
+            UNKNOWN_DEPLOYMENT_BACKFILL
+        } else {
+            self.backfill_blocks
+        };
+        let mut last_block = scanned_through_at_start(head, backfill, self.client.scan_from_block);
+        // The head at startup: JobClaimed events at or below this block
         // are HISTORICAL and must not prune (see the suppression in the log loop).
         let startup_head = head;
 
         tracing::info!(
             "Job monitor started, polling every {:?} from block {} (head {}, backfill {} blocks)",
             self.poll_interval,
-            last_block,
+            last_block + 1,
             head,
-            self.backfill_blocks,
+            head - last_block,
         );
 
-        // Event signatures. [RPC #3] The filter watches JobClaimed/JobCancelled too (one
+        // Event signatures. The filter watches JobClaimed/JobCancelled too (one
         // widened topic0 array — same single get_logs request) so the brain can prune
         // foreign-claimed/cancelled jobs from the candidate set purely from log data.
         let job_submitted_topic = job_submitted_topic0();
         let job_claimed_topic = job_claimed_topic0();
         let job_cancelled_topic = job_cancelled_topic0();
 
-        // [#10b] 429 circuit-breaker for the monitor: while the endpoint is rate-limiting,
+        // 429 circuit-breaker for the monitor: while the endpoint is rate-limiting,
         // stretch the effective poll cadence (get_block_number + get_logs are among the
         // heavier requests) to MONITOR_RATE_LIMITED_POLL, but query IMMEDIATELY on the clear
         // edge so a job that arrived during the storm is picked up promptly. New-job
@@ -181,8 +193,16 @@ impl JobMonitor {
         const MONITOR_RATE_LIMITED_POLL: Duration = Duration::from_secs(30);
         const MONITOR_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(30);
         let mut last_query = tokio::time::Instant::now();
+        let mut backfill_announced = false;
 
         loop {
+            // The backfill range is fully delivered once `last_block` reaches the startup head.
+            if !backfill_announced && last_block >= startup_head {
+                backfill_announced = true;
+                if tx.send(MonitorEvent::BackfillComplete).await.is_err() {
+                    return Ok(());
+                }
+            }
             poll_timer.tick().await;
 
             // Skip this tick's query only while STILL rate-limited AND we polled recently.
@@ -227,11 +247,11 @@ impl JobMonitor {
                 self.client.hemi_prove
             );
 
-            // [H4 #28] Query in bounded CHUNKs, advancing last_block per SUCCESSFUL chunk.
-            // The old single unchunked get_logs never advanced last_block on error, so
-            // during any outage the [last_block+1, current] range ratcheted upward until it
-            // permanently exceeded the provider's block-range/result cap — then every poll
-            // failed on size FOREVER, even after the RPC recovered. Chunking caps each
+            // Query in bounded CHUNKs, advancing last_block per SUCCESSFUL chunk.
+            // A single unchunked get_logs never advances last_block on error, so
+            // during any outage the [last_block+1, current] range ratchets upward until it
+            // permanently exceeds the provider's block-range/result cap — then every poll
+            // fails on size FOREVER, even after the RPC recovers. Chunking caps each
             // request at CHUNK blocks (always under the cap) and, on a mid-range failure,
             // keeps the progress from the chunks that DID succeed so the range can't grow.
             // Matches find_locked_jobs.
@@ -243,12 +263,12 @@ impl JobMonitor {
                     .address(self.client.hemi_prove)
                     .from_block(start)
                     .to_block(end);
-                // [RPC #3] Widen topic0 to {JobSubmitted, JobClaimed, JobCancelled} ONLY
+                // Widen topic0 to {JobSubmitted, JobClaimed, JobCancelled} ONLY
                 // when no proof-system filter is set (the run path — the brain filters by
                 // resolve_backend at ingest). With a proof-system filter, topic2 means
                 // proofSystemId ONLY for JobSubmitted (it is prover/caller for the other
                 // events), so combining them in one query would silently mis-filter —
-                // keep the legacy single-event query in that mode.
+                // keep the single-event query in that mode.
                 if let Some(ps) = self.proof_system_filter {
                     filter = filter.event_signature(job_submitted_topic).topic2(ps);
                 } else {
@@ -267,10 +287,10 @@ impl JobMonitor {
                         );
                         for log in logs {
                             let topic0 = log.topics().first().copied();
-                            // [RPC #2] Cache jobId → submitting tx hash for the descriptor
+                            // Cache jobId → submitting tx hash for the descriptor
                             // fast path. Free: the log already carries both (topic1 = jobId).
                             // Populated for BOTH the live poll and the startup backfill.
-                            // [RPC #3] GATED on topic0 == JobSubmitted: with the widened
+                            // GATED on topic0 == JobSubmitted: with the widened
                             // filter, a JobClaimed/JobCancelled log's tx is the claim/cancel
                             // tx, NOT the submit tx — caching it would poison the fast path
                             // (the hash-verify fallback would catch it, but every lookup for
@@ -283,17 +303,16 @@ impl JobMonitor {
                                 }
                             }
                             if let Some(event) = parse_monitor_log(&log) {
-                                // [review must-fix] Claims are NON-terminal: releaseJob and
+                                // Claims are NON-terminal: releaseJob and
                                 // slashAndReopen reset a job to Open (with a boosted bonus).
                                 // A historical JobClaimed replayed through the startup
                                 // backfill says NOTHING about current state — pruning on it
                                 // would permanently drop a claimed-then-reopened job on
-                                // every restart (the pre-event build re-discovered such jobs
-                                // via the first tick's live Multicall3 view). Suppress
-                                // backfill-range JobClaimed (block <= startup head; missing
-                                // block number → suppress, fail-safe = don't prune). LIVE
-                                // claims prune as designed. JobCancelled stays unconditional:
-                                // Cancelled is terminal — no contract path resets it.
+                                // every restart. Suppress backfill-range JobClaimed (block <=
+                                // startup head; missing block number → suppress, fail-safe =
+                                // don't prune). LIVE claims prune as designed. JobCancelled
+                                // stays unconditional: Cancelled is terminal — no contract
+                                // path resets it.
                                 if matches!(event, MonitorEvent::JobClaimed { .. })
                                     && log.block_number.is_none_or(|b| b <= startup_head)
                                 {
@@ -325,7 +344,7 @@ impl JobMonitor {
     }
 }
 
-/// [RPC #3] Dispatch a raw log to the right per-event parser, keyed STRICTLY on
+/// Dispatch a raw log to the right per-event parser, keyed STRICTLY on
 /// topic0. Unknown/other event topics (e.g. JobReopened, JobFulfilled) return None
 /// and are ignored — they must never be misparsed as one of the handled events.
 fn parse_monitor_log(log: &Log) -> Option<MonitorEvent> {
@@ -375,7 +394,7 @@ fn parse_job_claimed_log(log: &Log) -> Option<MonitorEvent> {
 
 /// Parse a JobCancelled log.
 /// `JobCancelled(bytes32 indexed jobId, address indexed caller, uint256 refundAmount,
-///               bool bonusIncluded)`
+///               uint256 bonusBurned)`
 fn parse_job_cancelled_log(log: &Log) -> Option<MonitorEvent> {
     let topics = log.topics();
     // topic0 + jobId + caller.
@@ -435,10 +454,30 @@ fn parse_job_submitted_log(log: &Log) -> Option<MonitorEvent> {
     })
 }
 
+/// The block the monitor treats as already scanned when it starts: each poll scans from the block
+/// after it. `backfill` blocks back from `head`, but never below `scan_from_block`, the first block
+/// to scan (the deployment's first block), and never above `head`.
+fn scanned_through_at_start(head: u64, backfill: u64, scan_from_block: u64) -> u64 {
+    head.saturating_sub(backfill)
+        .max(scan_from_block.saturating_sub(1).min(head))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::{keccak256, Bytes, LogData};
+
+    #[test]
+    fn the_first_block_scanned_is_scan_from_block_itself() {
+        // A long backfill stops at the deployment's first block, which is still scanned.
+        assert_eq!(scanned_through_at_start(10_000, u64::MAX, 7_000), 6_999);
+        // A short backfill starts above it.
+        assert_eq!(scanned_through_at_start(10_000, 500, 7_000), 9_500);
+        // No floor: the backfill alone.
+        assert_eq!(scanned_through_at_start(10_000, 500, 0), 9_500);
+        // A floor above the head (a node behind the deployment) scans nothing yet.
+        assert_eq!(scanned_through_at_start(5_000, 500, 7_000), 5_000);
+    }
 
     fn mk_log(topics: Vec<B256>, data: Vec<u8>) -> Log {
         Log {
@@ -459,10 +498,10 @@ mod tests {
 
     #[test]
     fn topic0s_match_bindings_signature_hashes() {
-        // [review] Independent pin against the sol!-generated event signatures. Without
+        // Independent pin against the sol!-generated event signatures. Without
         // this, a typo in the hand-written signature strings (or contracts/bindings
-        // drift — a documented failure mode in this repo) silently kills the whole
-        // event class: every log is ignored with green CI.
+        // drift) silently kills the whole event class: every log is ignored with
+        // the build still green.
         use alloy::sol_types::SolEvent;
         use zkminer_contracts::bindings::{IHemiProveCore, IHemiProveFulfill};
         assert_eq!(
@@ -484,9 +523,9 @@ mod tests {
 
     #[test]
     fn job_submitted_log_parses_through_dispatch() {
-        // [review] Positive coverage for the revenue-critical event through the NEW
-        // dispatch path (mutation testing showed total loss of job discovery previously
-        // passed every test).
+        // Positive coverage for the revenue-critical event through the dispatch path,
+        // so a regression that drops job discovery entirely is caught here rather than
+        // passing silently.
         let jid = B256::repeat_byte(0x01);
         let ps = B256::repeat_byte(0x02);
         let caller = Address::repeat_byte(0x03);
@@ -622,7 +661,7 @@ mod tests {
 
     #[test]
     fn job_reopened_log_is_ignored_not_misparsed() {
-        // [review guard] A JobReopened log has 4 topics and a wide data section (8
+        // A JobReopened log has 4 topics and a wide data section (8
         // non-indexed params ≥ 256 bytes) — enough to satisfy JobSubmitted's length
         // checks if dispatch were length-based. It must be IGNORED (None), never
         // misparsed as JobSubmitted.

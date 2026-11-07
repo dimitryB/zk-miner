@@ -65,6 +65,7 @@ fn native_worker_cold_timing() {
     let handshake_to_request_ms = elapsed_ms(handshake);
     worker.send(&WorkerCommand::Prove {
         request_id: 1, elf, input_data: workload.input.clone(), po2: Some(workload.po2),
+        program_id: None,
     }).unwrap();
     let response = worker.recv_proof(1, &None).unwrap();
     let proof = match response {
@@ -121,6 +122,7 @@ fn native_bundle_corrupt_hash_rejected() {
         elf: fs::read(required("ZKMINER_MACOS_PROGRAM")).unwrap(),
         input_data: fs::read(required("ZKMINER_MACOS_INPUT")).unwrap(),
         po2: Some(14),
+        program_id: None,
     }).unwrap();
     let response = worker.recv_proof(1, &None).unwrap();
     let error = match response {
@@ -187,14 +189,15 @@ fn native_workload_limit_controls() {
     let overrides = HashMap::from([("ZKMINER_RISC0_MAX_GUEST_CYCLES".into(), "1000".into())]);
     let mut worker = WorkerHandle::spawn("risc0", &binary, &overrides).unwrap();
     let input = fs::read(required("ZKMINER_MACOS_INPUT")).unwrap();
-    worker.send(&WorkerCommand::Execute { request_id:1, elf:elf.clone(), input_data:input.clone() }).unwrap();
+    worker.send(&WorkerCommand::Execute { request_id:1, elf:elf.clone(), input_data:input.clone(),
+        program_id:None, po2:Some(14) }).unwrap();
     match worker.recv().unwrap() {
         WorkerResponse::Error { kind:ErrorKind::InvalidInput, message, .. } => assert!(message.contains("Session limit exceeded")),
         other => panic!("expected execution cycle-limit rejection, got {other:?}"),
     }
     cases.push(json!({"operation":"execute","outcome":"guest_cycle_limit_rejected"}));
     for (id, po2) in [(2, 13), (3, 22), (4, 20)] {
-        worker.send(&WorkerCommand::Prove {request_id:id,elf:elf.clone(),input_data:input.clone(),po2:Some(po2)}).unwrap();
+        worker.send(&WorkerCommand::Prove {request_id:id,elf:elf.clone(),input_data:input.clone(),po2:Some(po2),program_id:None}).unwrap();
         loop {
             match worker.recv().unwrap() {
                 WorkerResponse::Progress {request_id,..} => assert_eq!(request_id,id),
@@ -1430,9 +1433,11 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             "risc0",
             &elf,
             &workload.input,
-            Some(Duration::from_secs(30))
+            Some(Duration::from_secs(30)),
+            None,
+            Some(workload.po2),
         )
-        .unwrap();
+        .unwrap().cycles;
     assert!(executed_cycles > 0);
     let valid_execute_cycles_ms = elapsed_ms(phase_started);
     let phase_started = Instant::now();
@@ -1441,7 +1446,9 @@ fn native_worker_proofs_failure_restart_and_shutdown() {
             "risc0",
             b"invalid guest",
             &[],
-            Some(Duration::from_secs(10))
+            Some(Duration::from_secs(10)),
+            None,
+            Some(workload.po2),
         )
         .is_err());
     let invalid_execute_cycles_ms = elapsed_ms(phase_started);

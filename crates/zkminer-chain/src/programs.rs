@@ -4,16 +4,376 @@
 //! register their compiled ELF binaries with metadata and download locations.
 //! Provers use this to discover where to obtain the ELF for a given programId.
 
+use std::net::{IpAddr, ToSocketAddrs};
+use std::time::Duration;
+
 use alloy::primitives::B256;
 use anyhow::{bail, Context, Result};
 
 use crate::client::ChainClient;
 use zkminer_contracts::bindings::IProgramRegistry;
 
+/// Strip control/escape bytes (keep tab) and cap length before logging a submitter-controlled string
+/// (storage URIs, program names). Otherwise a crafted URI/name with ANSI escapes
+/// could inject into the operator's terminal or forge log lines (via carriage returns) when the log
+/// is viewed.
+pub fn sanitize_log(s: &str) -> String {
+    const MAX: usize = 512;
+    // `char::is_control()` is Unicode category Cc only — it strips ESC/CR/LF/C1 (the ANSI/OSC/CRLF
+    // injection vectors), but NOT the bidirectional-override/isolate format chars (Cf) or the
+    // line/paragraph separators U+2028/U+2029 (Zl/Zp). Those enable Trojan-Source visual reordering
+    // (CVE-2021-42574) and apparent-newline forging in log viewers — the same "forge log lines"
+    // outcome, from a submitter-controlled URI / CID / program name. Strip them too. Keep TAB.
+    let mut out: String = s
+        .chars()
+        .filter(|&c| c == '\t' || (!c.is_control() && !is_log_unsafe_format(c)))
+        .take(MAX)
+        .collect();
+    if s.chars().count() > MAX {
+        out.push('…');
+    }
+    out
+}
+
+/// Bidi controls / explicit directional format chars and the line/paragraph separators that
+/// `char::is_control()` (Cc-only) does not catch but that can still reorder or forge log lines.
+fn is_log_unsafe_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}' | '\u{2029}'               // line / paragraph separator (Zl, Zp)
+        | '\u{200E}' | '\u{200F}' | '\u{061C}' // LRM / RLM / ALM
+        | '\u{202A}'..='\u{202E}'             // LRE / RLE / PDF / LRO / RLO
+        | '\u{2066}'..='\u{2069}'             // LRI / RLI / FSI / PDI (isolates)
+    )
+}
+
+/// Per-request connect + total timeout for an ELF download. A submitter endpoint that trickles bytes
+/// or never closes must not pin a socket — and, on the pre-claim measurement path, a worker slot —
+/// indefinitely. Overridable with `ZKMINER_ELF_FETCH_TIMEOUT_SECS`.
+fn elf_fetch_timeout() -> Duration {
+    let secs = std::env::var("ZKMINER_ELF_FETCH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(60);
+    // Bounded: this is added to an `Instant`, which panics past what it can hold.
+    Duration::from_secs(secs.min(24 * 60 * 60))
+}
+
+/// Cap on concurrent blocking DNS resolutions of submitter-controlled ELF hosts, node-wide.
+///
+/// `to_socket_addrs` (getaddrinfo) is a blocking, UNCANCELLABLE call run on tokio's shared blocking
+/// pool. When the 5s timeout in `validate_fetch_url_async` fires we abandon the `JoinHandle`, but the
+/// pool thread keeps running getaddrinfo until the OS resolver gives up (tens of seconds for a
+/// black-holed nameserver). A submitter who points many ELF hostnames at a non-responding nameserver
+/// could otherwise start resolutions faster than they drain and exhaust the whole blocking pool —
+/// stalling ELF cache reads/writes and `/proc` reads node-wide (a liveness DoS). This semaphore bounds
+/// how many resolutions are IN FLIGHT at once; since each holds its permit for at most the 5s timeout,
+/// the start rate is capped and the number of abandoned-but-still-running threads stays a small
+/// multiple of this bound, well under the pool size.
+const MAX_CONCURRENT_ELF_DNS: usize = 16;
+static ELF_DNS_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+
+/// Allow fetching an ELF from a private/loopback/link-local host — only for an operator who
+/// deliberately self-hosts the program store on a private network. OFF by default: a
+/// submitter-controlled storage URI that resolves to 169.254.169.254 (cloud metadata), 127.0.0.1,
+/// 10/8, etc. is a server-side request forgery vector (the miner fetches it pre-claim, unauthenticated).
+fn allow_private_elf_hosts() -> bool {
+    matches!(
+        std::env::var("ZKMINER_ELF_ALLOW_PRIVATE_URLS")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// Extract the IPv4 address embedded in an IPv6 address for every form that carries one, so the IPv4
+/// blocklist can be applied to it. Covers IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`,
+/// excluding `::` and `::1`, which are IPv6 unspecified/loopback), the NAT64 well-known prefix
+/// (`64:ff9b::a.b.c.d`), 6to4 (`2002:AABB:CCDD::`, v4 = `AABB.CCDD`) and Teredo (`2001:0::/32`, where the
+/// client v4 is the bitwise complement of the last two groups). These are the translation/relay
+/// encodings a submitter's authoritative DNS can return to smuggle a private/metadata v4 target past a
+/// guard that only normalises the mapped form. Returns `None` for an ordinary global IPv6 address.
+fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    use std::net::Ipv4Addr;
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let seg = v6.segments();
+    let v4_from = |hi: u16, lo: u16| {
+        let a = hi.to_be_bytes();
+        let b = lo.to_be_bytes();
+        Ipv4Addr::new(a[0], a[1], b[0], b[1])
+    };
+    // IPv4-compatible `::a.b.c.d` — the high 96 bits are zero. Exclude `::` (unspecified) and `::1`
+    // (loopback): those are native IPv6, not an embedded v4.
+    if seg[0..6].iter().all(|&s| s == 0) && !(seg[6] == 0 && (seg[7] == 0 || seg[7] == 1)) {
+        return Some(v4_from(seg[6], seg[7]));
+    }
+    // IPv4-translated `::ffff:0:a.b.c.d` (SIIT), which neither of the two forms above matches.
+    if seg[0..4].iter().all(|&s| s == 0) && seg[4] == 0xffff && seg[5] == 0 {
+        return Some(v4_from(seg[6], seg[7]));
+    }
+    // NAT64 well-known prefix `64:ff9b::/96` — `64:ff9b::a.b.c.d`.
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6].iter().all(|&s| s == 0) {
+        return Some(v4_from(seg[6], seg[7]));
+    }
+    // 6to4 `2002:AABB:CCDD::/16` — the v4 is groups 1 and 2.
+    if seg[0] == 0x2002 {
+        return Some(v4_from(seg[1], seg[2]));
+    }
+    // Teredo `2001:0000::/32` — the client v4 is the bitwise complement of the last two groups.
+    if seg[0] == 0x2001 && seg[1] == 0x0000 {
+        return Some(v4_from(!seg[6], !seg[7]));
+    }
+    None
+}
+
+/// True for an address a submitter must not be able to make the miner reach: loopback, RFC1918
+/// private, link-local (incl. the 169.254.169.254 metadata endpoint), CGNAT, unspecified, broadcast,
+/// documentation, multicast, IPv6 ULA/link-local, every IPv6 form that embeds a blocked IPv4 address
+/// (see [`embedded_ipv4`]), and the 6to4 and Teredo prefixes whatever they embed.
+fn ip_is_blocked(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
+                || o[0] >= 240 // 240.0.0.0/4 reserved (Class E), incl. 255.255.255.255
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 benchmarking
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol assignments
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99) // 192.88.99.0/24 6to4 relay anycast
+                || o == [168, 63, 129, 16] // Azure's platform endpoint
+        }
+        IpAddr::V6(v6) => {
+            // Normalise every IPv6 form that EMBEDS an IPv4 address back to that IPv4 and re-test it,
+            // so a blocked v4 target cannot be smuggled through as a v6 literal the submitter's DNS
+            // returns. `to_ipv4_mapped()` alone (the previous guard) covered only `::ffff:a.b.c.d`.
+            if embedded_ipv4(*v6).is_some_and(|v4| ip_is_blocked(&IpAddr::V4(v4))) {
+                return true;
+            }
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (seg[0] & 0xffc0) == 0xfec0 // fec0::/10 site-local, deprecated
+                // Block the relay prefixes outright, whatever they embed: both are deprecated, and no
+                // program store serves from one. Not the well-known NAT64 /96 with a public address in
+                // it, tested above, which is how a host on an IPv6-only network with DNS64 reaches a
+                // store that only has IPv4. Any other `64:ff9b:` is a local translator (RFC 8215).
+                || (seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6].iter().any(|&s| s != 0))
+                || seg[0] == 0x2002 // 6to4 2002::/16
+                || (seg[0] == 0x2001 && seg[1] == 0x0000) // Teredo 2001:0::/32
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
+                || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020) // 2001:20::/28 ORCHIDv2
+        }
+    }
+}
+
+
+/// Async wrapper around [`validate_fetch_url`] that runs the BLOCKING DNS resolution off the tokio
+/// runtime, bounded by a timeout. `validate_fetch_url` calls `to_socket_addrs`, which
+/// blocks the calling thread; invoked directly from the async `download_elf` it would stall a
+/// runtime worker (a submitter hostname with slow/hanging DNS could wedge the executor, and the
+/// reqwest download timeout does not cover resolution, which happens before the request). The scheme
+/// check stays inline (cheap); only the resolution is offloaded.
+/// Validate a (submitter-controlled) ELF URL and return the VETTED socket addresses its host
+/// resolves to. The caller PINS the connection to exactly these addresses (reqwest
+/// `resolve_to_addrs`), so the host is resolved ONCE here (off-runtime, IP-checked) and never
+/// re-resolved at connect time — closing the DNS-rebinding window where a TTL-0 host answers public
+/// to this validation lookup and internal to reqwest's own connect lookup. An empty Vec means "do not
+/// pin" (private hosts are allowed by config, so there is nothing to guard).
+async fn validate_fetch_url_async(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>> {
+    match url.scheme() {
+        "http" | "https" => {}
+        other => bail!("refusing ELF fetch with non-http(s) scheme '{other}': {url}"),
+    }
+    if allow_private_elf_hosts() {
+        return Ok(Vec::new());
+    }
+    let host_raw = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("ELF URL has no host: {url}"))?;
+    // host_str() brackets an IPv6 literal ("[::1]"); strip so to_socket_addrs treats it as an IP.
+    let host = host_raw
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host_raw)
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    // Bound concurrent blocking resolutions node-wide so a flood of black-holed submitter hostnames
+    // cannot exhaust the shared blocking pool (see MAX_CONCURRENT_ELF_DNS). Held across the timeout;
+    // released when this function returns. acquire() only errors if the semaphore is closed, which
+    // never happens here, so on the impossible error we proceed without a permit rather than block.
+    let _dns_permit = ELF_DNS_SEMAPHORE
+        .get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_ELF_DNS))
+        .acquire()
+        .await
+        .ok();
+    let host_for_dns = host.clone();
+    let addrs: Vec<std::net::SocketAddr> = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            (host_for_dns.as_str(), port)
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<_>>())
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("DNS resolution for ELF host '{host}' timed out"))?
+    .map_err(|e| anyhow::anyhow!("DNS resolution task failed for '{host}': {e}"))?
+    .with_context(|| format!("resolving ELF host '{host}'"))?;
+    reject_blocked_addrs(&host, &addrs)?;
+    Ok(addrs)
+}
+
+/// Shared IP-range check used by both the sync and async URL validators.
+fn reject_blocked_addrs(host: &str, addrs: &[std::net::SocketAddr]) -> Result<()> {
+    if addrs.is_empty() {
+        bail!("ELF host '{host}' did not resolve");
+    }
+    for a in addrs {
+        if ip_is_blocked(&a.ip()) {
+            bail!(
+                "refusing ELF fetch to private/reserved address {} (host '{host}') — set \
+                 ZKMINER_ELF_ALLOW_PRIVATE_URLS=1 only if you self-host the program store",
+                a.ip()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Build a download client for one hop, pinned to `host` → `addrs` (the addresses
+/// `validate_fetch_url_async` already IP-checked), with bounded timeouts and no redirects of its own:
+/// [`get_following_redirects`] follows those, vetting each. Pinning resolves the host ONCE (there) and
+/// connects to those exact addresses, closing DNS rebinding. An empty `addrs` (private hosts allowed by
+/// config) builds an unpinned client — there is nothing to guard in that mode.
+fn build_elf_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(elf_fetch_timeout())
+        .timeout(elf_fetch_timeout())
+        .redirect(reqwest::redirect::Policy::none())
+        // reqwest sends none by default, and Arweave's gateways answer a request without one with a
+        // 403 (the subdomain `arweave.net` redirects to, measured).
+        .user_agent(concat!("zkminer/", env!("CARGO_PKG_VERSION")));
+    if !addrs.is_empty() {
+        // Pin only the vetted IP, NOT the port. The connector (hyper-util `set_port`)
+        // fills a resolved addr's port iff it is 0 OR the URI carries an explicit port, so a pinned
+        // port-0 addr gets the correct scheme-default PER HOP — 80 on http, 443 on an https upgrade —
+        // while the IP still blocks DNS rebinding. Baking the original scheme's default port in (80
+        // for an http:// URL) instead breaks a legitimate same-host http->https redirect: the
+        // connector keeps 80 and attempts TLS against the plaintext port. See `pin_addrs`.
+        let pinned = pin_addrs(addrs);
+        // And no proxy, which reqwest otherwise takes from `HTTP_PROXY` and friends. A proxy resolves
+        // the host itself, so it would ignore the pin and let a submitter's URL reach whatever the
+        // proxy can. A host that only has egress through a proxy can set
+        // `ZKMINER_ELF_ALLOW_PRIVATE_URLS=1`, the unpinned mode above, giving up the checks on every hop.
+        builder = builder.resolve_to_addrs(host, &pinned).no_proxy();
+    }
+    builder
+        .build()
+        .context("building hardened ELF download client")
+}
+
+/// How many redirects one ELF fetch follows.
+const MAX_ELF_REDIRECTS: usize = 5;
+
+/// GET `start`, following redirects by hand so that each hop goes through `vet` before anything
+/// connects to it.
+///
+/// reqwest runs a redirect policy synchronously on its connection task, where it cannot resolve DNS,
+/// and with a client pinned to one host. So a policy can only refuse a redirect to another hostname or
+/// follow it unchecked, and following it would let a `302 Location: http://name.attacker.com/` whose A
+/// record is 169.254.169.254 defeat the SSRF guard. Refusing it breaks real program stores:
+/// `arweave.net/<tx>` answers with a redirect to a subdomain of its own, and a GitHub release URL with
+/// one to `release-assets.githubusercontent.com`. Out here each hop can be resolved, IP-checked and
+/// pinned as the first was, with a client of its own.
+///
+/// `budget` bounds the whole chain and the body read after it, as the single request it replaces did.
+/// A response that is not a redirect is returned whatever its status.
+async fn get_following_redirects<V, F>(
+    start: reqwest::Url,
+    budget: Duration,
+    vet: V,
+) -> Result<reqwest::Response>
+where
+    V: Fn(reqwest::Url) -> F,
+    F: std::future::Future<Output = Result<Vec<std::net::SocketAddr>>>,
+{
+    let deadline = std::time::Instant::now() + budget;
+    let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+    let mut url = start;
+    for _ in 0..=MAX_ELF_REDIRECTS {
+        let addrs = tokio::time::timeout(remaining(), vet(url.clone()))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out vetting {}", sanitize_log(url.as_str())))??;
+        let client = build_elf_client(url.host_str().unwrap_or(""), &addrs)?;
+        let response = client
+            .get(url.clone())
+            .timeout(remaining())
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", sanitize_log(&e.to_string())))?;
+        use reqwest::StatusCode as S;
+        if !matches!(
+            response.status(),
+            S::MOVED_PERMANENTLY
+                | S::FOUND
+                | S::SEE_OTHER
+                | S::TEMPORARY_REDIRECT
+                | S::PERMANENT_REDIRECT
+        ) {
+            return Ok(response);
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| anyhow::anyhow!("redirect with no usable Location"))?;
+        url = url
+            .join(location)
+            .map_err(|e| anyhow::anyhow!("redirect to an invalid Location: {e}"))?;
+        tracing::debug!("ELF fetch redirected to {}", sanitize_log(url.as_str()));
+    }
+    bail!("too many redirects while fetching ELF")
+}
+
+/// Strip the port from each vetted address so the pin binds the IP only. The connector
+/// supplies the correct per-hop scheme-default port (see `build_elf_client`); pinning a concrete port
+/// would break a same-host cross-scheme (http<->https) redirect, whose default port differs from the
+/// original URL's. The SSRF guarantee rests on the IP (already `reject_blocked_addrs`-checked), which
+/// is preserved.
+fn pin_addrs(addrs: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
+    addrs
+        .iter()
+        .map(|a| {
+            let mut a = *a;
+            a.set_port(0);
+            a
+        })
+        .collect()
+}
+
 /// Hard cap on a downloaded ELF. Real guest ELFs are single-digit MB; this bounds a
 /// submitter-controlled storage URI so an accidentally- or maliciously-huge response
 /// can't OOM the miner (the outer timeout bounds TIME, not bytes).
-const MAX_ELF_BYTES: u64 = 256 * 1024 * 1024;
+///
+/// Kept strictly BELOW the worker-IPC frame cap (MAX_FRAME_SIZE = 256 MiB in zkminer-prover-protocol):
+/// the Execute/Prove command serializes the ELF plus its input and a small envelope, so an ELF AT a
+/// 256 MiB cap would be un-sendable over the pipe (FrameTooLarge) after a full download + disk write +
+/// triple allocation — a pointless bounded griefing lever and an over-block of any ~256 MiB program.
+/// 248 MiB leaves ample headroom for the command envelope and bounded input. No real guest is near it.
+const MAX_ELF_BYTES: u64 = 248 * 1024 * 1024;
 
 /// Resolved program info with download URIs.
 #[derive(Debug, Clone)]
@@ -57,17 +417,12 @@ impl From<u8> for StorageKind {
 }
 
 impl ChainClient {
-    /// Query the ProgramRegistry for a program's metadata. Cached per programId
-    /// (registered metadata is immutable), so repeated jobs for the same program
-    /// hit the registry only once.
+    /// Query the ProgramRegistry for a program's metadata. Cached per programId for a short TTL:
+    /// registered metadata is MUTABLE (`addStorageURI`, `removeStorageURI`, `setBuildInfo`), and an
+    /// unregistered or URI-less read — which succeeds with empty values — is never cached at all, so
+    /// a job seen before its program's registration cannot block that program for the process's life.
     pub async fn get_program_info(&self, program_id: B256) -> Result<ProgramInfo> {
-        if let Some(hit) = self
-            .program_info_cache
-            .lock()
-            .unwrap()
-            .get(&program_id)
-            .cloned()
-        {
+        if let Some(hit) = self.program_info_cache.lock().unwrap().get(&program_id) {
             return Ok(hit);
         }
 
@@ -91,16 +446,24 @@ impl ChainClient {
             .await
             .context("Failed to query ProgramRegistry.getStorageURIs")?;
 
-        // Fetch ELF hash for verification
-        let elf_hash = match registry.getBuildHashes(program_id).call().await {
-            Ok(result) => {
-                if result.elfHash == B256::ZERO {
-                    None
-                } else {
-                    Some(result.elfHash)
-                }
-            }
-            Err(_) => None,
+        // Fetch ELF hash for verification. Distinguish an AUTHORITATIVE "no elf_hash registered yet"
+        // (Ok + elfHash == ZERO) from a NON-AUTHORITATIVE transient RPC failure (a 429/timeout on a
+        // hosted or load-balanced node). The two sibling reads above propagate their errors via `?`;
+        // this one MUST too, because for SP1 a false `elf_hash = None` becomes a session-long over-block
+        // of a legit program (the SP1 measure gate refuses a program with no elf_hash, and this info is
+        // cached). Swallowing `Err` into `None` conflated a transient blip — which the attacker's job
+        // flood can drive the operator RPC into, and which most plausibly hits THIS call as the last of
+        // the three sequential reads — with a genuine no-hash verdict. Propagate instead: a transient
+        // failure then leaves nothing cached and is retried next tick; only a real ZERO read yields None.
+        let build_hashes = registry
+            .getBuildHashes(program_id)
+            .call()
+            .await
+            .context("Failed to query ProgramRegistry.getBuildHashes")?;
+        let elf_hash = if build_hashes.elfHash == B256::ZERO {
+            None
+        } else {
+            Some(build_hashes.elfHash)
         };
 
         let storage_uris: Vec<ResolvedURI> = uris
@@ -121,10 +484,26 @@ impl ChainClient {
             storage_uris,
             elf_hash,
         };
-        self.program_info_cache
-            .lock()
-            .unwrap()
-            .insert(program_id, info.clone());
+        // `elf_hash` is the ONE field that is NOT immutable at registration: `registerProgram` takes no
+        // elfHash argument (the chain cannot keccak an off-chain ELF), so the hash is set by a LATER
+        // call. A brand-new legit SP1 program therefore reads `elfHash == ZERO` in the window between
+        // registration and the hash being set. SP1 REQUIRES the hash to size/claim, and this cache has
+        // no TTL/invalidation, so caching a None for an SP1 program would pin that transient absence for
+        // the whole process lifetime and permanently over-block the program even after its hash appears.
+        // So do NOT cache a None elf_hash for an SP1 program — re-read it until the hash is set, then
+        // cache normally. (The SP1 measure gate re-checks on a self-healing TTL, so this re-read is
+        // bounded, not per-tick.) risc0 legitimately has no registry elf_hash — it is bound by its
+        // image-id — so its None is immutable and cached as before, with no re-read cost. "An SP1
+        // program" means EITHER SP1 id: a program entry is served under both `sp1.groth16.v1` and
+        // `sp1.plonk.v1` (same vkey), so testing one id would re-open the permanent pin for the other.
+        let cacheable = !info.storage_uris.is_empty()
+            && (info.elf_hash.is_some() || !crate::auction::is_sp1_id(info.proof_system_id));
+        if cacheable {
+            self.program_info_cache
+                .lock()
+                .unwrap()
+                .insert(program_id, info.clone());
+        }
         Ok(info)
     }
 
@@ -145,7 +524,55 @@ impl ChainClient {
     }
 }
 
+/// Program ids whose on-disk ELF must NOT be LRU-evicted right now, as a refcount (several in-flight
+/// jobs can share a program). A lifecycle task pins its program from claim through prove: the on-disk
+/// LRU is small (default 4 GiB) relative to the 256 MiB-ish ELF size, so a submitter flooding distinct
+/// decoy programs during the claim->prove window could otherwise evict a just-claimed program's cached
+/// ELF (mtime unchanged since measurement), turning the claim into a prove-time fetch miss -> penalized
+/// release. Pinned bytes stay bounded by max_concurrent in-flight lifecycles.
+static ELF_PIN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<B256, usize>>> =
+    std::sync::OnceLock::new();
+
+fn elf_pin_map() -> &'static std::sync::Mutex<std::collections::HashMap<B256, usize>> {
+    ELF_PIN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn elf_is_pinned(program_id: &B256) -> bool {
+    elf_pin_map()
+        .lock()
+        .map(|m| m.contains_key(program_id))
+        .unwrap_or(false)
+}
+
+/// RAII pin: increments the refcount for `program_id` and decrements it on drop. Hold one for the
+/// lifetime of a lifecycle task so the program's ELF survives in the on-disk cache until prove.
+#[must_use]
+pub struct ElfPin(B256);
+
+impl ElfPin {
+    pub fn new(program_id: B256) -> Self {
+        if let Ok(mut m) = elf_pin_map().lock() {
+            *m.entry(program_id).or_insert(0) += 1;
+        }
+        ElfPin(program_id)
+    }
+}
+
+impl Drop for ElfPin {
+    fn drop(&mut self) {
+        if let Ok(mut m) = elf_pin_map().lock() {
+            if let Some(n) = m.get_mut(&self.0) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&self.0);
+                }
+            }
+        }
+    }
+}
+
 /// Local ELF cache manager — stores downloaded ELF binaries at ~/.zkminer/elfs/.
+#[derive(Clone)]
 pub struct ElfCache {
     cache_dir: std::path::PathBuf,
 }
@@ -156,12 +583,24 @@ impl Default for ElfCache {
     }
 }
 
+/// Where [`ElfCache::new`] keeps ELFs instead of `~/.zkminer/elfs`, when set (once, at startup).
+static ELF_CACHE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Keep this process's ELF cache in `dir`, apart from `~/.zkminer/elfs` (a watch-only run, which
+/// must not prune or purge the cache a miner on the same host relies on). Call before any cache is
+/// used; a second call is ignored.
+pub fn set_elf_cache_dir(dir: std::path::PathBuf) {
+    let _ = ELF_CACHE_DIR.set(dir);
+}
+
 impl ElfCache {
     pub fn new() -> Self {
-        let cache_dir = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".zkminer")
-            .join("elfs");
+        let cache_dir = ELF_CACHE_DIR.get().cloned().unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".zkminer")
+                .join("elfs")
+        });
         Self { cache_dir }
     }
 
@@ -176,6 +615,12 @@ impl ElfCache {
     pub fn get(&self, program_id: &B256, expected_content_hash: Option<B256>) -> Option<Vec<u8>> {
         let path = self.cache_dir.join(format!("{}.elf", program_id));
         let bytes = std::fs::read(&path).ok()?;
+        // Nothing caches an empty ELF: an empty entry is a torn write (a crash before writes were
+        // atomic), and keeping it would fail every proof of the program, every session.
+        if bytes.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
         if let Some(expected) = expected_content_hash {
             let actual_hash = alloy::primitives::keccak256(&bytes);
             if actual_hash != expected {
@@ -190,13 +635,109 @@ impl ElfCache {
         Some(bytes)
     }
 
-    /// Store an ELF in the cache.
+    /// Whether an entry for `program_id` is on disk (no read, no hash).
+    pub fn contains(&self, program_id: &B256) -> bool {
+        self.cache_dir.join(format!("{}.elf", program_id)).is_file()
+    }
+
+    /// Store an ELF in the cache: written in full to a temporary file, synced, then renamed into
+    /// place, so a crash or a concurrent reader never sees a partial entry (a read without an
+    /// expected hash — a recovered lock's, a measurement's — takes the bytes as they are).
     pub fn put(&self, program_id: &B256, elf: &[u8]) -> Result<()> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
         std::fs::create_dir_all(&self.cache_dir).context("Failed to create ELF cache directory")?;
         let path = self.cache_dir.join(format!("{}.elf", program_id));
-        std::fs::write(&path, elf).context("Failed to write ELF to cache")?;
+        static TMP: AtomicU64 = AtomicU64::new(0);
+        let tmp = self.cache_dir.join(format!(
+            ".{}.{}.{}.tmp",
+            program_id,
+            std::process::id(),
+            TMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written = std::fs::File::create(&tmp)
+            .and_then(|mut f| {
+                f.write_all(elf)?;
+                f.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).context("Failed to write ELF to cache");
+        }
         tracing::info!("Cached ELF for {} ({} bytes)", program_id, elf.len());
+        // Bound total on-disk cache size. Without this, a submitter who registers many distinct
+        // programs (each served from a URI near the 256 MiB cap) could fill the operator's disk —
+        // and this cache is written even on the PRE-CLAIM measurement path, for jobs never claimed.
+        self.prune_to_budget();
         Ok(())
+    }
+
+    /// Maximum total bytes kept in the on-disk ELF cache. Override with
+    /// `ZKMINER_ELF_CACHE_MAX_BYTES` (0 = unbounded, the old behaviour).
+    fn cache_budget_bytes() -> u64 {
+        std::env::var("ZKMINER_ELF_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(4 * 1024 * 1024 * 1024) // 4 GiB
+    }
+
+    /// Evict the least-recently-modified cached ELFs until the directory is under budget.
+    fn prune_to_budget(&self) {
+        self.prune_with_budget(Self::cache_budget_bytes());
+    }
+
+    fn prune_with_budget(&self, budget: u64) {
+        if budget == 0 {
+            return;
+        }
+        let read = match std::fs::read_dir(&self.cache_dir) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        // (path, size, mtime) for each cached ELF.
+        let mut entries: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
+        for ent in read.flatten() {
+            let path = ent.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("elf") {
+                continue;
+            }
+            if let Ok(md) = ent.metadata() {
+                let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+                entries.push((path, md.len(), mtime));
+            }
+        }
+        let mut total: u64 = entries.iter().map(|(_, sz, _)| *sz).sum();
+        if total <= budget {
+            return;
+        }
+        // Oldest first.
+        entries.sort_by_key(|(_, _, mtime)| *mtime);
+        for (path, sz, _) in entries {
+            if total <= budget {
+                break;
+            }
+            // Never evict an ELF whose program is pinned (a lifecycle task holds locked collateral on
+            // it and will read the ELF at prove time). The filename is "<programId>.elf"; parse the
+            // stem back to a B256 and skip if pinned. Pinned bytes are bounded by in-flight count, so
+            // the cache may briefly exceed budget rather than evict a program we are about to prove.
+            let pinned = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<B256>().ok())
+                .map(|pid| elf_is_pinned(&pid))
+                .unwrap_or(false);
+            if pinned {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    total = total.saturating_sub(sz);
+                    tracing::info!("Evicted cached ELF {} ({sz} bytes) to stay under cache budget", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to evict cached ELF {}: {e}", path.display()),
+            }
+        }
     }
 
     /// Check if an ELF is cached.
@@ -205,14 +746,39 @@ impl ElfCache {
     }
 }
 
+/// The registry lists no storage URIs for a program: unregistered, or registered and not yet given a
+/// URI. Says nothing about the program's future, unlike a URI that fails.
+#[derive(Debug, Clone, Copy)]
+pub struct NoStorageUris;
+
+impl std::fmt::Display for NoStorageUris {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("No storage URIs available for this program")
+    }
+}
+impl std::error::Error for NoStorageUris {}
+
 /// Download an ELF binary from a list of storage URIs.
 /// Tries each URI in order until one succeeds.
 pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> Result<Vec<u8>> {
     if uris.is_empty() {
-        bail!("No storage URIs available for this program");
+        return Err(NoStorageUris.into());
     }
 
-    for uri_info in uris {
+    // Cap the number of submitter-listed URIs actually tried. download_elf is on the
+    // pre-claim MEASURE path (bounded by a measure-fetch timeout at the caller) and the prove path;
+    // without a cap a program advertising dozens of stalling URIs burns timeout × count, pinning a
+    // scarce measure-budget slot (or a prove deadline). Real programs list one or a few mirrors.
+    const MAX_ELF_URIS: usize = 8;
+    if uris.len() > MAX_ELF_URIS {
+        tracing::warn!(
+            "program lists {} storage URIs; trying only the first {} (flood protection)",
+            uris.len(),
+            MAX_ELF_URIS
+        );
+    }
+
+    for uri_info in uris.iter().take(MAX_ELF_URIS) {
         let url = match uri_info.storage_type {
             StorageKind::IPFS => {
                 // Convert IPFS CID to a gateway URL
@@ -225,16 +791,33 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                 format!("https://arweave.net/{tx_id}")
             }
             StorageKind::Custom => {
-                tracing::debug!("Skipping Custom storage URI: {}", uri_info.uri);
+                tracing::debug!("Skipping Custom storage URI: {}", sanitize_log(&uri_info.uri));
                 continue;
             }
         };
 
-        tracing::info!("Downloading ELF from {}...", url);
-        match reqwest::get(&url).await {
+        // SSRF guard: parse + validate the (submitter-controlled) URL before touching the network.
+        let parsed = match reqwest::Url::parse(&url) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!("Skipping unparseable storage URI {}: {e}", sanitize_log(&url));
+                continue;
+            }
+        };
+
+        // The URL string is submitter-controlled (built from a registered URI); sanitize it in
+        // every log line so embedded ANSI/OSC/CRLF cannot forge or corrupt operator console output.
+        let url_log = sanitize_log(&url);
+        tracing::info!("Downloading ELF from {}...", url_log);
+        // Every hop is resolved, IP-checked and pinned before anything connects to it.
+        let fetched = get_following_redirects(parsed, elf_fetch_timeout(), |hop| async move {
+            validate_fetch_url_async(&hop).await
+        })
+        .await;
+        match fetched {
             Ok(mut response) => {
                 if !response.status().is_success() {
-                    tracing::warn!("HTTP {} from {}", response.status(), url);
+                    tracing::warn!("HTTP {} from {}", response.status(), url_log);
                     continue;
                 }
                 // Reject an over-cap body up front when the server declares its size.
@@ -242,7 +825,7 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                     if len > MAX_ELF_BYTES {
                         tracing::warn!(
                             "ELF at {} declares {} bytes (> {} cap) — skipping",
-                            url,
+                            url_log,
                             len,
                             MAX_ELF_BYTES
                         );
@@ -275,37 +858,52 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                 if over_cap {
                     tracing::warn!(
                         "ELF from {} exceeds {} cap mid-stream — skipping",
-                        url,
+                        url_log,
                         MAX_ELF_BYTES
                     );
                     continue;
                 }
                 if let Some(e) = read_err {
-                    tracing::warn!("Failed to read response from {}: {}", url, e);
+                    tracing::warn!("Failed to read response from {}: {}", url_log, sanitize_log(&e));
                     continue;
                 }
 
-                // Verify content hash if provided
-                if let Some(expected) = expected_hash {
-                    let actual = alloy::primitives::keccak256(&elf);
-                    if actual != expected {
-                        tracing::warn!(
-                            "ELF hash mismatch from {}: expected {}, got {}",
-                            url,
-                            expected,
-                            actual
-                        );
-                        continue;
+                // Verify the whole-ELF keccak digest against the registry `elf_hash` and the
+                // per-URI content_hash. keccak256 over up to MAX_ELF_BYTES is ~1-2s of non-yielding
+                // CPU, so offload it to a blocking thread (the on-disk cache read/write paths already
+                // do): a large-ELF or hash-mismatch flood on this download path must not pin the async
+                // runtime's worker threads. Both checks hash the SAME bytes, so compute the digest once.
+                if expected_hash.is_some() || uri_info.content_hash != B256::ZERO {
+                    let elf_arc = std::sync::Arc::new(std::mem::take(&mut elf));
+                    let for_hash = elf_arc.clone();
+                    let actual = match tokio::task::spawn_blocking(move || {
+                        alloy::primitives::keccak256(for_hash.as_slice())
+                    })
+                    .await
+                    {
+                        Ok(h) => h,
+                        Err(e) => {
+                            tracing::warn!("ELF hashing task failed for {}: {e}", url_log);
+                            continue;
+                        }
+                    };
+                    // The closure dropped its clone, so this Arc is now sole-owner: no 256 MiB copy.
+                    elf = std::sync::Arc::try_unwrap(elf_arc).unwrap_or_else(|a| (*a).clone());
+                    if let Some(expected) = expected_hash {
+                        if actual != expected {
+                            tracing::warn!(
+                                "ELF hash mismatch from {}: expected {}, got {}",
+                                url_log,
+                                expected,
+                                actual
+                            );
+                            continue;
+                        }
                     }
-                }
-
-                // Also verify against URI-level content hash
-                if uri_info.content_hash != B256::ZERO {
-                    let actual = alloy::primitives::keccak256(&elf);
-                    if actual != uri_info.content_hash {
+                    if uri_info.content_hash != B256::ZERO && actual != uri_info.content_hash {
                         tracing::warn!(
                             "Content hash mismatch from {}: expected {}, got {}",
-                            url,
+                            url_log,
                             uri_info.content_hash,
                             actual
                         );
@@ -317,11 +915,583 @@ pub async fn download_elf(uris: &[ResolvedURI], expected_hash: Option<B256>) -> 
                 return Ok(elf);
             }
             Err(e) => {
-                tracing::warn!("Failed to download from {}: {}", url, e);
+                tracing::warn!(
+                    "Failed to download from {}: {}",
+                    url_log,
+                    sanitize_log(&format!("{e:#}"))
+                );
                 continue;
             }
         }
     }
 
     bail!("Failed to download ELF from any of {} URIs", uris.len())
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn blocks_private_reserved_and_metadata_addresses() {
+        for s in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.5.4",
+            "192.168.1.1",
+            "169.254.169.254", // cloud metadata
+            "100.64.0.1",      // CGNAT
+            "0.0.0.0",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1", // IPv4-mapped loopback
+        ] {
+            assert!(ip_is_blocked(&ip(s)), "{s} should be blocked");
+        }
+    }
+
+    #[test]
+    fn allows_public_addresses() {
+        for s in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
+            assert!(!ip_is_blocked(&ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn pinned_elfs_are_not_evicted_by_prune() {
+        use std::io::Write;
+        // Unique temp cache dir for this test.
+        let dir = std::env::temp_dir().join(format!("zkminer-elf-pin-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = ElfCache { cache_dir: dir.clone() };
+
+        // Three 2 MiB ELFs (6 MiB total); pin two of them.
+        let ids = [B256::repeat_byte(0x11), B256::repeat_byte(0x22), B256::repeat_byte(0x33)];
+        for id in &ids {
+            let mut f = std::fs::File::create(dir.join(format!("{id}.elf"))).unwrap();
+            f.write_all(&vec![0u8; 2 * 1024 * 1024]).unwrap();
+        }
+        let _p1 = ElfPin::new(ids[0]);
+        let _p2 = ElfPin::new(ids[1]);
+        assert!(elf_is_pinned(&ids[0]) && elf_is_pinned(&ids[1]) && !elf_is_pinned(&ids[2]));
+
+        // Budget 3 MiB: prune must shed down toward it, but can only evict the single UNPINNED entry.
+        cache.prune_with_budget(3 * 1024 * 1024);
+
+        assert!(dir.join(format!("{}.elf", ids[0])).exists(), "pinned ELF #1 must survive");
+        assert!(dir.join(format!("{}.elf", ids[1])).exists(), "pinned ELF #2 must survive");
+        assert!(!dir.join(format!("{}.elf", ids[2])).exists(), "unpinned ELF must be evicted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn elf_pin_refcount_releases_on_drop() {
+        let id = B256::repeat_byte(0xab);
+        assert!(!elf_is_pinned(&id));
+        {
+            let _a = ElfPin::new(id);
+            let _b = ElfPin::new(id);
+            assert!(elf_is_pinned(&id), "pinned while a guard is held");
+        }
+        assert!(!elf_is_pinned(&id), "unpinned once all guards drop");
+    }
+
+    // The integrity-hash purge the risc0 ELF-swap binding depends on: `fetch_or_download_elf` reads
+    // the cache with the (co-resolved) verified keccak, so a cached entry whose bytes do NOT match the
+    // expected hash must be dropped and reported as a miss (forcing a hash-enforced re-download), while
+    // a matching entry is returned. keccak256 over the genuine bytes is deterministic from the program,
+    // so this never purges a correct entry.
+    #[test]
+    fn a_cached_elf_is_written_whole_and_an_empty_one_is_a_miss() {
+        let dir = std::env::temp_dir().join(format!(
+            "zkminer-elf-atomic-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = ElfCache {
+            cache_dir: dir.clone(),
+        };
+        let id = B256::repeat_byte(0x5a);
+        cache.put(&id, b"elf-bytes").unwrap();
+        assert_eq!(cache.get(&id, None).as_deref(), Some(&b"elf-bytes"[..]));
+        // Only the entry is left: no temporary file.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(format!("{id}.elf"))]);
+        // A torn (empty) entry is a miss, and goes.
+        std::fs::write(dir.join(format!("{id}.elf")), b"").unwrap();
+        assert_eq!(cache.get(&id, None), None);
+        assert!(!cache.contains(&id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_get_purges_on_hash_mismatch_and_returns_on_match() {
+        let dir = std::env::temp_dir().join(format!(
+            "zkminer-elf-hash-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = ElfCache { cache_dir: dir.clone() };
+
+        let id = B256::repeat_byte(0x7e);
+        let bytes = b"the-genuine-risc0-elf-bytes".to_vec();
+        let good = alloy::primitives::keccak256(&bytes);
+        cache.put(&id, &bytes).unwrap();
+
+        // No expected hash -> returned unverified.
+        assert_eq!(cache.get(&id, None).as_deref(), Some(bytes.as_slice()));
+        // Correct hash -> returned, entry kept.
+        assert_eq!(cache.get(&id, Some(good)).as_deref(), Some(bytes.as_slice()));
+        assert!(dir.join(format!("{id}.elf")).exists());
+
+        // Wrong hash (a swapped ELF would land here) -> miss AND the corrupt/stale entry is purged,
+        // so the next fetch cannot serve the mismatching bytes and must re-download under the hash.
+        let wrong = B256::repeat_byte(0xff);
+        assert_eq!(cache.get(&id, Some(wrong)), None, "mismatch must be a miss");
+        assert!(
+            !dir.join(format!("{id}.elf")).exists(),
+            "mismatching entry must be purged"
+        );
+        assert_eq!(cache.get(&id, None), None, "entry is gone after the purge");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocks_additional_special_use_ranges() {
+        for s in [
+            "240.0.0.1",      // 240/4 reserved (Class E)
+            "255.255.255.255",// broadcast / 240/4
+            "198.18.0.1",     // benchmarking 198.18/15
+            "198.19.255.1",   // benchmarking 198.18/15
+            "192.0.0.1",      // 192.0.0/24 IETF protocol assignments
+            "192.88.99.1",    // 6to4 relay anycast
+            "2001:db8::1",    // documentation 2001:db8::/32
+            "2001:20::1",     // ORCHIDv2 2001:20::/28
+            "2001:2f:ffff::1",// still within 2001:20::/28
+        ] {
+            assert!(ip_is_blocked(&ip(s)), "{s} should be blocked");
+        }
+        // Neighbours just outside the new ranges stay allowed.
+        for s in ["198.17.0.1", "198.20.0.1", "191.255.255.255", "2001:30::1"] {
+            assert!(!ip_is_blocked(&ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn sanitize_log_strips_terminal_and_bidi_and_separators() {
+        // CRLF / ESC (Cc) stripped, TAB and the printable ANSI payload kept.
+        assert_eq!(super::sanitize_log("a\r\nb\x1b[31mc\td"), "ab[31mc\td");
+        // Bidi overrides/isolates (Cf) and line/paragraph separators (Zl/Zp) stripped.
+        for bad in ['\u{202E}', '\u{2066}', '\u{200F}', '\u{061C}', '\u{2028}', '\u{2029}'] {
+            let input = format!("safe{bad}text");
+            let out = super::sanitize_log(&input);
+            assert_eq!(out, "safetext", "{:?} must be stripped", bad);
+        }
+        // Ordinary unicode (non-format) is preserved.
+        assert_eq!(super::sanitize_log("café-π"), "café-π");
+    }
+
+    /// What the guard's doc says it blocks and it used to let through.
+    #[test]
+    fn blocks_the_forms_the_early_return_let_through() {
+        for s in [
+            "224.0.0.1",          // IPv4 multicast
+            "239.255.255.250",    // IPv4 multicast
+            "::ffff:0:a9fe:a9fe", // IPv4-translated 169.254.169.254
+            "::ffff:0:a00:1",     // IPv4-translated 10.0.0.1
+            "2002:0808:0808::",   // 6to4, whatever it embeds
+            "2001:0:808:808::1",  // Teredo, whatever it embeds
+            "64:ff9b:1::808:808", // a local NAT64 translator (RFC 8215)
+            "fec0::1",            // deprecated site-local
+            "168.63.129.16",      // Azure's platform endpoint
+        ] {
+            assert!(ip_is_blocked(&ip(s)), "{s} should be blocked");
+        }
+        // How an IPv6-only host with DNS64 reaches a store with only IPv4, and the same public
+        // address in the other embedding forms, which reach nothing internal.
+        for s in ["64:ff9b::808:808", "::ffff:8.8.8.8", "::ffff:0:808:808"] {
+            assert!(!ip_is_blocked(&ip(s)), "{s} should be allowed");
+        }
+        assert_eq!(
+            embedded_ipv4("::ffff:0:a9fe:a9fe".parse().unwrap()),
+            Some(std::net::Ipv4Addr::new(169, 254, 169, 254))
+        );
+    }
+
+    #[test]
+    fn blocks_ipv4_embedding_ipv6_forms() {
+        use std::net::Ipv4Addr;
+        // Every IPv6 encoding that embeds the cloud-metadata v4 169.254.169.254 (a9fe:a9fe) must be
+        // blocked — the forms the old guard (to_ipv4_mapped only) let through.
+        for s in [
+            "64:ff9b::a9fe:a9fe",  // NAT64 well-known prefix of 169.254.169.254
+            "64:ff9b::a00:1",      // NAT64 of 10.0.0.1
+            "::a9fe:a9fe",         // IPv4-compatible 169.254.169.254
+            "2002:a9fe:a9fe::",    // 6to4 of 169.254.169.254
+            "2001::f5ff:fffe",     // Teredo whose client v4 (~f5ff:fffe) is 10.0.0.1
+        ] {
+            assert!(ip_is_blocked(&ip(s)), "{s} embeds a blocked v4 and must be blocked");
+        }
+        // The extractor decodes each form to the right v4.
+        let md = Ipv4Addr::new(169, 254, 169, 254);
+        assert_eq!(embedded_ipv4("64:ff9b::a9fe:a9fe".parse().unwrap()), Some(md));
+        assert_eq!(embedded_ipv4("::a9fe:a9fe".parse().unwrap()), Some(md));
+        assert_eq!(embedded_ipv4("2002:a9fe:a9fe::".parse().unwrap()), Some(md));
+        assert_eq!(
+            embedded_ipv4("2001::f5ff:fffe".parse().unwrap()),
+            Some(Ipv4Addr::new(10, 0, 0, 1))
+        );
+        // :: and ::1 are IPv6 unspecified/loopback, NOT an embedded v4 (and are blocked as v6).
+        assert_eq!(embedded_ipv4("::".parse().unwrap()), None);
+        assert_eq!(embedded_ipv4("::1".parse().unwrap()), None);
+        // An ordinary global v6 embeds nothing and stays allowed.
+        assert_eq!(embedded_ipv4("2606:4700:4700::1111".parse().unwrap()), None);
+    }
+
+    /// A server on localhost that answers each connection with the next canned reply (`{port}` in one
+    /// becomes its port) and records the Host header each request carried. `STALL` reads the request
+    /// and then says nothing, with the connection held open; see [`SLOW`] and [`BODY_STALLS`] for the
+    /// other ways it misbehaves.
+    struct CannedServer {
+        port: u16,
+        hosts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    fn canned_server(replies: &[&str]) -> CannedServer {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hosts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let replies: Vec<String> = replies
+            .iter()
+            .map(|r| r.replace("{port}", &port.to_string()))
+            .collect();
+        let seen = hosts.clone();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                if let Some(host) = text.lines().find_map(|l| l.strip_prefix("host: ")) {
+                    seen.lock()
+                        .unwrap()
+                        .push(host.split(':').next().unwrap().to_string());
+                }
+                if reply == STALL {
+                    std::thread::sleep(Duration::from_secs(60));
+                    return;
+                }
+                let reply = match reply.strip_prefix(SLOW) {
+                    Some(rest) => {
+                        std::thread::sleep(SLOW_BY);
+                        rest.to_string()
+                    }
+                    None => reply,
+                };
+                let _ = stream.write_all(reply.as_bytes());
+                if reply.ends_with(BODY_STALLS) {
+                    std::thread::sleep(Duration::from_secs(60));
+                    return;
+                }
+            }
+        });
+        CannedServer { port, hosts }
+    }
+
+    fn redirect_to(location: &str) -> String {
+        format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    const STALL: &str = "stall";
+    /// A reply starting with this comes after [`SLOW_BY`].
+    const SLOW: &str = "slow:";
+    const SLOW_BY: Duration = Duration::from_millis(1500);
+    /// A reply ending with this is left open: its headers promise more than it sends.
+    const BODY_STALLS: &str = "part of";
+
+    const OK_ELF: &str = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nelf";
+
+    type Vetted = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A vetter that takes names no resolver knows to localhost, recording what it was asked about.
+    /// That the fetch connects at all shows it used the pin. Refuses `refused`.
+    fn vet_to_localhost(
+        refused: &'static str,
+    ) -> (
+        Vetted,
+        impl Fn(reqwest::Url) -> std::future::Ready<Result<Vec<std::net::SocketAddr>>>,
+    ) {
+        let asked: Vetted = Default::default();
+        let log = asked.clone();
+        let vet = move |url: reqwest::Url| {
+            let host = url.host_str().unwrap_or("").to_string();
+            log.lock().unwrap().push(host.clone());
+            std::future::ready(if host == refused {
+                Err(anyhow::anyhow!("refused {host}"))
+            } else {
+                Ok(vec!["127.0.0.1:0".parse().unwrap()])
+            })
+        };
+        (asked, vet)
+    }
+
+    fn start_url(server: &CannedServer) -> reqwest::Url {
+        reqwest::Url::parse(&format!("http://store.invalid:{}/elf", server.port)).unwrap()
+    }
+
+    const BUDGET: Duration = Duration::from_secs(20);
+
+    /// What `arweave.net/<tx>` and a GitHub release URL do, and what the guard used to refuse.
+    #[tokio::test]
+    async fn a_redirect_to_another_host_is_vetted_and_followed() {
+        let server = canned_server(&[&redirect_to("http://cdn.invalid:{port}/real"), OK_ELF]);
+        let (asked, vet) = vet_to_localhost("");
+        let response = get_following_redirects(start_url(&server), BUDGET, vet)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "elf");
+        assert_eq!(*asked.lock().unwrap(), ["store.invalid", "cdn.invalid"]);
+        assert_eq!(
+            *server.hosts.lock().unwrap(),
+            ["store.invalid", "cdn.invalid"]
+        );
+    }
+
+    /// The point of the whole guard: nothing connects to a hop that fails vetting.
+    #[tokio::test]
+    async fn a_hop_that_fails_vetting_is_never_connected_to() {
+        let server = canned_server(&[&redirect_to("http://internal.invalid:{port}/"), OK_ELF]);
+        let (_, vet) = vet_to_localhost("internal.invalid");
+        let e = get_following_redirects(start_url(&server), BUDGET, vet)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("refused internal.invalid"),
+            "{e:#}"
+        );
+        assert_eq!(*server.hosts.lock().unwrap(), ["store.invalid"]);
+    }
+
+    /// With the real vetter: a name that resolves to a blocked address, an IP literal, and a scheme.
+    #[tokio::test]
+    async fn the_real_vetter_refuses_internal_redirect_targets() {
+        for target in [
+            "http://localhost:{port}/",
+            "http://127.0.0.1:{port}/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:{port}/",
+            "http://[::ffff:0:a9fe:a9fe]/",
+            "ftp://store.invalid/elf",
+            "file:///etc/passwd",
+        ] {
+            let server = canned_server(&[&redirect_to(target), OK_ELF]);
+            let first = start_url(&server);
+            let origin = first.clone();
+            let vet = move |hop: reqwest::Url| {
+                let is_first = hop == origin;
+                async move {
+                    if is_first {
+                        Ok(vec!["127.0.0.1:0".parse().unwrap()])
+                    } else {
+                        validate_fetch_url_async(&hop).await
+                    }
+                }
+            };
+            let result = get_following_redirects(first, BUDGET, vet).await;
+            let e = result
+                .err()
+                .unwrap_or_else(|| panic!("{target} was followed"));
+            // The guard's own words: a target that merely cannot be reached from here is no pass.
+            assert!(
+                format!("{e:#}").contains("refusing ELF fetch"),
+                "{target}: {e:#}"
+            );
+            assert_eq!(
+                server.hosts.lock().unwrap().len(),
+                1,
+                "{target} was connected to"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relative_location_stays_on_the_host_and_is_vetted_again() {
+        let server = canned_server(&[&redirect_to("/moved/elf"), OK_ELF]);
+        let (asked, vet) = vet_to_localhost("");
+        let response = get_following_redirects(start_url(&server), BUDGET, vet)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(*asked.lock().unwrap(), ["store.invalid", "store.invalid"]);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_chain_is_bounded() {
+        let hop = redirect_to("http://store.invalid:{port}/again");
+        let replies = vec![hop.as_str(); MAX_ELF_REDIRECTS + 3];
+        let server = canned_server(&replies);
+        let (asked, vet) = vet_to_localhost("");
+        let e = get_following_redirects(start_url(&server), BUDGET, vet)
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("too many redirects"), "{e:#}");
+        assert_eq!(asked.lock().unwrap().len(), MAX_ELF_REDIRECTS + 1);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_without_a_location_fails_and_other_statuses_are_returned() {
+        let server = canned_server(&[
+            "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        let (_, vet) = vet_to_localhost("");
+        assert!(get_following_redirects(start_url(&server), BUDGET, vet)
+            .await
+            .is_err());
+
+        let server = canned_server(&[
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        let (_, vet) = vet_to_localhost("");
+        let response = get_following_redirects(start_url(&server), BUDGET, vet)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+    }
+
+    /// The budget covers the whole chain, as the single request it replaces did: a host that stalls
+    /// must not get a fresh allowance for each hop. The first hop spends most of it, so a fresh one
+    /// for the second would take over 3.5 s rather than the 2 s of the budget.
+    #[tokio::test]
+    async fn the_budget_covers_the_whole_chain() {
+        let hop = format!("{SLOW}{}", redirect_to("http://store.invalid:{port}/stall"));
+        let server = canned_server(&[&hop, STALL]);
+        let (_, vet) = vet_to_localhost("");
+        let started = std::time::Instant::now();
+        let e = get_following_redirects(start_url(&server), Duration::from_secs(2), vet)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            server.hosts.lock().unwrap().len(),
+            2,
+            "the stalled hop was reached: {e:#}"
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(1900) && took < Duration::from_secs(3),
+            "{took:?}"
+        );
+    }
+
+    /// And the body, which the caller reads after this returns.
+    #[tokio::test]
+    async fn the_budget_covers_the_body_read() {
+        let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{BODY_STALLS}");
+        let server = canned_server(&[&reply]);
+        let (_, vet) = vet_to_localhost("");
+        let started = std::time::Instant::now();
+        let response = get_following_redirects(start_url(&server), Duration::from_secs(1), vet)
+            .await
+            .unwrap();
+        assert!(response.text().await.is_err(), "the body never finishes");
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_secs(4),
+            "{took:?}"
+        );
+    }
+
+    /// The stores this was written for, for real: neither redirect stays on the host asked for.
+    #[tokio::test]
+    #[ignore = "needs the network"]
+    async fn real_stores_that_redirect_across_hosts_are_followed() {
+        for url in [
+            "https://arweave.net/bNbA3TEQVL60xlgCcqdz4ZPHFZ711cZ3hmkpGttDt_U",
+            "https://github.com/risc0/risc0/releases/download/v1.0.0/cargo-risczero-x86_64-unknown-linux-gnu.tgz",
+        ] {
+            let vet = |hop: reqwest::Url| async move { validate_fetch_url_async(&hop).await };
+            let start = reqwest::Url::parse(url).unwrap();
+            let response = get_following_redirects(start.clone(), Duration::from_secs(60), vet)
+                .await
+                .unwrap_or_else(|e| panic!("{url}: {e:#}"));
+            assert!(response.status().is_success(), "{url}: {}", response.status());
+            assert_ne!(response.url().host_str(), start.host_str(), "{url} no longer redirects");
+        }
+    }
+
+    #[test]
+    fn pinning_binds_the_ip_but_not_the_port() {
+        // The pin must carry port 0 so the connector fills the
+        // correct scheme-default per hop; baking a concrete port (80 for http) in breaks a legitimate
+        // same-host http->https redirect (connector keeps 80, attempts TLS on it). The IP — the thing
+        // the SSRF guard actually rests on — is preserved exactly.
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 80);
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443);
+        let pinned = pin_addrs(&[v4, v6]);
+        assert_eq!(pinned.len(), 2);
+        assert_eq!(pinned[0].ip(), v4.ip(), "IP preserved");
+        assert_eq!(pinned[0].port(), 0, "port zeroed so the connector picks the per-hop default");
+        assert_eq!(pinned[1].ip(), v6.ip(), "IPv6 preserved");
+        assert_eq!(pinned[1].port(), 0);
+    }
+
+    #[test]
+    fn cache_prune_enforces_byte_budget() {
+        let dir = std::env::temp_dir().join(format!("zkminer-elfcache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = ElfCache {
+            cache_dir: dir.clone(),
+        };
+
+        // Three 1000-byte ELFs = 3000 bytes total.
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.join(format!("{name}.elf")), vec![0u8; 1000]).unwrap();
+        }
+
+        // A budget of 2500 must leave the directory at or under budget (one file evicted).
+        cache.prune_with_budget(2500);
+        let remaining: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("elf"))
+            .collect();
+        let total: u64 = remaining.iter().map(|e| e.metadata().unwrap().len()).sum();
+        assert!(total <= 2500, "cache not pruned under budget: {total} bytes");
+        assert_eq!(remaining.len(), 2, "exactly one oldest ELF should be evicted");
+
+        // Budget 0 = unbounded: nothing is evicted.
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.join(format!("{name}.elf")), vec![0u8; 1000]).unwrap();
+        }
+        cache.prune_with_budget(0);
+        let count = std::fs::read_dir(&dir).unwrap().flatten().count();
+        assert_eq!(count, 3, "budget 0 must not evict");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

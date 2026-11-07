@@ -5,7 +5,50 @@ use serde::{Deserialize, Serialize};
 /// 4: `BenchmarkEntry` gained `wrap_secs`. The codec is bincode, which is POSITIONAL — an extra field
 /// cannot be defaulted, so a v3 worker's entries do not decode as v4 and would fail mid-benchmark.
 /// Bumping the version makes `handshake` reject a stale worker at spawn with a clear message instead.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// 6: `ExecuteResult` gained `peak_host_bytes` (and, retroactively, relies on `journal_len`). Same
+/// bincode-positional reason: a trailing field a v5 worker omits makes a v6 reader underrun the frame,
+/// so `#[serde(default)]` does NOT give cross-version back-compat on the wire — it only lets a
+/// SAME-version co-built binary that happens not to set the field decode as 0. The bump makes the
+/// handshake reject a mismatched (old) worker at spawn rather than fail cryptically at first Execute.
+/// 7: `ExecuteResult` gained `journal`, the bytes the host checks a job's journal binding against
+/// before claiming it.
+/// 8: no new field, a new meaning: risc0 `ExecuteResult.cycles` is the padded proving total (plus
+/// the keccak proofs), the `sys_rand` seed hashes the image id and the key comes from the miner. A
+/// v7 risc0 worker would measure in other units and seed guests differently from a v8 one proving
+/// the same job, so the handshake refuses it.
+/// 9: no new field, a new meaning: a risc0 worker measures and proves a job at `RISC0_SEGMENT_PO2`,
+/// refuses a job proof at any other, and executes with risc0's refusals of guests no proof of which
+/// can verify. A v8 worker would measure such a guest clean, and a v9 one refuses the po2 a v8 host
+/// may send.
+/// 10: `Execute` gained `po2`: the host measures a risc0 job at the segment size of each card that
+/// may prove it, and a job proof runs at its card's size, within [`RISC0_JOB_PO2_MIN`]..=
+/// [`RISC0_JOB_PO2_MAX`]. A v9 worker would measure every job at 20 whatever the host asked.
+pub const PROTOCOL_VERSION: u32 = 10;
+
+/// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
+///
+/// A guest can tell the size it runs at: every split leaves the pc it suspended at in memory the guest
+/// can read (its own kernel, or a copy through the sha ecall). So a measurement at one size says
+/// nothing about a proof at another, where one that measured clean could exit, or commit, otherwise.
+/// The host therefore measures a job at the size of every card that may prove it, and a card proves it
+/// at its own size; neither side leaves the size to the SDK (which picks 21 on a 32 GB card).
+pub const RISC0_DEFAULT_JOB_PO2: u8 = 20;
+
+/// The smallest segment size a risc0 job is measured or proven at. Below 16 the executor's segments
+/// hold little but their own overhead: at 15 a segment must split 25,000 cycles early to leave room
+/// for the longest instruction (a bigint2 ecall), leaving ~11% of it for the guest, and at 14 an
+/// instruction over 2,000 cycles past ~14,400 fails the execution outright. A job measured there would
+/// size every job far heavier than its other cards prove it, or refuse honest ones.
+pub const RISC0_JOB_PO2_MIN: u8 = 16;
+
+/// The largest segment size a risc0 job is measured or proven at: risc0's `DEFAULT_MAX_PO2`. The
+/// Groth16 prover refuses a larger segment ("segment po2 exceeds max on ProverOpts") although the
+/// executor runs it, so a job measured above it would fail every proof after its claim.
+pub const RISC0_JOB_PO2_MAX: u8 = 22;
+
+/// The longest journal an `ExecuteResult` carries. The router refuses a longer one on every fulfil
+/// path (`MAX_JOURNAL_BYTES`, `JournalTooLarge`), so a longer journal is reported by its length alone.
+pub const EXECUTE_JOURNAL_MAX_BYTES: usize = 32 * 1024;
 
 /// Maximum frame size: 256 MB (accommodates large risc0 composite receipts).
 pub const MAX_FRAME_SIZE: u32 = 256 * 1024 * 1024;
@@ -37,9 +80,17 @@ pub enum WorkerCommand {
         request_id: u64,
         elf: Vec<u8>,
         input_data: Vec<u8>,
-        /// Segment limit as log2 of rows. None = use SDK default.
+        /// Segment limit as log2 of rows. None = [`RISC0_DEFAULT_JOB_PO2`].
         /// Only meaningful for risc0; other backends accept but ignore.
         po2: Option<u8>,
+        /// The job's on-chain `programId` (32 bytes), if the host knows it. For risc0 this is the
+        /// guest image id, so the worker refuses to prove an ELF whose computed image id does not
+        /// match (a submitter who serves bytes unrelated to the registered program can otherwise
+        /// burn a full Groth16 proof + fulfill gas on a proof the on-chain verifier will reject).
+        /// SP1/OpenVM ignore it (for SP1 `programId` is a vkey, not the ELF image). `None` keeps
+        /// the pre-existing behaviour (benchmark/calibration paths, mock worker).
+        #[serde(default)]
+        program_id: Option<[u8; 32]>,
     },
     /// EXECUTE the guest without proving, to measure its true cycle count.
     ///
@@ -53,6 +104,16 @@ pub enum WorkerCommand {
         request_id: u64,
         elf: Vec<u8>,
         input_data: Vec<u8>,
+        /// The job's on-chain `programId` (32 bytes), if known. Same meaning as on `Prove`: the
+        /// risc0 worker refuses to EXECUTE (size) an ELF whose image id does not match, so a
+        /// submitter cannot drive the zero-cost pre-claim measurement path with an ELF unrelated
+        /// to the program they registered. `None` preserves the prior behaviour.
+        #[serde(default)]
+        program_id: Option<[u8; 32]>,
+        /// The segment size to execute at (risc0; other backends ignore it), which must be the size
+        /// the proof will run at. `None` = [`RISC0_DEFAULT_JOB_PO2`].
+        #[serde(default)]
+        po2: Option<u8>,
     },
     /// Cancel an in-flight proof. Worker should abort and send Cancelled or Error.
     Cancel { request_id: u64 },
@@ -113,10 +174,37 @@ pub enum WorkerResponse {
     ExecuteResult {
         request_id: u64,
         /// Total cycles reported by the executor — the same quantity `ProofResult.cycles`
-        /// carries, obtained without proving.
+        /// carries, obtained without proving (risc0: each segment padded to its power of two, not
+        /// the guest's user cycles).
         cycles: u64,
         /// How long the execution itself took, so the caller can bound future ones.
         duration_secs: f64,
+        /// Length in bytes of the guest journal (risc0) / public values (SP1) this
+        /// execution produced. The guest commits it deterministically from (ELF, input) — the same
+        /// bytes the later proof would carry as `ProofResult.journal` — so the host can pre-screen a
+        /// program whose journal alone would OOG-revert fulfillJob and refuse to CLAIM it, instead of
+        /// discovering it only after wasting a full proof. `#[serde(default)]` keeps an older worker
+        /// (which omits the field) interoperable: it decodes as 0, i.e. "unknown, do not screen".
+        #[serde(default)]
+        journal_len: u64,
+        /// Peak RESIDENT host memory (bytes) this measurement's executor child reached — anon plus the
+        /// /dev/shm-mapped guest image. The measure worker is server-less, so this is the execute
+        /// phase's footprint IN ISOLATION; the host reserves it PLUS the warm `sp1-gpu-server`'s
+        /// resident when deciding whether a claimed job is provable-without-OOM (the prove-time
+        /// execute stacks on the resident server). A v6 worker always sets it: the measured peak on
+        /// native x86-64 Linux, else 0 ("unknown" — the portable executor has no such child), and the
+        /// host treats 0 as do-not-gate. `#[serde(default)]` is only a same-version safety net; it does
+        /// NOT give wire back-compat to a v5 worker (bincode is positional) — the `PROTOCOL_VERSION`
+        /// bump to 6 rejects a mismatched worker at the handshake instead.
+        #[serde(default)]
+        peak_host_bytes: u64,
+        /// The journal itself (the same bytes as `journal_len` counts), so the host can check the
+        /// job's `expectedJournalHash` / `journalFields` binding before claiming. `None` when the
+        /// journal is longer than [`EXECUTE_JOURNAL_MAX_BYTES`] (no fulfil could carry it) or the
+        /// worker cannot vouch that a proof would commit the same bytes; the host then claims no
+        /// journal-bound job on this measurement. `Some(vec![])` is a guest that committed nothing.
+        #[serde(default)]
+        journal: Option<Vec<u8>>,
     },
     /// Progress update during proving.
     Progress {
@@ -162,6 +250,14 @@ pub enum ErrorKind {
     ProofFailed,
     /// Invalid input data or ELF.
     InvalidInput,
+    /// The served ELF's verifying key / image id cannot match the job's on-chain `programId`, so NO
+    /// job for this program can ever produce an accepted proof. Distinct from `InvalidInput` (which is
+    /// per-job) because it is PERMANENT per program: the host negative-caches the program on it so it
+    /// stops claiming every future job the program submits, capping the loss to the one claim wave
+    /// already in flight when its first prove faults instead of one release penalty per job. SP1 cannot
+    /// check this before claiming (deriving the vkey needs the
+    /// minutes-long `setup`), so it is only proven on the prove path and reported with this kind.
+    ProgramMismatch,
     /// Ran out of memory or other system resources.
     ResourceExhausted,
     /// Protocol violation (unexpected message, version mismatch).
@@ -169,6 +265,15 @@ pub enum ErrorKind {
     /// Catch-all for internal errors.
     Internal,
 }
+/// The exit code of a worker whose proving server is gone, or whose connection to it is unusable.
+///
+/// The SP1 SDK keeps one connection to the `sp1-gpu-server` it starts and never reconnects, so a
+/// worker that loses it can prove nothing more, and it exits for the dispatcher to replace it. Its
+/// server may have been killed by the host running out of memory, which the worker cannot tell, so
+/// the dispatcher reads this code as it reads a worker's own SIGKILL (see
+/// `WorkerHandle::died_of_host_oom`). 75 is `EX_TEMPFAIL`: another worker may well succeed.
+pub const WORKER_EXIT_SERVER_LOST: i32 = 75;
+
 /// Bytes of HOST memory a worker is allowed to use, as the dispatcher sees it.
 ///
 /// A worker cannot work this out for itself: the ceiling is the host's RAM minus the slice reserved
@@ -201,7 +306,7 @@ const MIB: u64 = 1024 * 1024;
 
 /// Measured `(element threshold, peak VRAM)` for SP1, largest first.
 ///
-/// Both figures measured on this box on 2026-10-05 with a 1,912,954,963-cycle `sha256-chain` proof
+/// Both figures measured on this box with a 1,912,954,963-cycle `sha256-chain` proof
 /// through to a compact Groth16 seal: 17,766 MiB of a 24,564 MiB RTX 4090 at the 268M threshold, and
 /// 15,092 MiB of a 16,303 MiB RTX 5080 at 134M.
 ///
@@ -252,6 +357,13 @@ pub const SP1_ELEMENT_THRESHOLD_ENV: &str = "SP1_GPU_ELEMENT_THRESHOLD";
 /// Set to disable the SP1 worker's host-memory tuning, for bisecting a proving failure against stock
 /// SDK behaviour.
 pub const SP1_NO_AUTOTUNE_ENV: &str = "ZKMINER_SP1_NO_AUTOTUNE";
+
+/// Set to `1` to run an SP1 worker in MEASURE-ONLY mode: it answers Hello without the GPU usability
+/// probe (cycle sizing is pure CPU emulation, so GPU usability is irrelevant) and HARD-REFUSES every
+/// `Prove`/`Benchmark` so it can never build the `CudaProver` / fork `sp1-gpu-server`. The dispatcher
+/// runs one such server-less worker as the dedicated cycle-measurement slot, so a measure wall-clock
+/// watchdog SIGKILL (which group-kills the worker) can never tear down a proving worker's warm server.
+pub const SP1_MEASURE_ONLY_ENV: &str = "ZKMINER_SP1_MEASURE_ONLY";
 
 /// Set to `0` to stop the SP1 worker installing the `sp1-gpu-server` shipped beside it over
 /// `~/.sp1/bin/sp1-gpu-server`. Shared because the dispatcher has to know which of the two servers
@@ -394,9 +506,9 @@ pub fn sp1_vram_required_for_threshold(threshold: u64) -> Option<u64> {
 ///
 /// Derived from [`SP1_MEASURED_TIERS`] rather than written down separately, so this and
 /// [`sp1_element_threshold_for_available_vram`] cannot disagree about whether a card is usable. Two
-/// independent constants did disagree in the first draft — the floor admitted a card by ~350 MiB that
-/// the tier function then had no configuration for, which would have refused the work one layer later
-/// after the worker was already spawned.
+/// independent constants could disagree — a floor that admitted a card by ~350 MiB the tier function
+/// then had no configuration for would refuse the work one layer later, after the worker was already
+/// spawned.
 pub fn sp1_min_available_vram_bytes() -> u64 {
     SP1_MEASURED_TIERS
         .last()
@@ -487,6 +599,99 @@ impl std::fmt::Display for HostMemoryShortage {
 }
 
 impl std::error::Error for HostMemoryShortage {}
+
+/// Every worker/measure slot for a backend was BUSY (or down-and-not-revivable) when a cycle
+/// measurement tried to run, so nothing was attempted.
+///
+/// Typed for the same reason as `HostMemoryShortage`: the caller (the measure path) must not mistake
+/// pure scheduling contention for a bad program. It is TRANSIENT — no guest executed, so the
+/// (program, input) must not be struck or negative-cached; the next tick retries when a slot frees.
+#[derive(Debug, Clone)]
+pub struct MeasureSlotsBusy {
+    /// The backend whose measure/worker slots were all busy, e.g. `sp1`.
+    pub backend: String,
+    /// How many candidate slots were checked and found busy/unrevivable.
+    pub slots: usize,
+}
+
+impl std::fmt::Display for MeasureSlotsBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "all {} '{}' measure/worker slot(s) busy, or down and not revivable; skipping cycle \
+             measurement (transient)",
+            self.slots, self.backend,
+        )
+    }
+}
+
+impl std::error::Error for MeasureSlotsBusy {}
+
+/// A cycle measurement's wall-clock watchdog SIGKILLed the worker because the guest did not finish
+/// within the measure budget.
+///
+/// Typed on purpose (finding RH-round2/4): the measure path treats a genuine wall-clock timeout as
+/// POSSIBLY transient (a feasible guest can miss the budget under transient host load) and gives it a
+/// retry TTL rather than a permanent blacklist. That leniency MUST be driven by a dispatcher-generated
+/// signal — the watchdog's `intentional_kill` — NOT by substring-matching the error text, because a
+/// `WorkerResponse::Error` message carries guest-controlled bytes: a guest could panic with the phrase
+/// "wall-clock watchdog" and forge the TTL, re-opening the perpetual re-measurement DoS the permanent
+/// negative-cache exists to stop. Only the dispatcher's watchdog path constructs this error, so a
+/// `downcast_ref` to it is an unforgeable "this was a real timeout" signal. Everything else — a guest
+/// panic/trap, an image-id/vkey mismatch, a cap trip — stays permanent.
+#[derive(Debug, Clone)]
+pub struct MeasureWallClockTimeout {
+    /// The slot whose worker the watchdog killed, e.g. `sp1:measure:0`.
+    pub slot_key: String,
+}
+
+impl std::fmt::Display for MeasureWallClockTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cycle measurement timed out on {}: the guest did not finish within the measure budget \
+             (wall-clock watchdog) — may be transient host load",
+            self.slot_key,
+        )
+    }
+}
+
+impl std::error::Error for MeasureWallClockTimeout {}
+
+/// A committed (claimed) proof reclaimed this in-flight pre-claim MEASUREMENT's resources by killing
+/// its throwaway measure worker (dispatcher `preempt_measures_for_host` / `preempt_measures_for_shm`).
+///
+/// Typed, and TRANSIENT, for the same reason as `MeasureSlotsBusy`: nothing about the (program, input)
+/// failed — the measurement was healthy and simply YIELDED to a bonded job on the marginal box where a
+/// ~12 GiB measure and an ~18 GiB prove cannot co-fit (host-RAM and, on x86_64, `/dev/shm`). A
+/// measurement is speculative work with no collateral; a claimed proof is bonded and on a deadline, so
+/// giving the proof priority is the correct resolution of that contention (finding RH-round3 residual
+/// A — the "give the committed prove priority over the speculative measure" proper fix). The caller
+/// MUST treat it exactly like `MeasureSlotsBusy`: NO strike, NO negative-cache, NO retry TTL — just
+/// re-measure on a later tick once the proof has freed the resources.
+///
+/// Dispatcher-only and unforgeable: only the preemption path constructs it, never a
+/// `WorkerResponse::Error` carrying guest-controlled text, so a `downcast_ref` to it cannot be forged
+/// by a hostile guest to win the lenient transient treatment.
+#[derive(Debug, Clone)]
+pub struct MeasurePreempted {
+    /// The measure slot whose worker a claimed proof killed to reclaim its resources, e.g.
+    /// `sp1:measure:0`.
+    pub slot_key: String,
+}
+
+impl std::fmt::Display for MeasurePreempted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cycle measurement on {} was preempted to free resources for a claimed proof (transient) \
+             — it will be re-measured on a later tick",
+            self.slot_key,
+        )
+    }
+}
+
+impl std::error::Error for MeasurePreempted {}
 
 /// Not enough of this card's VRAM is free for this backend to be given work on it.
 ///
@@ -659,6 +864,12 @@ impl WorkerProofError {
     pub fn is_invalid(&self) -> bool {
         matches!(self.kind, ErrorKind::InvalidInput)
     }
+
+    /// Did the served ELF's verifying key / image id fail to match the job's `programId`? Then no job
+    /// for this program can ever be proved: the caller should stop claiming the program, not retry.
+    pub fn is_program_mismatch(&self) -> bool {
+        matches!(self.kind, ErrorKind::ProgramMismatch)
+    }
 }
 
 impl std::fmt::Display for WorkerProofError {
@@ -674,7 +885,7 @@ impl std::fmt::Display for WorkerProofError {
 impl std::error::Error for WorkerProofError {}
 
 /// True if a worker error message indicates a GPU out-of-memory / device
-/// allocation failure (CUDA or HIP/ROCm). Workers use this to tag such errors as
+/// allocation failure (CUDA, HIP/ROCm or Level Zero/SYCL). Workers use this to tag such errors as
 /// [`ErrorKind::ResourceExhausted`] so the dispatcher kills + respawns the worker
 /// with a clean GPU context instead of reusing a wedged one. Match is
 /// case-insensitive and covers the phrasings seen from the risc0/sp1 GPU stacks
@@ -690,6 +901,10 @@ pub fn is_gpu_oom(message: &str) -> bool {
         || m.contains("hip_error_out_of_memory")
         || m.contains("cudamalloc")
         || m.contains("hsa_status_error_out_of_resources")
+        // Level Zero and SYCL's Unified Runtime: ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY,
+        // UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ("Native API returns: 39"), and SYCL's own wording.
+        || m.contains("out_of_device_memory")
+        || m.contains("out of device memory")
 }
 
 /// A single benchmark measurement from a worker.
@@ -856,8 +1071,8 @@ mod tests {
 
     /// These messages are operator-facing and go to a one-line log sink, so a wrapped literal must be
     /// continued with `\` rather than left to carry its own indentation. `cargo fmt` collapses the
-    /// literal onto one physical line and the leading spaces survive into the output, which is how
-    /// this shipped the first time: "more than              the 512 MiB".
+    /// literal onto one physical line and the leading spaces survive into the output, e.g.
+    /// "more than              the 512 MiB".
     #[test]
     fn shortage_messages_render_as_one_clean_line() {
         const MIB: u64 = 1024 * 1024;
@@ -990,6 +1205,12 @@ mod tests {
         assert!(is_gpu_oom("CUDA_ERROR_OUT_OF_MEMORY"));
         assert!(is_gpu_oom("hipErrorOutOfMemory"));
         assert!(is_gpu_oom("cudaMalloc failed"));
+        assert!(is_gpu_oom(
+            "Native API failed. Native API returns: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)"
+        ));
+        assert!(is_gpu_oom(
+            "zeMemAllocDevice: ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY"
+        ));
         // Non-OOM proof failures must NOT be misclassified as ResourceExhausted.
         assert!(!is_gpu_oom(
             "Proof verification FAILED — SP1 proof is invalid"
@@ -1005,6 +1226,7 @@ mod tests {
             elf: vec![1, 2, 3],
             input_data: vec![4, 5, 6],
             po2: Some(20),
+            program_id: Some([7u8; 32]),
         };
         let bytes = bincode::serialize(&cmd).unwrap();
         let decoded: WorkerCommand = bincode::deserialize(&bytes).unwrap();
@@ -1014,13 +1236,40 @@ mod tests {
                 elf,
                 input_data,
                 po2,
+                program_id,
             } => {
                 assert_eq!(request_id, 42);
                 assert_eq!(elf, vec![1, 2, 3]);
                 assert_eq!(input_data, vec![4, 5, 6]);
                 assert_eq!(po2, Some(20));
+                assert_eq!(program_id, Some([7u8; 32]));
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn execute_carries_the_segment_size_to_measure_at() {
+        for po2 in [None, Some(RISC0_JOB_PO2_MIN), Some(19)] {
+            let cmd = WorkerCommand::Execute {
+                request_id: 7,
+                elf: vec![1],
+                input_data: vec![2],
+                program_id: Some([3u8; 32]),
+                po2,
+            };
+            let bytes = bincode::serialize(&cmd).unwrap();
+            match bincode::deserialize::<WorkerCommand>(&bytes).unwrap() {
+                WorkerCommand::Execute {
+                    po2: got,
+                    program_id,
+                    ..
+                } => {
+                    assert_eq!(got, po2);
+                    assert_eq!(program_id, Some([3u8; 32]));
+                }
+                _ => panic!("wrong variant"),
+            }
         }
     }
 
@@ -1048,5 +1297,27 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// `MeasurePreempted` is a real `std::error::Error`, names its slot, says "transient", and is a
+    /// DISTINCT type from the other transient/timeout measure errors — so the measure path can
+    /// downcast it specifically and treat it like `MeasureSlotsBusy` (no strike, no TTL).
+    #[test]
+    fn measure_preempted_is_a_typed_transient() {
+        let e = MeasurePreempted {
+            slot_key: "sp1:measure:0".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("sp1:measure:0"), "names the slot: {msg}");
+        assert!(msg.contains("transient"), "flagged transient: {msg}");
+
+        // Boxed as a trait object, it downcasts to itself and NOT to the sibling measure errors — the
+        // unforgeable-type property the measure path relies on.
+        let boxed: Box<dyn std::error::Error> = Box::new(MeasurePreempted {
+            slot_key: "sp1:measure:1".to_string(),
+        });
+        assert!(boxed.downcast_ref::<MeasurePreempted>().is_some());
+        assert!(boxed.downcast_ref::<MeasureSlotsBusy>().is_none());
+        assert!(boxed.downcast_ref::<MeasureWallClockTimeout>().is_none());
     }
 }

@@ -189,60 +189,6 @@
   },
   {
     "type": "function",
-    "name": "auditRecords",
-    "inputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "proofSystemId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "programId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "expectedCycles",
-        "type": "uint64",
-        "internalType": "uint64"
-      },
-      {
-        "name": "reportedCycles",
-        "type": "uint64",
-        "internalType": "uint64"
-      },
-      {
-        "name": "cycleCollateral",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "prover",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "fulfilledAt",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "proverReceivedBonus",
-        "type": "bool",
-        "internalType": "bool"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "batchCycleCommittee",
     "inputs": [],
     "outputs": [
@@ -250,89 +196,6 @@
         "name": "",
         "type": "address",
         "internalType": "address"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "bidConfigs",
-    "inputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "underbidWindow",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "maxBiddingDuration",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "maxBidExtension",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "minBidDecrement",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "bidExtensionCurveType",
-        "type": "uint8",
-        "internalType": "uint8"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "bidStates",
-    "inputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "currentBidder",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "biddingOperator",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "currentBid",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "bidDeadline",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "firstBidTime",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "softLockedCollateral",
-        "type": "uint96",
-        "internalType": "uint96"
       }
     ],
     "stateMutability": "view"
@@ -391,60 +254,6 @@
   },
   {
     "type": "function",
-    "name": "cycleConfigs",
-    "inputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "expectedCycles",
-        "type": "uint64",
-        "internalType": "uint64"
-      },
-      {
-        "name": "cycleCommitCollateral",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "snapshotMode",
-        "type": "uint8",
-        "internalType": "enum CycleAttestationMode"
-      },
-      {
-        "name": "snapshotToleranceBps",
-        "type": "uint16",
-        "internalType": "uint16"
-      },
-      {
-        "name": "snapshotFullBonusOvershootBps",
-        "type": "uint16",
-        "internalType": "uint16"
-      },
-      {
-        "name": "snapshotUndershootPenaltyBps",
-        "type": "uint16",
-        "internalType": "uint16"
-      },
-      {
-        "name": "snapshotFullPenaltyUndershootBps",
-        "type": "uint16",
-        "internalType": "uint16"
-      },
-      {
-        "name": "snapshotResolverRewardBps",
-        "type": "uint16",
-        "internalType": "uint16"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "cycleFallbackToSelfVerified",
     "inputs": [],
     "outputs": [
@@ -458,50 +267,7 @@
   },
   {
     "type": "function",
-    "name": "eip712Domain",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "fields",
-        "type": "bytes1",
-        "internalType": "bytes1"
-      },
-      {
-        "name": "name",
-        "type": "string",
-        "internalType": "string"
-      },
-      {
-        "name": "version",
-        "type": "string",
-        "internalType": "string"
-      },
-      {
-        "name": "chainId",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "verifyingContract",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "salt",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "extensions",
-        "type": "uint256[]",
-        "internalType": "uint256[]"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "extendDeadlinesForDowntime",
+    "name": "extendLocksForDowntime",
     "inputs": [
       {
         "name": "jobIds",
@@ -509,7 +275,22 @@
         "internalType": "bytes32[]"
       },
       {
-        "name": "extension",
+        "name": "expectedProvers",
+        "type": "address[]",
+        "internalType": "address[]"
+      },
+      {
+        "name": "expectedLockDeadlines",
+        "type": "uint40[]",
+        "internalType": "uint40[]"
+      },
+      {
+        "name": "downtimeStart",
+        "type": "uint40",
+        "internalType": "uint40"
+      },
+      {
+        "name": "downtimeEnd",
         "type": "uint40",
         "internalType": "uint40"
       },
@@ -519,7 +300,13 @@
         "internalType": "string"
       }
     ],
-    "outputs": [],
+    "outputs": [
+      {
+        "name": "applied",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
     "stateMutability": "nonpayable"
   },
   {
@@ -531,6 +318,25 @@
         "name": "",
         "type": "address",
         "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "isFormerBurnDestination",
+    "inputs": [
+      {
+        "name": "addr",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
       }
     ],
     "stateMutability": "view"
@@ -626,165 +432,16 @@
   },
   {
     "type": "function",
-    "name": "jobs",
+    "name": "markFormerBurnDestination",
     "inputs": [
       {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "caller",
+        "name": "addr",
         "type": "address",
         "internalType": "address"
-      },
-      {
-        "name": "status",
-        "type": "uint8",
-        "internalType": "uint8"
-      },
-      {
-        "name": "reopenCount",
-        "type": "uint8",
-        "internalType": "uint8"
-      },
-      {
-        "name": "jobIndex",
-        "type": "uint48",
-        "internalType": "uint48"
-      },
-      {
-        "name": "descriptorHash",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "depositedAmount",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "bonusAmount",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "lockDeadline",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "prover",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "lockedCollateral",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "rampUpStart",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "elapsedAtLock",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "settledPrice",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "callbackGasLimit",
-        "type": "uint32",
-        "internalType": "uint32"
-      },
-      {
-        "name": "operatorRejections",
-        "type": "uint8",
-        "internalType": "uint8"
-      },
-      {
-        "name": "minPrice",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "maxPrice",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "rampUpPeriod",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "curveType",
-        "type": "uint8",
-        "internalType": "uint8"
-      },
-      {
-        "name": "fulfillmentTimeout",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "lockCollateralBps",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "speedPremium",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "claimingOperator",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "exclusivityDuration",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "callbackRejections",
-        "type": "uint8",
-        "internalType": "uint8"
-      },
-      {
-        "name": "lastReopenTimestamp",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "excludeFromEwma",
-        "type": "bool",
-        "internalType": "bool"
       }
     ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "localPauseTimestamp",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "",
-        "type": "uint40",
-        "internalType": "uint40"
-      }
-    ],
-    "stateMutability": "view"
+    "outputs": [],
+    "stateMutability": "nonpayable"
   },
   {
     "type": "function",
@@ -793,40 +450,6 @@
     "outputs": [
       {
         "name": "",
-        "type": "uint128",
-        "internalType": "uint128"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "operatorAuthorizations",
-    "inputs": [
-      {
-        "name": "",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "permissionBitmap",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "authorizationNonce",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "maxLockedCollateral",
         "type": "uint128",
         "internalType": "uint128"
       }
@@ -927,75 +550,6 @@
   },
   {
     "type": "function",
-    "name": "pendingCycleSettlements",
-    "inputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "caller",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "cycleCollateral",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "prover",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "expectedCycles",
-        "type": "uint64",
-        "internalType": "uint64"
-      },
-      {
-        "name": "toleranceBps",
-        "type": "uint16",
-        "internalType": "uint16"
-      },
-      {
-        "name": "undershootPenaltyBps",
-        "type": "uint16",
-        "internalType": "uint16"
-      },
-      {
-        "name": "committee",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "fulfilledAt",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "fullBonusOvershootBps",
-        "type": "uint16",
-        "internalType": "uint16"
-      },
-      {
-        "name": "fullPenaltyUndershootBps",
-        "type": "uint16",
-        "internalType": "uint16"
-      },
-      {
-        "name": "resolverRewardBps",
-        "type": "uint16",
-        "internalType": "uint16"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "pendingOwner",
     "inputs": [],
     "outputs": [
@@ -1003,114 +557,6 @@
         "name": "",
         "type": "address",
         "internalType": "address"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "presets",
-    "inputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "minPrice",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "maxPrice",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "rampUpPeriod",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "curveType",
-        "type": "uint8",
-        "internalType": "uint8"
-      },
-      {
-        "name": "fulfillmentTimeout",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "lockCollateralBps",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "speedPremium",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "exclusivityDuration",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "callbackGasLimit",
-        "type": "uint32",
-        "internalType": "uint32"
-      },
-      {
-        "name": "excludeFromEwma",
-        "type": "bool",
-        "internalType": "bool"
-      },
-      {
-        "name": "laxCallbackMode",
-        "type": "bool",
-        "internalType": "bool"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "priceHistories",
-    "inputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "lastSettledPrice",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "ewmaPrice",
-        "type": "uint96",
-        "internalType": "uint96"
-      },
-      {
-        "name": "lastUpdated",
-        "type": "uint40",
-        "internalType": "uint40"
-      },
-      {
-        "name": "sampleCount",
-        "type": "uint24",
-        "internalType": "uint24"
       }
     ],
     "stateMutability": "view"
@@ -1618,6 +1064,19 @@
   },
   {
     "type": "function",
+    "name": "syncRegistryWindow",
+    "inputs": [
+      {
+        "name": "key",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "totalExtensionApplied",
     "inputs": [
       {
@@ -1835,37 +1294,6 @@
   },
   {
     "type": "event",
-    "name": "BidForfeited",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "bidder",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "forfeitedCollateral",
-        "type": "uint96",
-        "indexed": false,
-        "internalType": "uint96"
-      },
-      {
-        "name": "newBonusAmount",
-        "type": "uint96",
-        "indexed": false,
-        "internalType": "uint96"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
     "name": "BidInvalidated",
     "inputs": [
       {
@@ -2022,112 +1450,6 @@
   {
     "type": "event",
     "name": "CallbackFailed",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "callbackContract",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "reason",
-        "type": "bytes",
-        "indexed": false,
-        "internalType": "bytes"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "CallbackForceAccepted",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "callbackContract",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "totalRejections",
-        "type": "uint8",
-        "indexed": false,
-        "internalType": "uint8"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "CallbackForceAcceptedSplit",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "callbackContract",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "proverShare",
-        "type": "uint96",
-        "indexed": false,
-        "internalType": "uint96"
-      },
-      {
-        "name": "callerRefundExtra",
-        "type": "uint96",
-        "indexed": false,
-        "internalType": "uint96"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "CallbackRejected",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "callbackContract",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "rejectionCount",
-        "type": "uint8",
-        "indexed": false,
-        "internalType": "uint8"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "CallbackRevertAccepted",
     "inputs": [
       {
         "name": "jobId",
@@ -2475,13 +1797,13 @@
   },
   {
     "type": "event",
-    "name": "DeadlinesExtended",
+    "name": "DeadlineExtended",
     "inputs": [
       {
-        "name": "jobIds",
-        "type": "bytes32[]",
-        "indexed": false,
-        "internalType": "bytes32[]"
+        "name": "jobId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
       },
       {
         "name": "extension",
@@ -2490,18 +1812,62 @@
         "internalType": "uint40"
       },
       {
-        "name": "reason",
-        "type": "string",
+        "name": "lockDeadline",
+        "type": "uint40",
         "indexed": false,
-        "internalType": "string"
+        "internalType": "uint40"
       }
     ],
     "anonymous": false
   },
   {
     "type": "event",
-    "name": "EIP712DomainChanged",
-    "inputs": [],
+    "name": "DeadlineExtensionSkipped",
+    "inputs": [
+      {
+        "name": "jobId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "reason",
+        "type": "uint8",
+        "indexed": false,
+        "internalType": "uint8"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "DowntimeCredited",
+    "inputs": [
+      {
+        "name": "downtimeStart",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "downtimeEnd",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "applied",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "reason",
+        "type": "string",
+        "indexed": false,
+        "internalType": "string"
+      }
+    ],
     "anonymous": false
   },
   {
@@ -2544,6 +1910,38 @@
         "type": "uint16",
         "indexed": false,
         "internalType": "uint16"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "FirstPauseMarked",
+    "inputs": [
+      {
+        "name": "firstPauseA",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "firstPauseR",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "FormerBurnDestinationRegistered",
+    "inputs": [
+      {
+        "name": "burnDestination",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
       }
     ],
     "anonymous": false
@@ -2690,10 +2088,10 @@
         "internalType": "uint256"
       },
       {
-        "name": "bonusIncluded",
-        "type": "bool",
+        "name": "bonusBurned",
+        "type": "uint256",
         "indexed": false,
-        "internalType": "bool"
+        "internalType": "uint256"
       }
     ],
     "anonymous": false
@@ -3030,6 +2428,80 @@
   },
   {
     "type": "event",
+    "name": "KeyClockSet",
+    "inputs": [
+      {
+        "name": "key",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "active",
+        "type": "bool",
+        "indexed": false,
+        "internalType": "bool"
+      },
+      {
+        "name": "a",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "t",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "c",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "epoch",
+        "type": "uint24",
+        "indexed": false,
+        "internalType": "uint24"
+      },
+      {
+        "name": "prevEnd",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "KeyEpochCut",
+    "inputs": [
+      {
+        "name": "routerBase",
+        "type": "bool",
+        "indexed": false,
+        "internalType": "bool"
+      },
+      {
+        "name": "epoch",
+        "type": "uint24",
+        "indexed": false,
+        "internalType": "uint24"
+      },
+      {
+        "name": "firstPause",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "MaxEwmaBootstrapPriceUpdated",
     "inputs": [
       {
@@ -3289,6 +2761,25 @@
   },
   {
     "type": "event",
+    "name": "PauseClockSet",
+    "inputs": [
+      {
+        "name": "anchor",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "total",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "Paused",
     "inputs": [
       {
@@ -3522,31 +3013,6 @@
   },
   {
     "type": "event",
-    "name": "SlashClaimFulfillPartialRevert",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      },
-      {
-        "name": "prover",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "reason",
-        "type": "bytes",
-        "indexed": false,
-        "internalType": "bytes"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
     "name": "SlashExecutedCancelDeferred",
     "inputs": [
       {
@@ -3579,6 +3045,31 @@
   },
   {
     "type": "event",
+    "name": "UnionClockSet",
+    "inputs": [
+      {
+        "name": "anchor",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "total",
+        "type": "uint40",
+        "indexed": false,
+        "internalType": "uint40"
+      },
+      {
+        "name": "registryPaused",
+        "type": "bool",
+        "indexed": false,
+        "internalType": "bool"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "Unpaused",
     "inputs": [
       {
@@ -3592,6 +3083,22 @@
   },
   {
     "type": "error",
+    "name": "ArrayLengthMismatch",
+    "inputs": [
+      {
+        "name": "expected",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "actual",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "EnforcedPause",
     "inputs": []
   },
@@ -3599,6 +3106,17 @@
     "type": "error",
     "name": "ExpectedPause",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ImplementationHasNoCode",
+    "inputs": [
+      {
+        "name": "implementation",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
   },
   {
     "type": "error",
@@ -3624,12 +3142,38 @@
   },
   {
     "type": "error",
+    "name": "InvalidConfig",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "InvalidCurveType",
     "inputs": [
       {
         "name": "curveType",
         "type": "uint8",
         "internalType": "uint8"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "InvalidDowntimeWindow",
+    "inputs": [
+      {
+        "name": "downtimeStart",
+        "type": "uint40",
+        "internalType": "uint40"
+      },
+      {
+        "name": "downtimeEnd",
+        "type": "uint40",
+        "internalType": "uint40"
+      },
+      {
+        "name": "pauseStart",
+        "type": "uint40",
+        "internalType": "uint40"
       }
     ]
   },
@@ -3678,6 +3222,22 @@
   },
   {
     "type": "error",
+    "name": "InvalidSpeedPremium",
+    "inputs": [
+      {
+        "name": "speedPremium",
+        "type": "uint96",
+        "internalType": "uint96"
+      },
+      {
+        "name": "maxPrice",
+        "type": "uint96",
+        "internalType": "uint96"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "MaxBatchSizeExceeded",
     "inputs": [
       {
@@ -3717,6 +3277,17 @@
     "type": "error",
     "name": "NotInitializing",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotRegistry",
+    "inputs": [
+      {
+        "name": "caller",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
   },
   {
     "type": "error",
@@ -3802,11 +3373,6 @@
   {
     "type": "error",
     "name": "ZeroAddress",
-    "inputs": []
-  },
-  {
-    "type": "error",
-    "name": "ZeroAmount",
     "inputs": []
   }
 ]

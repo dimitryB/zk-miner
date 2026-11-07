@@ -61,6 +61,7 @@ fn seed_state(state: &mut zkminer_tui::state::MinerState) {
         unstake_amount: 0,
         unstake_request_time: 0,
         deposit_block: 1_000_000,
+        read_block: None,
     });
     state.prover_stats = Some(ProverStatistics {
         jobs_fulfilled: 0,
@@ -460,6 +461,7 @@ async fn miner_brain(state: SharedState) {
                         current_price: job.current_price,
                         bonus_amount: job.info.bonus_amount,
                         speed_premium: job.info.speed_premium,
+                        premium_cap: None,
                         fulfillment_timeout: job.info.fulfillment_timeout,
                         time_remaining: job.info.fulfillment_timeout,
                         estimated_cycles: job.estimated_cycles,
@@ -576,6 +578,7 @@ async fn miner_brain(state: SharedState) {
                             current_price: top_job.current_price,
                             bonus_amount: top_job.info.bonus_amount,
                             speed_premium: top_job.info.speed_premium,
+                            premium_cap: None,
                             fulfillment_timeout: top_job.info.fulfillment_timeout,
                             time_remaining: top_job.info.fulfillment_timeout,
                             estimated_cycles: top_job.estimated_cycles,

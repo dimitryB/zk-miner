@@ -47,6 +47,10 @@ pub struct JobParams {
     pub bonus_amount: u128,
     /// Speed premium available.
     pub speed_premium: u128,
+    /// `getPremiumCap(jobId)`: the most of the speed premium a fulfil can still earn. Each release
+    /// lowers it and a slash zeroes it; the router pays `max(0, earned - (speed_premium - cap))`.
+    /// `None` = the full premium (a job never reopened).
+    pub premium_cap: Option<u128>,
     /// Fulfillment timeout in seconds.
     pub fulfillment_timeout: u64,
     /// Seconds remaining until deadline (after claim).
@@ -84,6 +88,7 @@ impl Default for JobParams {
             current_price: 10_000_000_000_000_000_000, // 10 HEMI (1e19)
             bonus_amount: 0,
             speed_premium: 0,
+            premium_cap: None,
             fulfillment_timeout: 3600,
             time_remaining: 3600,                              // 1 hour
             estimated_cycles: 10_000_000,                      // 10M cycles
@@ -199,17 +204,23 @@ pub fn evaluate_job(
             .time_remaining
             .saturating_sub(estimated_duration.as_secs());
         // Use checked_mul to prevent u128 overflow
-        job.speed_premium
+        let earned = job
+            .speed_premium
             .checked_mul(time_left_after_proving as u128)
             .map(|v| v / job.fulfillment_timeout as u128)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        // A reopened job's premium is capped (HemiProveBase._cappedSpeedBonus).
+        let forfeited = job
+            .premium_cap
+            .map_or(0, |cap| job.speed_premium.saturating_sub(cap));
+        earned.saturating_sub(forfeited)
     } else {
         0
     };
 
     let total_gross = gross_reward + speed_bonus;
-    // Protocol fee is on current_price only (matching Solidity contract)
-    let protocol_fee = job.current_price * job.fee_rate_bps as u128 / 10000;
+    // The router's fee is on the settled price plus the speed bonus (HemiProveFulfill).
+    let protocol_fee = (job.current_price + speed_bonus) * job.fee_rate_bps as u128 / 10000;
     let net_reward_tokens = total_gross - protocol_fee;
 
     // Convert to USD
@@ -483,6 +494,85 @@ mod tests {
             "expected Skip(profit), got {:?}",
             eval.recommendation
         );
+    }
+
+    #[test]
+    fn a_reopened_jobs_premium_is_capped_and_the_fee_covers_the_bonus() {
+        let suite = real_suite(1_000_000.0);
+        let cost = CostParams::default();
+        let hemi = 1_000_000_000_000_000_000u128;
+        let job = JobParams {
+            throughput: 1_000_000.0,
+            estimated_cycles: 10_000_000,
+            current_price: 10 * hemi,
+            speed_premium: 10 * hemi,
+            fee_rate_bps: 1000,
+            ..Default::default()
+        };
+        let profit = |premium_cap| {
+            evaluate_job(
+                &suite,
+                &cost,
+                &JobParams {
+                    premium_cap,
+                    ..job.clone()
+                },
+                0.0,
+                1.5,
+            )
+            .estimated_profit_hemi_per_day
+        };
+        let full = profit(None);
+        assert_eq!(
+            profit(Some(10 * hemi)),
+            full,
+            "a cap at the premium forfeits nothing"
+        );
+        assert!(
+            profit(Some(5 * hemi)) < full,
+            "a lowered cap forfeits part of the bonus"
+        );
+        assert!(
+            profit(Some(0)) < profit(Some(5 * hemi)),
+            "a slashed job's premium is gone"
+        );
+        // The fee is charged on the bonus too: with no cost, 10% of price + bonus.
+        let bonus_only = evaluate_job(&suite, &cost, &job, 0.0, 1.5).estimated_profit_hemi_per_day
+            - evaluate_job(
+                &suite,
+                &cost,
+                &JobParams {
+                    speed_premium: 0,
+                    ..job.clone()
+                },
+                0.0,
+                1.5,
+            )
+            .estimated_profit_hemi_per_day;
+        let no_fee = evaluate_job(
+            &suite,
+            &cost,
+            &JobParams {
+                fee_rate_bps: 0,
+                ..job.clone()
+            },
+            0.0,
+            1.5,
+        )
+        .estimated_profit_hemi_per_day
+            - evaluate_job(
+                &suite,
+                &cost,
+                &JobParams {
+                    speed_premium: 0,
+                    fee_rate_bps: 0,
+                    ..job.clone()
+                },
+                0.0,
+                1.5,
+            )
+            .estimated_profit_hemi_per_day;
+        assert!((bonus_only - no_fee * 0.9).abs() < 1e-6 * no_fee.abs().max(1.0));
     }
 
     #[test]

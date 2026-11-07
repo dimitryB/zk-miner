@@ -32,7 +32,6 @@ default = []
 testing = []
 risc0 = ["dep:risc0-zkvm", "dep:risc0-build"]
 sp1 = ["dep:sp1-sdk", "dep:sp1-build"]
-openvm = ["dep:openvm-sdk"]
 
 [dependencies]
 alloy-primitives = { workspace = true }
@@ -56,7 +55,6 @@ libc = "0.2"
 # Optional prover backends
 risc0-zkvm = { version = "3.0", default-features = false, features = ["prove"], optional = true }
 sp1-sdk = { version = "6.0", features = ["blocking"], optional = true }
-openvm-sdk = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.5.0-rc.1", optional = true }
 
 [dev-dependencies]
 # So an integration test can forward the WORKER's own stderr. Without a subscriber the dispatcher's

@@ -477,6 +477,8 @@ fn prove_staged(
         report["image_id"] = json!(image.to_string());
         let mut builder = risc0_zkvm::ExecutorEnv::builder();
         builder.write_slice(input);
+        let image_bytes: [u8; 32] = image.as_bytes().try_into().expect("image ID is 32 bytes");
+        builder.random_seed(super::sys_rand_seed(&super::sys_rand_key(), &image_bytes, input));
         bound_env(&mut builder, po2)?;
         let env = builder.build()?;
         let prover = prover();
