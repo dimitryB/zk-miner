@@ -1,5 +1,30 @@
 # Phase 2: Metal proving performance on macOS
 
+## Upstream final-segment padding r2 — 2026-11-06
+
+The separate `codex/upstream-final-segment-padding-r2` engine branch is based
+on upstream `release-3.0` `54921e770bcb62578d4ffb7a7f70131b611bda2a`.
+Commit `d354733d6efa627d72521eea19482f5b328a7ed0` cherry-picks
+`f9455a5181cb733e45085ee0daf25afe7737eb66`. Its one conflict was the
+append collision in `risc0/circuit/rv32im/src/execute/tests.rs`; the #33
+refusal tests precede the two final-padding tests. The execution-only test
+suite passed 37/37 cases.
+
+A CPU worker sealed against this r2 engine commit produced one complete
+10,003,116-user-cycle arithmetic proof at cap po2 18. The unchanged pinned
+external verifier accepted it and rejected the wrong image, modified journal,
+and corrupt seal. The 44 segment sizes, derived from the worker's total cycles
+and the executor's full-size nonfinal segments, are 43 × po2 18 followed by a
+padded final po2 17. The CPU worker required an explicit 64M guest-cycle
+limit and 1800-second watchdog; its proof took 1562.2 seconds. This Mac lacks
+Apple's `metal` compiler, so the CPU-only build used a recorded placeholder
+for the unused Metal asset while compiling CPU kernels normally. The original
+CPU collector reported failure after the test and external verification passed
+because it expected the retired staging-byte field. The corrected collector
+validated the saved proof without another run. See
+`evidence/upstream-final-segment-padding-r2.json` and the raw run path there.
+The existing PR branches were not changed.
+
 ## Upstream merge after WP6b — 2026-11-06
 
 WP6b was merged into the Phase 2 branches before this sync. The engine merge
