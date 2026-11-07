@@ -119,7 +119,7 @@ def validate_results(attempt, args, expected, fixture):
                 or record.get("elf_sha256") != fixture["elf_sha256"]
                 or record.get("input_sha256") != fixture["input_sha256"]
                 or record.get("po2") != args.po2
-                or record.get("staging_limit_bytes") != args.staging_bytes
+                or record.get("staging_limit_bytes") is not None
                 or record.get("stats", {}).get("segments", 0) < fixture["min_segments"]
                 or verification.get("image_id") != record.get("image_id") or verification.get("verification") != "passed"
                 or verification.get("journal_hex") != fixture["expected_journal_hex"]
