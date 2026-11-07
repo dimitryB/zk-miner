@@ -317,9 +317,10 @@ def main():
                        ZKMINER_RISC0_MODE=args.mode, ZKMINER_MACOS_EXPECT_MODE=expected,
                        ZKMINER_MACOS_REPEAT=str(args.repeat), ZKMINER_MACOS_LIFECYCLE="0" if args.proof_only else "1",
                        ZKMINER_MACOS_FAILURE_TIMEOUT_SECS=str(args.failure_timeout),
-                       ZKMINER_RISC0_METAL_STAGING_BYTES=str(args.staging_bytes), RAYON_NUM_THREADS="6")
+                       RAYON_NUM_THREADS="6")
             binary, test_build = build_acceptance(attempt, env)
-            report["command"] = [str(binary), "--ignored", "--nocapture", "--test-threads=1"]
+            report["command"] = [str(binary), "native_worker_proofs_failure_restart_and_shutdown",
+                                 "--exact", "--ignored", "--nocapture"]
             test_started = time.monotonic()
             with (attempt / "test.log").open("w") as log:
                 proc = subprocess.Popen(report["command"], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
