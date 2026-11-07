@@ -3,6 +3,21 @@
 Re-exported spec SHA-256 (2026-11-07):
 `9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1`.
 
+## Upstream padding PR #30 — ready for review, 2026-11-07
+
+The existing [hemilabs/risc0 PR #30](https://github.com/hemilabs/risc0/pull/30)
+now points to the validated `d354733d6efa627d72521eea19482f5b328a7ed0`
+rebase on `release-3.0` `54921e770`. The old
+`f9455a518` head was replaced on the `dimitryB` fork with a
+SHA-pinned force-with-lease; the local PR branch was aligned to the new
+head. GitHub reports one commit, three changed files, a clean merge, and
+draft=false. The PR description now records the 37/37 execute tests and
+the unchanged-verifier 10M proof with three tamper rejections. The
+[#33 conflict/re-proof note](https://github.com/hemilabs/risc0/pull/33#issuecomment-6714421285)
+was answered with the same evidence. No parent branch was merged.
+The evidence manifest remains
+`evidence/upstream-final-segment-padding-r2.json`.
+
 ## Post-merge regression diagnosis — paired gate passed, 2026-11-07
 
 The upstream-merge publication stop was held pending this controlled paired reading;

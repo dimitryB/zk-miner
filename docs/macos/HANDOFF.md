@@ -2,6 +2,19 @@
 
 Final report for the phase: [PHASE2_FINAL_REPORT.md](PHASE2_FINAL_REPORT.md) (2026-11-07, published worker `c3428c37…`).
 
+## Upstream padding PR #30 — 2026-11-07
+
+[hemilabs/risc0 #30](https://github.com/hemilabs/risc0/pull/30) now
+points to the validated rebase `d354733d6` on `release-3.0`
+`54921e770`. GitHub reports a clean merge and the PR is ready for
+review. Its description includes the 37/37 execute tests and complete
+10M CPU proof accepted by the unchanged verifier with three tamper
+rejections. The [#33 note](https://github.com/hemilabs/risc0/pull/33#issuecomment-6714421285)
+has the conflict resolution and proof evidence. The parent branch has
+not been merged. Details and hashes are in
+[PHASE2_PLAN.md](PHASE2_PLAN.md) and
+[the evidence manifest](evidence/upstream-final-segment-padding-r2.json).
+
 ## Post-merge paired diagnosis — 2026-11-07
 
 The re-exported Phase 2 spec SHA-256 is
