@@ -24,7 +24,18 @@ Every merge conflict and resolution:
 | miner | `crates/zkminer-prover/src/engine.rs` | Kept the Mac-specific po2 calibration guard; upstream added no competing implementation in that location. |
 | miner | `crates/zkminer-prover/src/memory.rs` | Kept upstream's Linux `/dev/shm` capacity check and the Mac-specific reserve, footprint and pressure functions. The shared floor uses the platform reserve on Mac. |
 
-Validation and the controlled reading for this new sealed worker are pending.
+The merged Metal worker SHA-256 is
+`c3428c3717c331c452e3621736e779ae1f06311003dfd65b50f292d39877e5f9`.
+Its build-time po2-14 proof verified with three tamper rejections. The
+20-request lifecycle and restart suite verified 21 proofs; po2-14/18/20
+real-witness segment and recursion CPU differentials, nine input-limit
+controls, and multi-segment pipeline cancellation passed. The CPU-only worker
+and unit tests built, and the offline Colima recursion, rv32im, and zkvm
+feature paths passed against the merged engine. The root Git-source lock was
+restored. See `evidence/phase2-upstream-merge-acceptance.json`. An initial
+pipeline-cancel harness invocation used a single-segment boundary workload,
+so it could not observe overlap and failed its assertion; the 10M arithmetic
+multi-segment rerun passed. The controlled reading and re-seal are next.
 
 ## WP7 admission estimator — 2026-11-06
 
