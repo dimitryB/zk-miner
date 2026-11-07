@@ -35,7 +35,29 @@ feature paths passed against the merged engine. The root Git-source lock was
 restored. See `evidence/phase2-upstream-merge-acceptance.json`. An initial
 pipeline-cancel harness invocation used a single-segment boundary workload,
 so it could not observe overlap and failed its assertion; the 10M arithmetic
-multi-segment rerun passed. The controlled reading and re-seal are next.
+multi-segment rerun passed.
+
+The source-bound checkpoint manifest SHA-256 is
+`e7a3cae3ab845a2f84050c8d737d7bbe8fb62fd43189efa64b98416a92c1c13d`.
+The controlled reading used the newly sealed worker, browsers closed, normal
+memory pressure, the new default 8 GiB reserve, one excluded warmup and five
+measured independently verified proofs per fixture. Complete medians were:
+
+| Fixture | Prior final median (s) | New median (s) | Change (s) | Prior measured range (s) |
+| --- | ---: | ---: | ---: | ---: |
+| arithmetic 10M | 48.458 | 52.479 | +4.021 | 48.452–50.316 |
+| hashing 10M | 49.511 | 51.350 | +1.838 | 49.498–50.512 |
+| arithmetic 46M | 165.835 | 167.162 | +1.327 | 162.522–167.474 |
+
+The first two new medians exceed even the prior measured maxima. This is a
+regression beyond run-to-run noise and **stops publication of both Phase 2
+merge branches**. The 46M median stays within its prior range. The old final
+reading used its then-default 16 GiB reserve; this reading uses the current
+default 8 GiB reserve, as requested. Both campaigns were browser-closed and
+started at nominal thermal state. The full 18-proof campaign and all 54
+tamper rejections passed; see `evidence/phase2-upstream-merge-controlled.json`
+and its CSV. The merged branches remain local for diagnosis, with their
+upstream merge commits preserved.
 
 ## WP7 admission estimator — 2026-11-06
 
