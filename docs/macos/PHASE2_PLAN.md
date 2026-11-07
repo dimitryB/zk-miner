@@ -39,6 +39,24 @@ request → first GPU dispatch at most 5 s after build-time warm-up, with
 lifecycle, differential, limit controls, tamper checks, and unchanged assets
 green. Evidence will be under `evidence/phase2-wp6b-*.json`.
 
+Engine `7816a0002642bf97bbcdd82bd55ebaa22d84ad80` and the source-bound
+worker `f65ff7a374e4471404d9bc52dab57d010e12cb5af4d0f5197053b0f8107060ab`
+passed the warm-driver gates. With browsers closed and the default 8 GiB
+reserve, three sealed pre-WP6b launches had a 4.619 s handshake median;
+three WP6b launches had a 0.107 s median. `build-worker.py` completed and
+verified its mandatory po2-14 proof in 29.164 s. The first direct proof
+after that build reached a completed GPU dispatch in 57.1 ms from request,
+well inside the 5 s gate. These are warm-driver readings. On the first login
+to the fresh `zkmac` account, launch → handshake was 0.106 s, handshake →
+request was effectively immediate, and request → first completed GPU dispatch
+was 25.129 s; the complete proof took 62.467 s and verified with three tamper
+rejections. No driver cache was deleted. The exact final worker
+passed 21 lifecycle/recovery proofs, po2-14/18/20 segment and recursion CPU
+differentials, nine input-limit controls and a corrupted-bundle rejection
+before helper spawn. See `evidence/phase2-wp6b-validation.json` and
+`evidence/phase2-wp6b-cold.json`. WP6b is closed with both warm gates and
+correctness passing; the fresh-user cold reading is a single observation.
+
 ## Controlled final reading — revised brief, 2026-11-06
 
 The spec export used for this controlled reading had SHA-256
@@ -511,7 +529,7 @@ brief remains the detailed technical and acceptance specification.
 | WP8-lite native wrap overlap | At least 1.5 s saved at 10M; cancellation during identity and wrap leaves no helper; lifecycle green | Closed, timing gate missed: 0.018/0.034 s saved at 10M and 0.988 s at 46M; 36 paired proofs, 21 lifecycle proofs, cancellation and platform checks passed. Best correct variant retained. |
 | WP6 pipeline cache | Warm process first dispatch at most 5 s, stale archive rebuilds | Closed on a miss; re-scoped to WP6b. Archive PR remains draft and unmerged. |
 | WP7 admission | No refusal under specified desktop load with at least 40 GiB truly free; pressure refusal still works | Passed and merged after held-memory proof, guard-floor reconciliation and pressure-level refusal text. |
-| WP6b startup | Warm-driver spawn → handshake at most 1.0 s; first request → first dispatch at most 5 s after build-time warm-up | In progress after WP7 merge. |
+| WP6b startup | Warm-driver spawn → handshake at most 1.0 s; first request → first dispatch at most 5 s after build-time warm-up | Closed, passed: 0.107 s median handshake and 0.057 s first dispatch; correctness passed. Fresh-user cold dispatch took 25.129 s in one reading. |
 | WP8 identity_p254 on Metal | Exact differential and verified identity receipts | Optional; requires owner approval before starting |
 
 The mid-point decision after WP3 targets both 10M warm medians at most 60 s.

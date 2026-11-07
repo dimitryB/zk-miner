@@ -60,7 +60,7 @@ pub fn capabilities() -> (bool, Option<String>) {
 pub fn warmup_summary() -> String {
     let c = config();
     if cfg!(feature = "macos-native-wrap") {
-        return format!("Native helper ready; segments {}; Poseidon2 recursion {}; witness, accumulation and identity-p254 CPU", c.segment_hal, c.recursion_hal);
+        return format!("Native helper verification pending; segments {}; Poseidon2 recursion {}; witness, accumulation and identity-p254 CPU", c.segment_hal, c.recursion_hal);
     }
     format!(
         "CPU ready; emulated Groth16 helper preflight passed; requested={}",
@@ -234,7 +234,7 @@ pub fn preflight() -> Result<()> {
             std::env::var("ZKMINER_RISC0_WRAP").as_deref() == Ok("native"),
             "native worker requires ZKMINER_RISC0_WRAP=native"
         );
-        risc0_groth16::prove::native::preflight()?;
+        risc0_groth16::prove::native::start_verification()?;
         (
             String::new(),
             std::env::var("RISC0_GROTH16_CONTAINER_NAME")
@@ -516,6 +516,7 @@ fn prove_staged(
                 observed["other_segment_operations"] = json!("metal_shared_buffers");
                 observed["rv32im_metal"] = json!({"completed_constraint_checks":checks,"evaluation_points":points,
                     "completed_dispatches":dispatches,"completed_command_buffers":command_buffers,
+                    "first_completed_gpu_dispatch_epoch_ns":risc0_zkp::hal::metal::first_completed_dispatch_epoch_ns(),
                     "cpu_witness_calls":witness,"cpu_accumulation_calls":accumulation,
                     "threads_per_threadgroup":256,"evalfast_phase_split":std::env::var("RISC0_RV32IM_TAIL_SPLIT").as_deref()!=Ok("1"),
                     "kernel_source_sha256":hash(risc0_zkvm::metal_rv32im_kernel_source().as_bytes()),

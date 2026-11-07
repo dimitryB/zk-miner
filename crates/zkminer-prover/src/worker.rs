@@ -325,6 +325,9 @@ pub struct WorkerHandle {
     pub path: PathBuf,
     pub sdk_version: Option<String>,
     pub worker_version: Option<String>,
+    /// Process launch through the completed Hello handshake, including parent
+    /// supervision setup. Measured before `Command::spawn` and after HelloAck.
+    pub spawn_to_handshake_ms: f64,
     child: Child,
     reader: BufReader<ChildStdout>,
     writer: BufWriter<ChildStdin>,
@@ -506,6 +509,7 @@ impl WorkerHandle {
             });
         }
 
+        let launch_started = Instant::now();
         let child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn worker {backend} at {}", path.display()))?;
@@ -638,6 +642,7 @@ impl WorkerHandle {
             path: path.clone(),
             sdk_version: None,
             worker_version: None,
+            spawn_to_handshake_ms: 0.0,
             child,
             reader,
             writer,
@@ -652,6 +657,7 @@ impl WorkerHandle {
 
         // Perform Hello handshake
         handle.handshake()?;
+        handle.spawn_to_handshake_ms = launch_started.elapsed().as_secs_f64() * 1000.0;
 
         Ok(handle)
     }
