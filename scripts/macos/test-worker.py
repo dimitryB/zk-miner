@@ -220,6 +220,7 @@ def main():
     parser.add_argument("--context", required=True)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--workload", choices=["fibonacci", "sha256-chain", "segment-boundary"], default="fibonacci")
+    parser.add_argument("--iterations", type=int, help="guest iteration count for the selected workload")
     parser.add_argument("--po2", type=int, choices=range(14, 19), help="defaults to 16 for boundary, 18 otherwise")
     parser.add_argument("--admission-pressure", action="store_true", help="exercise bounded logical in-flight reservation pressure; does not exhaust physical RAM")
     parser.add_argument("--proof-only", action="store_true", help="verify selected mode without the separate cancellation/timeout/restart cases")
@@ -229,7 +230,7 @@ def main():
     args = parser.parse_args()
     if args.worker_kind == "metal":
         parser.error("the fold-only worker is retired; use test-native-worker.py --worker-kind native-rv32im-metal --segment-hal metal")
-    input_data, expected_journal, default_po2, minimum_segments = workload(args.workload)
+    input_data, expected_journal, default_po2, minimum_segments = workload(args.workload, args.iterations)
     args.po2 = default_po2 if args.po2 is None else args.po2
     if not (1 <= args.repeat <= 100 and 1 <= args.timeout <= 14400 and 1 <= args.failure_timeout <= 300
             and 4096 <= args.staging_bytes <= 16777216):
@@ -269,7 +270,7 @@ def main():
         worker = worker_paths(args.worker_kind)["binary"]
         verifier = BASE / "verifier/release/hemi-macos-proof"
         program = BASE / "guest-build/riscv32im-risc0-zkvm-elf/release" / (args.workload + ".bin")
-        fixture = {"workload":args.workload, "program_path":str(program), "elf_sha256":sha(program),
+        fixture = {"workload":args.workload, "iterations":args.iterations, "program_path":str(program), "elf_sha256":sha(program),
                    "input_sha256":hashlib.sha256(input_data).hexdigest(), "expected_journal_hex":expected_journal,
                    "po2":args.po2, "min_segments":minimum_segments}
         guest = BASE / "guests" / args.workload
