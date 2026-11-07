@@ -1,5 +1,7 @@
 # macOS proving handoff
 
+Final report for the phase: [PHASE2_FINAL_REPORT.md](PHASE2_FINAL_REPORT.md) (2026-11-07, published worker `c3428c37…`).
+
 ## Post-merge paired diagnosis — 2026-11-07
 
 The re-exported Phase 2 spec SHA-256 is
