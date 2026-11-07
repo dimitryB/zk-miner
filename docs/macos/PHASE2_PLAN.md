@@ -103,6 +103,12 @@ Both run scripts enforce their 15-minute idle gaps and nominal start
 thermal before timing. The final seal script refuses to overwrite an
 existing checkpoint.
 
+Publication: non-force pushes to the `dimitryB` forks succeeded, engine
+`codex/hemi-macos-metal-phase2` at
+`881513e022d98ac7c07460ba090a5f6a5657334a` and miner diagnosis/evidence
+commit `d333818483bdd0c16b45d48c2aff11e3ebcf4698` on its same-named
+branch. No upstream or existing PR branch was pushed.
+
 ## Upstream final-segment padding r2 — 2026-11-06
 
 The separate `codex/upstream-final-segment-padding-r2` engine branch is based

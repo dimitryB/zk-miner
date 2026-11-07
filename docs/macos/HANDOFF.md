@@ -32,7 +32,11 @@ worker is sealed at `target/macos/phase2/post-diagnosis-final-checkpoint/`:
 manifest SHA-256
 `c9e2ea296cbbcc243665e5f48719c28b295aed15502ecb273c67b9d576288dd1`,
 worker SHA-256 `c3428c3717c331c452e3621736e779ae1f06311003dfd65b50f292d39877e5f9`.
-Fork publication is the remaining step.
+Both Phase 2 branches were published by non-force push to the `dimitryB`
+forks, engine at `881513e022d98ac7c07460ba090a5f6a5657334a` and miner
+diagnosis/evidence commit at `d333818483bdd0c16b45d48c2aff11e3ebcf4698`.
+This handoff status update follows those pushes. No upstream or existing PR
+branch was changed.
 
 ## WP6b warm gates and correctness — 2026-11-06
 
