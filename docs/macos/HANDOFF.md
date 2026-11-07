@@ -1,5 +1,39 @@
 # macOS proving handoff
 
+## Post-merge paired diagnosis — 2026-11-07
+
+The re-exported Phase 2 spec SHA-256 is
+`9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1`.
+Sealed merged worker `c3428c3717c331c452e3621736e779ae1f06311003dfd65b50f292d39877e5f9`
+was paired against sealed WP8-lite worker
+`625589c35f6583bfaf4510a00d6f98dceb781b004064500ce38b44b42d659be7`.
+With both workers resident, alternating order, closed browser, default 8 GiB
+reserve, nominal thermal at the start and 920.8 s idle after the harness
+build, the paired median complete-latency gaps (merged minus WP8-lite) were
+**+0.007 s arithmetic 10M, +0.001 s hashing 10M, +0.999 s arithmetic 46M**.
+All 32 proofs verified with 96 tamper rejections. The 1/1/3 s lift rule is
+met, so campaign B and the engine/miner bisect are not triggered. The first
+GPU-submit delay was near-identical in each arm; worker startup nice/priority
+were 0/31 with 18 Rayon and 18 Go threads. Thread QoS is not exposed by
+macOS `ps`. Neither paired nor historical logs contained a bundle rehash or
+identity-mismatch line. See [paired evidence](evidence/phase2-upstream-diagnosis-a.json),
+[paired rows](evidence/phase2-upstream-diagnosis-a.csv), and
+[historical log scan](evidence/phase2-upstream-diagnosis-historical-logs.json).
+The stop is lifted by the paired gate. The amended absolute reading began after
+920.3 s idle with nominal thermal, browser closed and the default 8 GiB reserve.
+Five measured complete-proof medians after one excluded warmup were **49.532 s
+arithmetic 10M, 50.274 s hashing 10M and 159.559 s arithmetic 46M**. All meet
+the 55/55/220 s minimum lines; 46M meets the 180 s desirable line, while the
+10M fixtures remain above 45 s. All 18 proofs and 54 tamper rejections passed;
+pressure stayed normal, and peak owned footprints were 18.84/18.77/19.29 GiB.
+See [controlled evidence](evidence/phase2-post-diagnosis-controlled.json) and
+[per-proof rows](evidence/phase2-post-diagnosis-controlled.csv). The final
+worker is sealed at `target/macos/phase2/post-diagnosis-final-checkpoint/`:
+manifest SHA-256
+`c9e2ea296cbbcc243665e5f48719c28b295aed15502ecb273c67b9d576288dd1`,
+worker SHA-256 `c3428c3717c331c452e3621736e779ae1f06311003dfd65b50f292d39877e5f9`.
+Fork publication is the remaining step.
+
 ## WP6b warm gates and correctness — 2026-11-06
 
 WP6b engine `7816a0002642bf97bbcdd82bd55ebaa22d84ad80` starts native
@@ -33,8 +67,9 @@ and three tamper rejections. Browser processes were closed and thermal was
 nominal before and after. The raw script's optional cache-directory count
 used a path one level too high; the count is excluded from the cold claim,
 and the script is corrected. See [cold evidence](evidence/phase2-wp6b-cold.json).
-WP6b is closed. Next is the one-hour `identity_p254` profile from the revised
-spec; it requires the owner's go-ahead. WP8 remains unstarted.
+WP6b is closed. At that checkpoint the proposed next step was the one-hour
+`identity_p254` profile; the newer post-merge diagnosis above supersedes that
+sequence. The profile has not started, and WP8 remains unstarted.
 
 ## WP7 admission estimator — 2026-11-06
 

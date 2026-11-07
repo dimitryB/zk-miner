@@ -69,6 +69,8 @@ def main():
                         help="keep WP2 enabled in the sealed Metal arm and disable it in the candidate arm")
     parser.add_argument("--paired-start-case", type=int, choices=(0, 1), default=0,
                         help="which paired arm runs first in round zero")
+    parser.add_argument("--prebuilt-acceptance-manifest", type=Path,
+                        help="source-bound acceptance binary built before the controlled idle interval")
     args = parser.parse_args()
     if args.paired_baseline and args.paired_metal_baseline:
         parser.error("select one paired baseline")
@@ -188,6 +190,8 @@ def main():
                   segment_check_cpu=args.segment_check_cpu, recursion_hal=args.recursion_hal,
                   recursion_check_cpu=args.recursion_check_cpu, recursion_cases=args.recursion_cases)
     report["pipeline_cancel"] = args.pipeline_cancel
+    if args.prebuilt_acceptance_manifest:
+        report["prebuilt_acceptance_manifest"] = str(args.prebuilt_acceptance_manifest.resolve(strict=True))
     if args.paired_baseline:
         report["paired_baseline"] = {"path":str(args.paired_baseline), "sha256":sha(args.paired_baseline)}
     if args.paired_metal_baseline:
@@ -201,7 +205,14 @@ def main():
         report["calibration"] = {"path":str(args.calibration), "sha256":sha(args.calibration)}
     print(directory, flush=True)
     try:
-        binary, build = acceptance.build_acceptance(directory, env)
+        if args.prebuilt_acceptance_manifest:
+            build = json.loads(args.prebuilt_acceptance_manifest.read_text())
+            binary = Path(build["binary_path"]).resolve(strict=True)
+            if build["source_inputs"] != acceptance.test_sources() or sha(binary) != build["binary_sha256"]:
+                raise RuntimeError("prebuilt acceptance binary or source inputs changed")
+            (directory / "acceptance-build.json").write_text(json.dumps(build, indent=2) + "\n")
+        else:
+            binary, build = acceptance.build_acceptance(directory, env)
         with (directory / "test.log").open("w") as log:
             test = "native_bundle_corrupt_hash_rejected" if args.invalid_bundle else "native_worker_handshake_timing" if args.handshake_only else "native_workload_limit_controls" if args.limit_controls else "native_thread_comparison" if args.thread_cases else "native_worker_proofs_failure_restart_and_shutdown"
             subprocess.run([str(binary), test, "--exact", "--ignored", "--nocapture"],

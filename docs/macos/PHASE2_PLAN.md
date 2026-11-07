@@ -1,5 +1,108 @@
 # Phase 2: Metal proving performance on macOS
 
+Re-exported spec SHA-256 (2026-11-07):
+`9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1`.
+
+## Post-merge regression diagnosis — paired gate passed, 2026-11-07
+
+The upstream-merge publication stop was held pending this controlled paired reading;
+campaign A subsequently met the lift rule below.
+The first campaign attempt is retained at
+`target/macos/phase2/upstream-diagnosis-pairs/a-37ba8e734f7c43e3b3f80aa77e5e4c84/`:
+it stopped before any proof because the sealed WP8-lite worker speaks IPC
+protocol 5 and the merged supervisor speaks protocol 10. A test-feature-only
+v5 command/response adapter now lets the same supervisor keep both exact
+worker binaries resident; production worker hashes are unchanged. A four-proof
+small-fixture diagnostic passed external verification and all tamper checks at
+`target/macos/native-wrap/worker-runs/60569d475d2a40c4bc7fd646ef9e3d2d/`.
+The failed sandboxed diagnostics are retained in their own worker-runs; their
+old-worker process was killed by the safety guard when sandboxed process reads
+were unavailable. The successful diagnostic used ordinary user-level macOS
+process reads. The source-bound acceptance harness is prebuilt at
+`target/macos/phase2/upstream-diagnosis-acceptance-prebuild/` so the paired
+reading can begin after the prescribed 15-minute idle interval without a
+build between the preflight and first proof. Historical old/new logs and bundle
+file identities are recorded in
+`evidence/phase2-upstream-diagnosis-historical-logs.json`.
+
+Campaign A ran with the browser closed, the current default 8 GiB host
+reserve, nominal thermal at the start, and **920.8 s idle** after the last
+acceptance build. Each fixture kept both exact workers resident and ran one
+proof at a time in alternating order, with one excluded warmup per arm. All
+32 complete proofs passed the unchanged verifier and 96 tamper rejections.
+There were no admission waits; pressure stayed normal and the maximum owned
+footprints were 18.86, 18.89 and 19.33 GiB respectively, below the 32 GiB
+ceiling.
+The paired median of complete-latency gaps is the decision statistic:
+
+| Fixture | WP8-lite median (s) | Merged median (s) | Paired gap, merged − WP8-lite (s) | Within-pair gaps (s) |
+| --- | ---: | ---: | ---: | --- |
+| Arithmetic 10M | 49.508 | 49.516 | +0.007 | +2.035, −0.008, +0.007, +0.008, −0.068 |
+| Hashing 10M | 49.507 | 49.513 | +0.001 | +0.039, +0.001, −0.010, −0.057, +0.006 |
+| Arithmetic 46M | 159.542 | 160.540 | +0.999 | −1.003, +0.999, +1.031 |
+
+The 10M gaps are ≤1 s and the 46M gap is ≤3 s, so the spec's paired
+lift rule is met. Campaign B and the upstream-commit bisect are not triggered.
+The old and merged workers had the same 18 Rayon/18 Go settings and actual
+nice 0 / priority 31 at process start in every fixture. macOS `ps` did not
+expose thread QoS, so QoS is unmeasured. Median request → first `gpu_submit`
+was 1.739/1.738 s (old/merged) on arithmetic 10M, 1.978/1.968 s on hashing
+10M and 1.974/1.972 s on 46M. There was no per-proof bundle re-verification
+or identity-mismatch line in either the paired or historical worker logs. The
+successful rehash path does not itself log a line, so absence of a line alone
+cannot rule out a silent rehash; the bundle file identities and near-equal
+identity+wrap medians supply additional evidence. The full per-proof stage
+timers, GPU totals, pair ratios, process status and log lines are in
+`evidence/phase2-upstream-diagnosis-a.json` and `.csv`; the raw campaign is
+`target/macos/phase2/upstream-diagnosis-pairs/a-59db709f867b4af1b29dc6d867d019ec/`.
+
+| Fixture | Segment stage old/merged (s) | Recursion old/merged (s) | Identity + wrap old/merged (s) | Segment GPU old/merged (s) |
+| --- | ---: | ---: | ---: | ---: |
+| Arithmetic 10M | 26.101 / 26.187 | 5.448 / 5.463 | 17.488 / 17.477 | 29.246 / 29.249 |
+| Hashing 10M | 26.277 / 26.249 | 5.449 / 5.384 | 16.907 / 17.002 | 27.269 / 27.220 |
+| Arithmetic 46M | 116.023 / 116.730 | 25.629 / 25.660 | 16.925 / 17.008 | 134.394 / 135.670 |
+
+The segment GPU column sums per-kernel GPU timestamps; it is a profile total,
+not elapsed wall time, and can exceed the segment-stage wall duration.
+
+The amended absolute reading began after **920.3 s idle** following campaign
+A, with browser closed, default 8 GiB reserve and nominal thermal at the
+start. The unchanged worker and verifier passed all 18 complete proofs and
+54 tamper rejections. Five measured complete medians after one excluded
+warmup per fixture were:
+
+| Fixture | Median (s) | Min–max (s) | Segment stage (s) | Recursion (s) | Identity + wrap (s) | Peak owned GiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Arithmetic 10M | 49.532 | 49.500–51.529 | 26.171 | 5.480 | 17.474 | 18.84 |
+| Hashing 10M | 50.274 | 49.244–52.297 | 26.569 | 5.562 | 17.460 | 18.77 |
+| Arithmetic 46M | 159.559 | 158.379–161.553 | 116.345 | 25.772 | 16.937 | 19.29 |
+
+All three meet the 55/55/220 s minimum lines; 46M also meets its 180 s
+desirable line, while the 10M fixtures do not meet 45 s. Memory pressure
+stayed normal and every peak remained below the unchanged 32 GiB guard.
+See `evidence/phase2-post-diagnosis-controlled.json` and `.csv`, raw campaign
+`target/macos/phase2/controlled-post-diagnosis/a0f3f00ec4b9416d869c91ab2f31da11/`.
+The final worker is re-sealed at
+`target/macos/phase2/post-diagnosis-final-checkpoint/` with manifest SHA-256
+`c9e2ea296cbbcc243665e5f48719c28b295aed15502ecb273c67b9d576288dd1`;
+the worker binary remains SHA-256 `c3428c3717c331c452e3621736e779ae1f06311003dfd65b50f292d39877e5f9`.
+
+Reproduction from the sealed files and already-built source-bound harness:
+
+```sh
+HEMI_MINER_DIR=/Users/dbur/dev/zk-miner source scripts/macos/env.sh
+export PROTOC=/Users/dbur/dev/zk-miner/target/macos/bootstrap/protoc-36.2/bin/protoc CARGO_NET_OFFLINE=true
+python3 scripts/macos/phase2-run-upstream-diagnosis-pairs.py --baseline-archive target/macos/phase2/wp8lite-checkpoint --expected-baseline-sha256 625589c35f6583bfaf4510a00d6f98dceb781b004064500ce38b44b42d659be7 --label a --last-activity-file target/macos/phase2/upstream-diagnosis-acceptance-prebuild/acceptance-build.json --acceptance-build-manifest target/macos/phase2/upstream-diagnosis-acceptance-prebuild/acceptance-build.json
+python3 scripts/macos/phase2-collect-upstream-diagnosis-pairs.py target/macos/phase2/upstream-diagnosis-pairs/a-59db709f867b4af1b29dc6d867d019ec
+python3 scripts/macos/phase2-run-post-diagnosis-reading.py --last-campaign-result target/macos/phase2/upstream-diagnosis-pairs/a-59db709f867b4af1b29dc6d867d019ec/result.json --acceptance-build-manifest target/macos/phase2/upstream-diagnosis-acceptance-prebuild/acceptance-build.json
+python3 scripts/macos/phase2-collect-post-diagnosis-reading.py target/macos/phase2/controlled-post-diagnosis/a0f3f00ec4b9416d869c91ab2f31da11
+python3 scripts/macos/phase2-seal-post-diagnosis.py
+```
+
+Both run scripts enforce their 15-minute idle gaps and nominal start
+thermal before timing. The final seal script refuses to overwrite an
+existing checkpoint.
+
 ## Upstream final-segment padding r2 — 2026-11-06
 
 The separate `codex/upstream-final-segment-padding-r2` engine branch is based
@@ -74,14 +177,16 @@ measured independently verified proofs per fixture. Complete medians were:
 | hashing 10M | 49.511 | 51.350 | +1.838 | 49.498–50.512 |
 | arithmetic 46M | 165.835 | 167.162 | +1.327 | 162.522–167.474 |
 
-The first two new medians exceed even the prior measured maxima. This is a
-regression beyond run-to-run noise and **stops publication of both Phase 2
-merge branches**. The 46M median stays within its prior range. The old final
+The first two new medians exceeded even the prior measured maxima and
+triggered a conservative publication stop. The subsequent paired campaign A
+above did not reproduce a code-cost gap and met the amended lift rule; the
+absolute difference is not used as a regression verdict. The 46M median
+stayed within its prior range. The old final
 reading used its then-default 16 GiB reserve; this reading uses the current
 default 8 GiB reserve, as requested. Both campaigns were browser-closed and
 started at nominal thermal state. The full 18-proof campaign and all 54
 tamper rejections passed; see `evidence/phase2-upstream-merge-controlled.json`
-and its CSV. The merged branches remain local for diagnosis, with their
+and its CSV. The merged branches remained local through diagnosis, with their
 upstream merge commits preserved.
 
 ## WP7 admission estimator — 2026-11-06

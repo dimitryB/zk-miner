@@ -409,9 +409,24 @@ fn native_thread_comparison() {
         if let Some(cases) = &pipeline_cases {
             overrides.insert("RISC0_SEGMENT_PIPELINE".into(), cases[index].clone());
         }
+        if index == 0 && std::env::var("ZKMINER_MACOS_LEGACY_BASELINE_PROTOCOL")
+            .ok().as_deref() == Some("5") {
+            assert!(segment_cases.is_some(), "legacy worker is only for sealed pairs");
+            overrides.insert("ZKMINER_TEST_LEGACY_PROTOCOL".into(), "5".into());
+        }
         let binary = binaries.as_ref().map(|v| v[index].clone())
             .unwrap_or_else(|| required("ZKMINER_MACOS_WORKER"));
-        pool.insert_test_worker(KEY, "risc0", binary, overrides).unwrap();
+        eprintln!("paired worker insert index={index} binary={}", binary.display());
+        pool.insert_test_worker(KEY, "risc0", binary.clone(), overrides).unwrap();
+        let pid = pool.worker_pid(KEY).unwrap();
+        let status = Command::new("ps").args(["-o", "pid=,ni=,pri=,comm=", "-p", &pid.to_string()])
+            .output().expect("read actual worker process priority");
+        assert!(status.status.success(), "worker process priority unavailable");
+        ledger(&evidence, &json!({"event":"worker_started","case":index,
+            "worker_pid":pid,"binary":binary,
+            "rayon_threads":rayon,"gomaxprocs":go,
+            "process_priority":String::from_utf8_lossy(&status.stdout).trim(),
+            "process_priority_columns":"pid nice priority command; ps cannot report thread QoS on this macOS"}));
         pools.push(pool);
     }
     let mut rows = Vec::new();
