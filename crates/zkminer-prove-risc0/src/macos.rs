@@ -590,9 +590,37 @@ fn prove_staged(
         report["total_ms"] = json!(total.elapsed().as_secs_f64() * 1000.0);
         write_report(&report, &filename)?;
 
+        #[cfg(feature = "macos-recursion-metal")]
+        let identity_recursion_before = risc0_zkvm::metal_recursion_stats();
+        #[cfg(feature = "macos-rv32im-metal")]
+        let identity_gpu_before = risc0_zkp::hal::metal::metal_gpu_stats();
         let started = Instant::now();
         let receipt = prover.compress(&ProverOpts::groth16(), &succinct)?;
         let wrap_secs = started.elapsed().as_secs_f64();
+        #[cfg(feature = "macos-recursion-metal")]
+        if c.recursion_hal == "metal" {
+            let after = risc0_zkvm::metal_recursion_stats();
+            let checks = after.completed_constraint_checks
+                - identity_recursion_before.completed_constraint_checks;
+            let points = after.evaluation_points - identity_recursion_before.evaluation_points;
+            let cpu_checks = after.cpu_differential_checks
+                - identity_recursion_before.cpu_differential_checks;
+            ensure!(checks > 0 && points > 0, "missing Metal identity constraint check");
+            report["observed_stages"]["identity_metal"] = json!({
+                "completed_constraint_checks":checks,
+                "evaluation_points":points,
+                "cpu_differential_checks":cpu_checks,
+                "eval_check_split":after.eval_check_split,
+                "kernel_source_sha256":hash(risc0_zkvm::metal_recursion_kernel_source().as_bytes()),
+                "cpu_stages":["witness","accumulation"],
+            });
+            #[cfg(feature = "macos-rv32im-metal")]
+            {
+                report["observed_stages"]["identity_metal"]["gpu_kernels"] = json!(
+                    risc0_zkp::hal::metal::metal_gpu_stats_since(
+                        &identity_gpu_before, "recursion/"));
+            }
+        }
         let started = Instant::now();
         receipt
             .verify(image)

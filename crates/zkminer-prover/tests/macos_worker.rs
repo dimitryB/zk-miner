@@ -672,6 +672,16 @@ fn validate_stage(record: &Value, workload: &Workload) {
                 .unwrap()
                 .iter()
                 .any(|stage| stage == "identity_p254"));
+            if record["phase"] == "complete" {
+                let identity = &record["observed_stages"]["identity_metal"];
+                assert!(positive(identity, "completed_constraint_checks") > 0);
+                assert!(positive(identity, "evaluation_points") > 0);
+                if record["segment_hal"] == "metal" {
+                    for kernel in ["recursion/poseidon254_rows", "recursion/poseidon254_fold"] {
+                        assert!(positive(&identity["gpu_kernels"][kernel], "commands") > 0);
+                    }
+                }
+            }
         } else {
             assert_eq!(record["observed_stages"]["identity"], "cpu");
         }
