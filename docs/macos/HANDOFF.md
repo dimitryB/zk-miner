@@ -27,11 +27,15 @@ all 12 proofs verified with 36 tamper rejections. See
 [per-proof rows](evidence/phase2-wp8-controlled.csv). The first reading
 preflight stopped before a proof because its prebuilt acceptance harness was
 stale; the harness was rebuilt, verified by a po2-14 proof, and the idle
-interval restarted. Linux feature-path checks remain pending because automatic
-approval review rejected starting the stopped Colima VM as a privileged action;
-owner approval has been requested. Neither WP8 branch has been pushed or
-merged. The prior published Phase 2 worker and branches remain the release
-checkpoint until the Linux check closes.
+interval restarted. Automatic approval review initially rejected starting
+Colima as a privileged action; the owner then approved it. Recursion
+`prove,metal`, RV32IM `prove`, and zkVM
+`prove,metal-recursion` all passed in the cached Rust container with pulls,
+container networking, and Cargo network access disabled. See
+[Linux evidence](evidence/phase2-wp8-linux.json). WP8 is closed on its
+isolated branches; the parent repositories and verifier pin were not changed.
+Colima was left running because it already hosted two long-lived Postgres and
+pgAdmin containers when the checks began.
 
 ## Upstream padding PR #30 — 2026-11-07
 

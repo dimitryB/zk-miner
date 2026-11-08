@@ -3,7 +3,7 @@
 Re-exported spec SHA-256 (2026-11-07):
 `9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1`.
 
-## WP8 identity_p254 on Metal — Mac gate passed, 2026-11-07/08
+## WP8 identity_p254 on Metal — closed, 2026-11-07/08
 
 The owner authorized full WP8 after the identity profile. The re-exported
 spec SHA-256 remains
@@ -98,10 +98,17 @@ The complete proof times here are absolute readings, while the paired campaign
 above identifies WP8's code cost and saving. Per-proof stage timers, verifier
 and tamper results, Metal dispatches, GPU timing, memory and host snapshots
 are in `evidence/phase2-wp8-controlled.json` and `.csv`. The Mac correctness
-and timing gates pass. Colima is stopped; automatic approval review rejected
-starting the VM because owner approval is required for this privileged action,
-and an approval request is pending. No Linux feature-path result is claimed,
-so formal checkpoint closure and branch publication remain pending.
+and timing gates pass. After the owner approved the privileged Colima action,
+the exact engine `bcdca76fc8e83d0a42b5fecbda5f048e01cd2bce` passed all
+three offline Linux feature paths: recursion `prove,metal`, RV32IM `prove`,
+and zkVM `prove,metal-recursion`. The cached `rust:1.93-trixie` image was run
+with `--pull never`, `--network none`, and Cargo `--offline --locked`; the
+snapshot and log hashes are in `evidence/phase2-wp8-linux.json` (SHA-256
+`c1e0ce99e4bc5b8f196afd5a98f1c15b7d714406fa7f8eaefa2eee717ee0681a`).
+The WP8 checkpoint is closed. Colima reported already running when started;
+two pre-existing Postgres and pgAdmin containers were still up, so the VM was
+left running to avoid interrupting them. Neither default po2 nor the memory
+ceiling changed.
 
 ## Identity_p254 profile — 2026-11-07/08
 
@@ -888,7 +895,7 @@ brief remains the detailed technical and acceptance specification.
 | WP6 pipeline cache | Warm process first dispatch at most 5 s, stale archive rebuilds | Closed on a miss; re-scoped to WP6b. Archive PR remains draft and unmerged. |
 | WP7 admission | No refusal under specified desktop load with at least 40 GiB truly free; pressure refusal still works | Passed and merged after held-memory proof, guard-floor reconciliation and pressure-level refusal text. |
 | WP6b startup | Warm-driver spawn → handshake at most 1.0 s; first request → first dispatch at most 5 s after build-time warm-up | Closed, passed: 0.107 s median handshake and 0.057 s first dispatch; correctness passed. Fresh-user cold dispatch took 25.129 s in one reading. |
-| WP8 identity_p254 on Metal | Exact differential and verified identity receipts; identity ≤4 s on both 10M fixtures | Mac gate passed: exact parity, complete po2-14/18/20 differentials, 21-proof lifecycle, 36 paired proofs, and controlled identity medians 2.724/2.717 s. Linux feature-path check and publication await owner approval for Colima. |
+| WP8 identity_p254 on Metal | Exact differential and verified identity receipts; identity ≤4 s on both 10M fixtures | Closed: exact parity, complete po2-14/18/20 differentials, 21-proof lifecycle, 36 paired proofs, controlled identity medians 2.724/2.717 s, and three offline Linux feature paths passed. |
 
 The mid-point decision after WP3 targets both 10M warm medians at most 60 s.
 A near miss within a few seconds is the owner's call; the revised order is

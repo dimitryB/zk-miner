@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "macos_wp8_gate_passed_linux_feature_path_pending",
+  "status": "passed",
   "spec_sha256": "9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1",
   "branches": {
     "engine": "codex/hemi-macos-metal-wp8",
@@ -314,8 +314,19 @@
     ]
   },
   "linux_feature_paths": {
-    "status": "pending_owner_approval",
-    "reason": "Colima was stopped; automatic approval review rejected privileged VM startup"
+    "status": "passed",
+    "evidence_path": "/Users/dbur/dev/zk-miner/docs/macos/evidence/phase2-wp8-linux.json",
+    "evidence_sha256": "c1e0ce99e4bc5b8f196afd5a98f1c15b7d714406fa7f8eaefa2eee717ee0681a",
+    "engine_sha": "bcdca76fc8e83d0a42b5fecbda5f048e01cd2bce",
+    "checks": {
+      "recursion_prove_metal": "passed",
+      "rv32im_prove": "passed",
+      "zkvm_prove_metal_recursion": "passed"
+    },
+    "container_image_id": "sha256:ecbe59a8408895edd02d9ef422504b8501dd9fa1526de27a45b73406d734d659",
+    "compile_network": "disabled (--pull never, --network none, cargo --offline --locked)",
+    "owner_approved_colima_start": true,
+    "vm_left_running_reason": "Colima reported already running; pre-existing Postgres and pgAdmin containers had been up for three days"
   },
   "paired_campaign": {
     "report_path": "/Users/dbur/dev/zk-miner/docs/macos/evidence/phase2-wp8-paired.json",
