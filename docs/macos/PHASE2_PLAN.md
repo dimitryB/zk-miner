@@ -3,6 +3,106 @@
 Re-exported spec SHA-256 (2026-11-07):
 `9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1`.
 
+## WP8 identity_p254 on Metal — Mac gate passed, 2026-11-07/08
+
+The owner authorized full WP8 after the identity profile. The re-exported
+spec SHA-256 remains
+`9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1`.
+The work is isolated on `codex/hemi-macos-metal-wp8` in both repositories;
+the engine is at `bcdca76fc8e83d0a42b5fecbda5f048e01cd2bce`.
+Its Metal hash suite runs the CPU Poseidon254 permutation over BN254 Fr using
+eight 32-bit Montgomery limbs, explicit carries and native 32-bit low/high
+products. The 150 round constants and nine MDS entries were checked against
+the CPU suite after conversion to Montgomery form. The recursion Metal HAL
+now selects this suite for the actual `poseidon_254` recursion selector;
+the first build exposed and corrected a `poseidon254` selector mismatch.
+
+Parity passed for 134 field-input pairs including zero, one, p−1, R, R² and
+deterministic random elements; `hash_rows`/`hash_fold` boundary suites; and
+the full identity data commitment of 2^18 rows by 128 columns with every
+Merkle fold level against the CPU HAL. The final source-bound worker was
+sealed at binary SHA-256
+`9b2532dd859292c53545f14324b5ef264ce2d6fbc4e686863e276f45078e0a55`
+(manifest SHA-256
+`1841887196b5686e577e515e7fdfc62656a321f58d0a982c16b7d9e4dfa7b728`).
+Its build-time po2-14 proof verified against the unchanged external verifier
+with all three tamper rejections; complete proving took 18.168 s. The run is at
+`target/macos/native-wrap/worker-runs/28bd6e9445694b04b3f5bbff11aa608f/`.
+Its sidecar records Metal identity execution, one completed constraint check,
+seven Poseidon254 row dispatches, 116 folds, and about 3.00 s of GPU time
+in the batched identity Merkle command buffers. The CPU implementation remains
+available as the differential oracle.
+
+A 10M arithmetic proof with recursion CPU evaluator differential enabled
+verified with three tamper rejections at
+`target/macos/native-wrap/worker-runs/9d0ce927788b4bb786c6457f41bc95ed/`;
+its 4.550 s identity time includes the differential and is not a timing
+gate reading. A 10M hashing proof without that diagnostic verified with
+three tamper rejections at
+`target/macos/native-wrap/worker-runs/8536e2be1edb4d838166da7985a7827c/`;
+identity took 3.518 s. On the final worker, complete real-witness Metal/CPU
+differentials at po2 14, 18 and 20 passed, with unchanged external verification
+and three tamper rejections per proof. The 20-request lifecycle plus recovery
+verified 21 proofs with 63 tamper rejections; idle worker/helper footprint fell
+from 3.617 to 3.413 GB between requests 1 and 20. Nine input-limit controls
+and a po2-20 cancellation during observed CPU/GPU segment overlap passed,
+including recovery proofs. The final CPU-only worker build passed 11 tests;
+the generic Metal primitive suite passed 24 tests, including identity-size
+Poseidon254 Merkle parity. The first cancellation attempt used a tiny
+single-segment workload that completed before cancellation; it is retained
+as a harness fixture miss. Evidence paths and SHA-256 values are recorded in
+`evidence/phase2-wp8-validation.json`.
+
+The sealed post-diagnosis Phase 2 worker
+`c3428c3717c331c452e3621736e779ae1f06311003dfd65b50f292d39877e5f9`
+was paired against the final WP8 worker with both resident, identities pinned,
+one excluded warmup per arm, five alternating measured pairs per fixture,
+18 Rayon and Go threads, po2 20, and the default 8 GiB reserve. All 36 proofs
+verified with the unchanged verifier and 108 tamper rejections; no proof row
+was excluded or retried. The earlier two paired harness attempts failed
+before a usable pair because their acceptance assertion assumed Metal identity
+for the sealed baseline. The harness now admits CPU identity only for this
+explicit paired campaign; the collector requires CPU identity in arm 0 and
+Metal identity in arm 1. All failed attempts remain in the validation record.
+
+| Fixture | Baseline median (s) | WP8 median (s) | Median saving (s) | WP8 min–max (s) |
+| --- | ---: | ---: | ---: | ---: |
+| 10M arithmetic | 49.516 | 39.404 | 10.113 | 39.384–40.423 |
+| 10M hashing | 49.496 | 39.419 | 10.077 | 39.397–39.431 |
+| 46M arithmetic | 158.565 | 149.425 | 9.141 | 149.382–149.461 |
+
+Identity plus wrap fell from 17.009 to 7.417 s in arithmetic and from 16.947
+to 7.327 s in hashing; the candidate's identity Merkle GPU batch medians were
+2.535 and 2.466 s. The 46M identity plus wrap median fell from 16.841 to
+7.257 s. All paired peak owned footprints stayed below 32 GiB. The per-proof
+stages, background and thermal snapshots, min–max, and five within-pair ratios
+are in `evidence/phase2-wp8-paired.json` and `.csv`.
+
+The first absolute-reading preflight reached 900.1 s idle with Brave closed
+and nominal thermal, then stopped before any proof because its prebuilt
+acceptance harness no longer matched the paired-harness source fix. The
+source-bound harness was rebuilt and verified with one po2-14 proof and three
+tamper rejections; a new browser-closed idle interval began at
+2026-11-08T03:50:19Z. The controlled reading passed after 900.09 s idle,
+with Brave closed, default 8 GiB reserve, nominal thermal at the start,
+one excluded warmup and five measured proofs per fixture. All 12 proofs
+verified with 36 tamper rejections. The identity wall timer, not only GPU
+dispatch time, meets the spec's ≤4 s gate on both fixtures:
+
+| Fixture | Identity median (s) | Identity min–max (s) | Complete median incl. verifier (s) |
+| --- | ---: | ---: | ---: |
+| 10M arithmetic | **2.724** | 2.711–2.764 | 40.418 |
+| 10M hashing | **2.717** | 2.710–2.726 | 40.405 |
+
+The complete proof times here are absolute readings, while the paired campaign
+above identifies WP8's code cost and saving. Per-proof stage timers, verifier
+and tamper results, Metal dispatches, GPU timing, memory and host snapshots
+are in `evidence/phase2-wp8-controlled.json` and `.csv`. The Mac correctness
+and timing gates pass. Colima is stopped; automatic approval review rejected
+starting the VM because owner approval is required for this privileged action,
+and an approval request is pending. No Linux feature-path result is claimed,
+so formal checkpoint closure and branch publication remain pending.
+
 ## Identity_p254 profile — 2026-11-07/08
 
 The re-exported spec's Identity profile section was re-read; its SHA-256
@@ -49,7 +149,7 @@ maximum. The raw run, stage logs, per-proof timers, worker and engine
 SHAs, and the two stopped preflights are in
 `evidence/phase2-identity-profile.json`.
 
-**Recommendation.** Choose full WP8: the measured 85% hash share leaves at most about 2 s for a hybrid transform/evaluator port before transfer costs. If a full BN254-limb Poseidon254 kernel reaches the spec's ≤4 s identity gate, it could save roughly 8–10 s and move a 49.5 s 10M proof toward 40–42 s; that is an estimate requiring a paired campaign. Require CPU `poseidon_254` parity on random and edge field values (zero, one, p−1, Montgomery boundaries), `hash_rows`/`hash_fold` parity at identity sizes, and complete identity receipts and Groth16 proofs accepted by the unchanged verifier with three tamper rejections; WP8 has not started.
+**Recommendation.** Choose full WP8: the measured 85% hash share leaves at most about 2 s for a hybrid transform/evaluator port before transfer costs. If a full BN254-limb Poseidon254 kernel reaches the spec's ≤4 s identity gate, it could save roughly 8–10 s and move a 49.5 s 10M proof toward 40–42 s; that is an estimate requiring a paired campaign. Require CPU `poseidon_254` parity on random and edge field values (zero, one, p−1, Montgomery boundaries), `hash_rows`/`hash_fold` parity at identity sizes, and complete identity receipts and Groth16 proofs accepted by the unchanged verifier with three tamper rejections; the owner subsequently authorized WP8, with progress recorded above.
 
 ## Upstream padding PR #30 — ready for review, 2026-11-07
 
@@ -788,7 +888,7 @@ brief remains the detailed technical and acceptance specification.
 | WP6 pipeline cache | Warm process first dispatch at most 5 s, stale archive rebuilds | Closed on a miss; re-scoped to WP6b. Archive PR remains draft and unmerged. |
 | WP7 admission | No refusal under specified desktop load with at least 40 GiB truly free; pressure refusal still works | Passed and merged after held-memory proof, guard-floor reconciliation and pressure-level refusal text. |
 | WP6b startup | Warm-driver spawn → handshake at most 1.0 s; first request → first dispatch at most 5 s after build-time warm-up | Closed, passed: 0.107 s median handshake and 0.057 s first dispatch; correctness passed. Fresh-user cold dispatch took 25.129 s in one reading. |
-| WP8 identity_p254 on Metal | Exact differential and verified identity receipts | Optional; requires owner approval before starting |
+| WP8 identity_p254 on Metal | Exact differential and verified identity receipts; identity ≤4 s on both 10M fixtures | Mac gate passed: exact parity, complete po2-14/18/20 differentials, 21-proof lifecycle, 36 paired proofs, and controlled identity medians 2.724/2.717 s. Linux feature-path check and publication await owner approval for Colima. |
 
 The mid-point decision after WP3 targets both 10M warm medians at most 60 s.
 A near miss within a few seconds is the owner's call; the revised order is

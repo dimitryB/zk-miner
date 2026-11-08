@@ -666,13 +666,25 @@ fn validate_stage(record: &Value, workload: &Workload) {
             if std::env::var("RISC0_RECURSION_METAL_CHECK_CPU").as_deref() == Ok("1") {
                 assert_eq!(stage["cpu_differential_checks"], stage["completed_constraint_checks"]);
             }
-            assert_eq!(record["observed_stages"]["identity"], "metal");
-            assert!(!record["recursion_cpu_stages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|stage| stage == "identity_p254"));
-            if record["phase"] == "complete" {
+            let cpu_identity = record["observed_stages"]["identity"] == "cpu";
+            if cpu_identity {
+                // WP8 pairs a sealed pre-WP8 worker with the candidate. The
+                // paired collector binds the CPU identity to arm 0 only.
+                assert_eq!(std::env::var("ZKMINER_MACOS_PAIRED_ALLOW_CPU_IDENTITY").as_deref(), Ok("1"));
+                assert!(record["recursion_cpu_stages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|stage| stage == "identity_p254"));
+            } else {
+                assert_eq!(record["observed_stages"]["identity"], "metal");
+                assert!(!record["recursion_cpu_stages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|stage| stage == "identity_p254"));
+            }
+            if record["phase"] == "complete" && !cpu_identity {
                 let identity = &record["observed_stages"]["identity_metal"];
                 assert!(positive(identity, "completed_constraint_checks") > 0);
                 assert!(positive(identity, "evaluation_points") > 0);

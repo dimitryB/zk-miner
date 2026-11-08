@@ -2,6 +2,37 @@
 
 Final report for the phase: [PHASE2_FINAL_REPORT.md](PHASE2_FINAL_REPORT.md) (2026-11-07, published worker `c3428c37…`).
 
+## WP8 Metal identity — 2026-11-07/08
+
+Full Poseidon254 identity on Metal is implemented on isolated
+`codex/hemi-macos-metal-wp8` branches (engine `bcdca76fc8e83d0a42b5fecbda5f048e01cd2bce`).
+The final source-bound worker SHA-256 is
+`9b2532dd859292c53545f14324b5ef264ce2d6fbc4e686863e276f45078e0a55`.
+Field, hash and identity-size Merkle parity, the 24-test Metal primitive
+suite, po2-14/18/20 complete-proof CPU differentials, a 21-proof lifecycle,
+input limits, pipeline cancellation and recovery, and the CPU-only build passed.
+In five alternating pairs per fixture against the sealed pre-WP8 worker,
+median complete times fell 49.516 → 39.404 s arithmetic, 49.496 → 39.419 s
+hashing, and 158.565 → 149.425 s at 46M. All 36 proofs verified with 108
+tamper rejections. See [paired evidence](evidence/phase2-wp8-paired.json),
+[paired rows](evidence/phase2-wp8-paired.csv) and
+[validation evidence](evidence/phase2-wp8-validation.json).
+
+The controlled absolute identity-time gate passed after 900.09 s idle with
+Brave closed, default 8 GiB reserve and thermal nominal at the start. After
+one excluded warmup, five measured proofs per 10M fixture gave identity
+medians **2.724 s arithmetic and 2.717 s hashing**, each below the 4 s gate;
+all 12 proofs verified with 36 tamper rejections. See
+[controlled evidence](evidence/phase2-wp8-controlled.json) and
+[per-proof rows](evidence/phase2-wp8-controlled.csv). The first reading
+preflight stopped before a proof because its prebuilt acceptance harness was
+stale; the harness was rebuilt, verified by a po2-14 proof, and the idle
+interval restarted. Linux feature-path checks remain pending because automatic
+approval review rejected starting the stopped Colima VM as a privileged action;
+owner approval has been requested. Neither WP8 branch has been pushed or
+merged. The prior published Phase 2 worker and branches remain the release
+checkpoint until the Linux check closes.
+
 ## Upstream padding PR #30 — 2026-11-07
 
 [hemilabs/risc0 #30](https://github.com/hemilabs/risc0/pull/30) now
