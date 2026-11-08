@@ -66,7 +66,7 @@ Each package was measured as a paired five-proof campaign against the immediatel
 | WP1b | `7222459e3` | `mksm2.py` hot slab (32 hottest words in threadgroup memory), `mksub.py` chain tails | Evaluator 1.70 → 1.04 s/segment; −6.8 / −7.0 s; −23 s at 46M | 50.5 s |
 | WP8-lite | `cd018ee72`, `6521f87c2` | gnark child pre-started under identity, witness streamed over stdin | identity + wrap −0.5 s, complete ~0; kept | 49.5 s |
 | WP7 | miner `ed649c6`…`ea8cd11` (engine unchanged) | Admission on kernel pressure plus measured owned footprint; VM estimate kept as a floor (16 GiB for a fresh worker instead of 40); guard pressure-first; default reserve 8 GiB | No latency effect. Admitted and completed with a sibling holding 64 GiB (20 GiB estimated); refuses in 0.5 ms under real warning pressure and recovers | — |
-| WP6 | `11025fe0e` (draft PR, unmerged) | `MTLBinaryArchive` pipeline cache keyed by shader hash, device and OS build | −0.16 s with a warm driver cache; gate missed | — |
+| WP6 | `11025fe0e` (closed fork PR, unmerged) | `MTLBinaryArchive` pipeline cache keyed by shader hash, device and OS build | −0.16 s with a warm driver cache; gate missed | — |
 | WP6b | `fc7af4317`, `7816a0002` | Groth16 bundle verification off the start path; build-time driver-cache warm-up | Spawn → handshake 4.62 → 0.11 s; first-ever proof on a fresh account 25 s to first dispatch | — |
 | Upstream merge | `881513e02` (engine), miner `d359e01` | hemilabs `release-3.0` @ `54921e770` and `main` @ `af44acc` folded in: execution refusals, deterministic `sys_rand`, security hardening, Intel AOT | Paired cost +0.007 / +0.001 s at 10M, +1.0 s at 46M | 49.5 s |
 | WP8 | engine `bcdca76fc`, miner `a4ee58e` | Poseidon254 identity Merkle hashing on Metal with eight 32-bit Montgomery limbs | Paired complete savings 10.113 / 10.077 s at 10M, 9.141 s at 46M; controlled identity wall time 2.724 / 2.717 s | 39.4 s paired |
@@ -115,7 +115,7 @@ admitted and completed; under warning pressure, the gate refused before a
 worker request and recovered when pressure returned to normal. Idle
 footprint after 20 consecutive requests met the one-sided ≤5% growth rule.
 
-Cold start: WP6's `MTLBinaryArchive` pipeline cache was built and is correct but saved 0.16 s, because macOS's own driver shader cache already covers every repeat start; it stays in a draft PR, unmerged. What every worker start actually paid was 4.6 s of SHA-256 over the 2.8 GB Groth16 bundle before the handshake. WP6b moved that onto a background thread joined before any helper use — with size, mtime, inode and device checks, and a corrupted bundle still rejected before a helper spawns — taking spawn → handshake to 0.11 s, and `build-worker.py` now runs one po2-14 proof after every build to warm the driver cache. The one true cold measurement, on a freshly created macOS account, was 25 s from first request to first GPU dispatch and 62 s for that first po2-14 proof: paid once per worker build per machine, and absorbed by the build-time warm-up.
+Cold start: WP6's `MTLBinaryArchive` pipeline cache was built and is correct but saved 0.16 s, because macOS's own driver shader cache already covers every repeat start; its fork PR is closed and its branch retained. What every worker start actually paid was 4.6 s of SHA-256 over the 2.8 GB Groth16 bundle before the handshake. WP6b moved that onto a background thread joined before any helper use — with size, mtime, inode and device checks, and a corrupted bundle still rejected before a helper spawns — taking spawn → handshake to 0.11 s, and `build-worker.py` now runs one po2-14 proof after every build to warm the driver cache. The one true cold measurement, on a freshly created macOS account, was 25 s from first request to first GPU dispatch and 62 s for that first po2-14 proof: paid once per worker build per machine, and absorbed by the build-time warm-up.
 
 The configuration is intended for a 64 GiB-class Mac or larger; every measurement in this phase was on a 128 GiB M5 Max (18 CPU / 40 GPU cores, macOS 26.4). No cross-machine result exists.
 
@@ -164,7 +164,7 @@ Both phase-2 branches were fast-forwarded to the validated WP8 tips and
 pushed to the `dimitryB` forks on 2026-11-08 without force. The sealed
 source-bound WP8 worker is `9b2532dd…`; the pre-WP8 worker `c3428c37…`
 remains archived as the paired baseline. The parent repositories have not
-received these phase-2 branches.
+merged these phase-2 branches; both are now proposed as PRs for review.
 
 | Repository | Branch | Reference commit | Notes |
 | --- | --- | --- | --- |
@@ -173,8 +173,10 @@ received these phase-2 branches.
 | `dimitryB/risc0` | `codex/hemi-macos-metal-phase2` | `bcdca76fc` Verify Poseidon254 Merkle parity at identity size | Published WP8 engine tip on the upstream `release-3.0` merge |
 | `dimitryB/risc0` | `codex/hemi-macos-metal` | `dcbe9f4b9` | Phase-1 engine branch |
 | `dimitryB/risc0` | `codex/upstream-final-segment-padding-r2` and #30 head `codex/upstream-final-segment-padding` | `d354733d6` | #30 rebased onto `release-3.0`'s tip (one test-file append collision resolved), 37/37 execute tests, one verified 10M CPU proof; pushed to the PR branch and marked ready for review on 2026-11-07 |
-| `dimitryB/risc0` draft PR #1 | `codex/hemi-macos-metal-wp6` | `11025fe0e` | WP6 archive; unmerged, its miss documented in the PR |
+| `dimitryB/risc0` PR #1 (closed) | `codex/hemi-macos-metal-wp6` | `11025fe0e` | WP6 archive gate missed; branch and evidence retained |
 | `hemilabs/risc0` PR #30 (open, ready); #31 and #32 (closed) | `codex/upstream-final-segment-padding`, `-locked-circom`, `-native-helper-lifetime` | #30 at `d354733d6` on `54921e770` | #30 is cleanly mergeable and carries the r2 proof evidence in its description; #33's conflict note was answered. #31 and #32 only mattered alongside a Mac-backend PR and were closed unmerged on 2026-11-07 |
+| [hemilabs/risc0 #35](https://github.com/hemilabs/risc0/pull/35) | `dimitryB:codex/hemi-macos-metal-phase2` → `release-3.0` | `bcdca76fc` | Open for review; final-segment padding overlaps still-open #30 and is disclosed in the PR |
+| [hemilabs/zk-miner #29](https://github.com/hemilabs/zk-miner/pull/29) | `dimitryB:codex/hemi-macos-metal-phase2` → `main` | `a4b633b` at creation | Open for review; depends on engine #35; evidence files collapsed by `.gitattributes` |
 
 Sealed checkpoints include `baseline`, `wp1-baseline`, `wp2-baseline`,
 `wp3-baseline`, `wp4-baseline`, `wp5-baseline`, `wp1b-baseline`,
@@ -229,9 +231,9 @@ Runtime selectors for the validated configuration: `RISC0_SEGMENT_HAL=metal`, `R
 
 ## Open items and decisions
 
-1. **Parent review** — review and merge [#30](https://github.com/hemilabs/risc0/pull/30), the upstream final-segment-padding change. The parent repositories have not received the Mac backend; an opt-in Mac PR remains an owner decision.
-2. **Fork branch integration** — decide whether to fold the published `codex/hemi-macos-metal-phase2` branches into `codex/hemi-macos-metal` in both forks. The validated WP8 tips are already published on the phase-2 branches.
-3. **Housekeeping** — delete the `zkmac` account created for the cold reading if it is not wanted; investigate the roughly one-second tick in complete latency before using a gate of a second or less.
-4. **Not pursued, by decision** — a 40 GiB large-memory profile for po2 21 with pipelining, GPU witness generation and accumulation, further CPU/GPU overlap, and the WP6 archive beyond its draft PR.
+1. **Parent review** — [engine #35](https://github.com/hemilabs/risc0/pull/35) and [miner #29](https://github.com/hemilabs/zk-miner/pull/29) are open and ready for parallel review. #35 overlaps the unmerged [padding #30](https://github.com/hemilabs/risc0/pull/30); reconcile that overlap before merging #35, then integrate the engine before the miner. Both PRs reported mergeable at creation; no CI checks were reported then.
+2. **Fork cleanup** — the WP7 work is already merged into Phase 2, and there is no open WP7 fork PR. The WP6 binary-archive draft PR was closed after its timing-gate miss, while its branch and evidence were retained. Folding Phase 2 back into the historical Phase 1 fork branches is unnecessary for these parent PRs.
+3. **Optional local housekeeping** — the `zkmac` account used for one cold reading may be removed by its owner. The roughly one-second completion tick matters only for future subsecond gates, not the measured WP8 saving or final absolute lines.
+4. **Not pursued, by decision** — a 40 GiB large-memory profile for po2 21 with pipelining, GPU witness generation and accumulation, further CPU/GPU overlap, and the WP6 archive after its missed gate.
 
 What the phase did not measure: any machine other than the 128 GiB M5 Max, cold start on another GPU generation (the fresh-account reading is one observation on this machine), and a direct comparison against an NVIDIA card; the 5070 Ti figures remain estimates from hemilabs' published per-segment timings on other GPUs.

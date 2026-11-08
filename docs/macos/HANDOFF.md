@@ -3,6 +3,33 @@
 Final report for the phase: [PHASE2_FINAL_REPORT.md](PHASE2_FINAL_REPORT.md)
 (2026-11-08, published WP8 worker `9b2532dd…`).
 
+## Parent PRs opened — 2026-11-08
+
+The owner chose to open both Mac backend PRs while
+[risc0 #30](https://github.com/hemilabs/risc0/pull/30) awaits team review.
+[Engine #35](https://github.com/hemilabs/risc0/pull/35) targets
+`hemilabs/risc0:release-3.0` from the validated engine Phase 2 branch
+`bcdca76fc8e83d0a42b5fecbda5f048e01cd2bce`.
+[Miner #29](https://github.com/hemilabs/zk-miner/pull/29) targets
+`hemilabs/zk-miner:main` from the Phase 2 miner branch; its code and
+controlled-reading commit at PR creation was
+`a4b633b794ec90bb3cec3dc9ca0b1c145257a8e2`.
+Both PRs were open, ready for review and reported mergeable against the
+current parent tips when created. No CI checks were reported then.
+Engine #35 contains the same final-segment padding behavior as #30; its
+description asks reviewers to resolve that overlap before merging.
+Miner #29 depends on engine #35, and its root Cargo engine pin remains the
+parent pin until the engine change is integrated. The parent PRs are review
+destinations; no parent branch was pushed directly.
+
+The abandoned WP6 binary-archive
+[fork draft #1](https://github.com/dimitryB/risc0/pull/1) was closed after
+its 0.16 s warm-cache gain missed the gate. Its branch and evidence remain.
+The WP7 work is already in the Phase 2 branch, and there is no open WP7 fork
+PR. Generated benchmark records and standalone tool lockfiles are marked
+with `linguist-generated` so GitHub collapses them in the miner PR diff by
+default; the records remain available for audit.
+
 ## WP8 Metal identity — 2026-11-07/08
 
 Full Poseidon254 identity on Metal was implemented on isolated

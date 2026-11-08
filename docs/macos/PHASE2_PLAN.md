@@ -3,6 +3,23 @@
 Re-exported spec SHA-256 (2026-11-07):
 `9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1`.
 
+## Parent review publication — 2026-11-08
+
+The owner authorized opening both parent Mac backend PRs before #30 merges.
+[risc0 #35](https://github.com/hemilabs/risc0/pull/35) proposes the engine
+Phase 2 branch against `release-3.0` at `54921e770`; it is open and ready
+for review, with the overlap with still-open
+[#30](https://github.com/hemilabs/risc0/pull/30) disclosed in its body.
+[zk-miner #29](https://github.com/hemilabs/zk-miner/pull/29) proposes the
+miner Phase 2 branch against `main` at `af44acc`; it is open and ready for
+review and depends on the engine PR. Both were reported mergeable on
+creation, with no CI checks yet reported. The root miner engine pin remains
+the upstream `main` pin, and the local override continues to bind the
+validated engine commit. No direct push to either parent branch occurred.
+The WP6 archive fork draft PR was closed after its missed gate; its branch
+and evidence were kept. The phase-2 performance and correctness ladder is
+closed; only upstream review and the declared PR dependency remain.
+
 ## WP8 identity_p254 on Metal — closed, 2026-11-07/08
 
 The owner authorized full WP8 after the identity profile. The re-exported
