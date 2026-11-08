@@ -666,6 +666,13 @@ fn validate_stage(record: &Value, workload: &Workload) {
             if std::env::var("RISC0_RECURSION_METAL_CHECK_CPU").as_deref() == Ok("1") {
                 assert_eq!(stage["cpu_differential_checks"], stage["completed_constraint_checks"]);
             }
+            assert_eq!(record["observed_stages"]["identity"], "metal");
+            assert!(!record["recursion_cpu_stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|stage| stage == "identity_p254"));
+        } else {
             assert_eq!(record["observed_stages"]["identity"], "cpu");
         }
     }
