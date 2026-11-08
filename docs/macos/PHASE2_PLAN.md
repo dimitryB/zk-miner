@@ -8,8 +8,11 @@ Re-exported spec SHA-256 (2026-11-07):
 The owner authorized full WP8 after the identity profile. The re-exported
 spec SHA-256 remains
 `9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1`.
-The work is isolated on `codex/hemi-macos-metal-wp8` in both repositories;
-the engine is at `bcdca76fc8e83d0a42b5fecbda5f048e01cd2bce`.
+The work was validated on isolated `codex/hemi-macos-metal-wp8` branches.
+On 2026-11-08, both `codex/hemi-macos-metal-phase2` branches were
+fast-forwarded to the WP8 tips and pushed to the `dimitryB` forks without
+force: engine `bcdca76fc8e83d0a42b5fecbda5f048e01cd2bce` and miner
+`a4ee58e037240e0dd9494619981cd2926e01d4ea`.
 Its Metal hash suite runs the CPU Poseidon254 permutation over BN254 Fr using
 eight 32-bit Montgomery limbs, explicit carries and native 32-bit low/high
 products. The 150 round constants and nine MDS entries were checked against
@@ -93,6 +96,19 @@ dispatch time, meets the spec's ≤4 s gate on both fixtures:
 | --- | ---: | ---: | ---: |
 | 10M arithmetic | **2.724** | 2.711–2.764 | 40.418 |
 | 10M hashing | **2.717** | 2.710–2.726 | 40.405 |
+
+After both phase-2 branches were fast-forwarded and published, a separate
+controlled 46M arithmetic reading on the same sealed worker passed after
+900.09 s browser-closed idle with default 8 GiB reserve and nominal thermal
+state at start. One warmup was excluded; the five measured complete proofs
+had median **150.448 s** (149.460–151.488), under the 180 s desirable line.
+Identity wall time was 2.817 s median (2.704–3.088). All six proofs passed
+the unchanged external verifier and all 18 tamper checks rejected. The
+116.295 / 25.512 / 7.452 s stage medians (execution plus segments /
+recursion / identity plus wrap), per-proof rows, source hashes and host
+snapshots are in `evidence/phase2-wp8-final-46m-controlled.json` and `.csv`.
+Two earlier browser-open preflights stopped before any proof (Brave, then
+Safari), and their raw result hashes are retained in the evidence record.
 
 The complete proof times here are absolute readings, while the paired campaign
 above identifies WP8's code cost and saving. Per-proof stage timers, verifier

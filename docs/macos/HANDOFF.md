@@ -1,11 +1,16 @@
 # macOS proving handoff
 
-Final report for the phase: [PHASE2_FINAL_REPORT.md](PHASE2_FINAL_REPORT.md) (2026-11-07, published worker `c3428c37…`).
+Final report for the phase: [PHASE2_FINAL_REPORT.md](PHASE2_FINAL_REPORT.md)
+(2026-11-08, published WP8 worker `9b2532dd…`).
 
 ## WP8 Metal identity — 2026-11-07/08
 
-Full Poseidon254 identity on Metal is implemented on isolated
-`codex/hemi-macos-metal-wp8` branches (engine `bcdca76fc8e83d0a42b5fecbda5f048e01cd2bce`).
+Full Poseidon254 identity on Metal was implemented on isolated
+`codex/hemi-macos-metal-wp8` branches. On 2026-11-08 both
+`codex/hemi-macos-metal-phase2` branches were fast-forwarded to their
+validated WP8 tips and pushed to the `dimitryB` forks without force:
+engine `bcdca76fc8e83d0a42b5fecbda5f048e01cd2bce`, miner
+`a4ee58e037240e0dd9494619981cd2926e01d4ea`.
 The final source-bound worker SHA-256 is
 `9b2532dd859292c53545f14324b5ef264ce2d6fbc4e686863e276f45078e0a55`.
 Field, hash and identity-size Merkle parity, the 24-test Metal primitive
@@ -32,8 +37,17 @@ Colima as a privileged action; the owner then approved it. Recursion
 `prove,metal`, RV32IM `prove`, and zkVM
 `prove,metal-recursion` all passed in the cached Rust container with pulls,
 container networking, and Cargo network access disabled. See
-[Linux evidence](evidence/phase2-wp8-linux.json). WP8 is closed on its
-isolated branches; the parent repositories and verifier pin were not changed.
+[Linux evidence](evidence/phase2-wp8-linux.json). WP8 is closed and published
+on the phase-2 fork branches; the parent repositories and verifier pin were
+not changed.
+The later controlled 46M arithmetic reading on the same worker had a
+**150.448 s** complete median (149.460–151.488) from five measured proofs
+after one excluded warmup, with 900.09 s idle, browser closed, default
+reserve and nominal thermal at start. All six proofs verified and all 18
+tamper checks rejected. Two earlier browser-open preflights stopped before
+any proof and remain recorded in the
+[46M evidence](evidence/phase2-wp8-final-46m-controlled.json) and
+[per-proof rows](evidence/phase2-wp8-final-46m-controlled.csv).
 Colima was left running because it already hosted two long-lived Postgres and
 pgAdmin containers when the checks began.
 

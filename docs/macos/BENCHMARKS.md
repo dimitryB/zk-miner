@@ -1,5 +1,46 @@
 # macOS proving measurements
 
+## WP8 Metal identity — 2026-11-08
+
+The final WP8 worker (`9b2532dd859292c53545f14324b5ef264ce2d6fbc4e686863e276f45078e0a55`;
+engine `bcdca76fc8e83d0a42b5fecbda5f048e01cd2bce`) computes the
+Poseidon254 identity Merkle commitments and folds on Metal. The circuit,
+constants, Groth16 assets and original pinned verifier remain unchanged.
+The source-bound [paired campaign](evidence/phase2-wp8-paired.json) used the
+sealed pre-WP8 worker as baseline, with both workers resident, one excluded
+warmup per arm and five alternating measured pairs per fixture. All 36 proofs
+verified externally and all 108 tamper checks rejected.
+
+| Complete latency, median of five | Pre-WP8 | WP8 | Saving |
+| --- | ---: | ---: | ---: |
+| Arithmetic 10M | 49.516 s | 39.404 s | 10.113 s |
+| Hashing 10M | 49.496 s | 39.419 s | 10.077 s |
+| Arithmetic 46M | 158.565 s | 149.425 s | 9.141 s |
+
+The separate browser-closed [controlled 10M reading](evidence/phase2-wp8-controlled.json)
+began after 900.09 seconds idle, with nominal thermal state, default 8 GiB
+reserve, po2 20, 18 Rayon and 18 Go threads, one excluded warmup and five
+measured proofs per fixture. Complete medians including the unchanged verifier
+were **40.418 s** arithmetic (40.412–41.407) and **40.405 s** hashing
+(39.411–40.417), meeting both 45 s desirable lines. The identity wall-time
+medians were 2.724 s (2.711–2.764) and 2.717 s (2.710–2.726), below the
+4 s WP8 gate. All 12 proofs verified with 36 tamper rejections. The paired
+campaign measures WP8's code effect; the controlled reading is the absolute
+10M result.
+
+The [controlled 46M reading](evidence/phase2-wp8-final-46m-controlled.json)
+used the same sealed worker and default settings. Browser closed, 900.09 s
+idle and nominal thermal state preceded one excluded warmup and five measured
+proofs. Its complete median including external verification was **150.448 s**
+(149.460–151.488), meeting both the 220 s minimum and 180 s desirable lines.
+The identity wall-time median was 2.817 s (2.704–3.088); stage medians were
+116.295 s execution plus segments, 25.512 s recursion and 7.452 s identity
+plus wrap. All six proofs verified and all 18 tamper checks rejected. Two
+browser-open preflights stopped before any proof (Brave, then Safari); their
+raw result hashes are retained in the 46M evidence record. The
+[per-proof rows](evidence/phase2-wp8-final-46m-controlled.csv) retain the
+excluded warmup and all measured samples.
+
 ## WP6b startup reading — 2026-11-06
 
 The source-bound WP6b worker from engine `7816a0002` has SHA-256
