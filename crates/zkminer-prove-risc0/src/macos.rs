@@ -333,7 +333,8 @@ pub fn preflight() -> Result<()> {
         json!({"requested_mode":state.requested,"observed_mode":if segment_hal == "metal" {"metal"} else {"cpu"},
         "fallback_reason":null,"probe":state.probe,"staging_limit_bytes":null,
         "segment_hal":segment_hal,"poseidon2_recursion":recursion_hal,"recursion_probe":state.recursion_probe,
-        "witness_accumulation_identity_p254":"cpu","groth16":if cfg!(feature = "macos-native-wrap") { "native_darwin_arm64_helper" } else { "local_linux_amd64_helper" }})
+        "witness_accumulation":"cpu","identity_p254":if recursion_hal == "metal" { "metal" } else { "cpu" },
+        "groth16":if cfg!(feature = "macos-native-wrap") { "native_darwin_arm64_helper" } else { "local_linux_amd64_helper" }})
     );
     CONFIG
         .set(state)
@@ -469,7 +470,8 @@ fn prove_staged(
         "helper_container":c.helper_container,"helper_arch":if cfg!(feature = "macos-native-wrap") { "darwin/arm64" } else { "linux/amd64 (emulated)" },
         "rayon_threads":c.cpu_threads,"gomaxprocs":if cfg!(feature = "macos-native-wrap") { Some(c.go_threads) } else { None },
         "max_guest_cycles":c.limits.max_guest_cycles,"minimum_segment_po2":14,
-        "segment_hal":c.segment_hal,"recursion_hal":c.recursion_hal,"recursion_cpu_stages":["witness","accumulation","identity_p254"],
+        "segment_hal":c.segment_hal,"recursion_hal":c.recursion_hal,
+        "recursion_cpu_stages":if c.recursion_hal == "metal" { vec!["witness","accumulation"] } else { vec!["witness","accumulation","identity_p254"] },
         "staging_limit_bytes":null,"stage_ms":{},"error":null});
     write_report(&report, &filename)?;
     let result = (|| -> Result<Completed> {
@@ -491,7 +493,8 @@ fn prove_staged(
             .context("verify composite receipt")?;
         report["stats"] = serde_json::to_value(&info.stats)?;
         let mut observed = json!({"other_segment_operations":"cpu","recursion":c.recursion_hal,
-            "identity":"cpu","groth16":if cfg!(feature = "macos-native-wrap") { "native_darwin_arm64_helper" } else { "local_linux_amd64_helper" }});
+            "identity":if c.recursion_hal == "metal" { "metal" } else { "cpu" },
+            "groth16":if cfg!(feature = "macos-native-wrap") { "native_darwin_arm64_helper" } else { "local_linux_amd64_helper" }});
         #[cfg(feature = "macos-rv32im-metal")]
         {
             let after = risc0_zkvm::metal_rv32im_stats();
