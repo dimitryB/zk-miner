@@ -3,6 +3,54 @@
 Re-exported spec SHA-256 (2026-11-07):
 `9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1`.
 
+## Identity_p254 profile — 2026-11-07/08
+
+The re-exported spec's Identity profile section was re-read; its SHA-256
+remains `9a0e052f6c1e72a1a8a31d3081fe3a3604bbfe11cb9fd661e30109c21c12f6f1`.
+The published sealed worker `c3428c3717c331c452e3621736e779ae1f06311003dfd65b50f292d39877e5f9`
+was preserved. A source-bound diagnostic worker
+`5832edb772968101731a192d0cde232ff2eaf4d1a203098fc1362a95541743c5`
+from timer-only engine commit `6cfd014fcdb5fe035b950a6b35e53ed1192359bd`
+(base `881513e02`) exposed CPU Poseidon254 HAL spans and forwarded the
+unchanged gnark helper's debug timings to worker stderr under `RISC0_VERBOSE`.
+Three consecutive 10,003,116-cycle arithmetic proofs verified with the
+unchanged external verifier and nine tamper rejections. The final run began
+2,002.3 s after the last build with Brave and Safari closed, default 8 GiB
+reserve, 18 Rayon/Go threads, po2 20, nominal thermal at start and end,
+and no browser in either host snapshot. Two earlier start gates found Brave
+open and stopped before proof; their failed preflights are retained. Brave
+had reopened during the wait, so a continuously browser-closed final
+15-minute interval was not established; these are component timings, not a
+new controlled absolute latency line.
+
+| Component | Median (s) | Min–max (s) |
+| --- | ---: | ---: |
+| Identity proof, excluding helper prestart | 14.044 | 13.743–14.976 |
+| Poseidon254 `hash_rows` + `hash_fold` (Merkle commitments and FRI) | **11.968** | 11.665–12.975 |
+| Recursion transforms + evaluator | 1.970 | 1.842–1.977 |
+| Other identity work, measured residual | 0.107 | 0.101–0.159 |
+| Native wrap elapsed | 4.926 | 4.825–9.223 |
+| Rust witness generation/streaming | 0.339 | 0.320–4.978 |
+| Gnark constraint-system + key load | 0.614 | 0.597–0.677 |
+| Gnark proving | 4.240 | 4.014–4.371 |
+| Wrap residual after Rust witness and gnark proving | 0.235 | 0.231–0.246 |
+
+Hashing was **85.2%** of identity (84.9–86.6% per proof).
+`RISC0_VERBOSE` supplied the identity boundary, `poly_group`,
+`start_finalize` and `finalize` cross-checks; new diagnostic-only CPU
+HAL timers separate hash rows/folds from NTT, zk-shift, polynomial
+evaluation, FRI fold and synchronous `eval_check`. WP0's GPU/CPU
+attribution covers Metal lift/join but not CPU-only identity; its profile
+is bound by SHA in the [evidence](evidence/phase2-identity-profile.json).
+The helper's `loadWitness` timer includes waiting on stdin throughout
+identity and is not witness compute; key loading overlaps identity, and
+the first proof's 4.98 s Rust witness path explains the wrap's 9.22 s
+maximum. The raw run, stage logs, per-proof timers, worker and engine
+SHAs, and the two stopped preflights are in
+`evidence/phase2-identity-profile.json`.
+
+**Recommendation.** Choose full WP8: the measured 85% hash share leaves at most about 2 s for a hybrid transform/evaluator port before transfer costs. If a full BN254-limb Poseidon254 kernel reaches the spec's ≤4 s identity gate, it could save roughly 8–10 s and move a 49.5 s 10M proof toward 40–42 s; that is an estimate requiring a paired campaign. Require CPU `poseidon_254` parity on random and edge field values (zero, one, p−1, Montgomery boundaries), `hash_rows`/`hash_fold` parity at identity sizes, and complete identity receipts and Groth16 proofs accepted by the unchanged verifier with three tamper rejections; WP8 has not started.
+
 ## Upstream padding PR #30 — ready for review, 2026-11-07
 
 The existing [hemilabs/risc0 PR #30](https://github.com/hemilabs/risc0/pull/30)
